@@ -1,6 +1,6 @@
 # Context-Dump, Unified Verification & Single-Pass Replay Architecture
 
-> This document defines the authoritative architecture and tool interfaces for the **Fusion 360 Batch Post & Lathe IPW Verification Pipeline**, superseding earlier per-batch wrapper and G-code text stitching prototypes.
+> This document defines the authoritative architecture and tool interfaces for the **Fusion 360 Batch Post & Unified IPW Verification Pipeline** (supporting both **3D Milling** and **2D Turning**), superseding earlier per-batch wrapper and G-code text stitching prototypes.
 
 ---
 
@@ -24,10 +24,12 @@ By separating **Pass 1: Per-Batch Context Extraction (`universal_dumper.cps`)** 
 
 ### 1.2 Seven Core Architectural Invariants
 1. **Single Pathway (Zero G-Code Parsing)**: Never parse machine G-code (`parse_cnc_file` is permanently removed). All geometric verification operates strictly on exact floating-point coordinates captured from the Fusion Post Kernel via [`universal_dumper.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_dumper.cps).
-2. **Per-Batch Context Extraction**: Operations in a setup are partitioned into single-tool batches (`[(tool_num, [op1, ...]), ...]`). Each single-tool batch is posted individually through [`universal_dumper.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_dumper.cps) (which dynamically loads the target `BASE_POST` so kernel tolerances, `minimumChordLength`, `maximumCircularRadius`, and `allowedCircularPlanes` match the target machine).
-3. **Dialect-Independent Multi-Operation Merging**: [`merge_context_dumps()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L29-L115) in [`context_parser.py`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py) merges the per-batch JSON context dumps into a single unified multi-section context document, re-indexing `id` (`0..N-1`), `batchIdx`, and `batchSectionIdx`.
-4. **Unified Continuous IPW Verification**: [`parse_context_dump()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L118-L295) extracts a single continuous `List[MotionSegment]` across all tools and operations. [`Lathe2DIPWVerifier.verify_toolpath()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/lathe_engine.py#L87-L320) is invoked **once** on the complete setup so that in-process workpiece (IPW) stock removal carries over accurately from Tool 1 (e.g., Roughing) to Tool 2 (e.g., Finishing/Grooving/Drilling).
-5. **Global Rapid Promotion with Direct Event Stamping**: Rapid promotion decisions (`promoted_events`) are computed on the combined setup against the evolving 2D IPW stock (with `c_clear` safety clearance) and stamped directly onto the corresponding merged JSON events (`ev["promote"] = True`) via [`apply_promotions_to_context()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L298-L355).
+2. **Per-Batch Context Extraction**: Operations in a setup are partitioned into single-tool batches (`[(tool_num, [op1, ...]), ...]`). Each single-tool batch is posted individually through [`universal_dumper.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_dumper.cps) (or staged [`universal_dumper_export_stock.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/PostProcessAll.py#L2713-L2720) for Batch 0 of `"From Preceding Setup"` setups so `post --interrogate` Safe Mode enables native STL stock export).
+3. **Dialect-Independent Multi-Operation Merging**: [`merge_context_dumps()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L31-L132) in [`context_parser.py`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py) merges the per-batch JSON context dumps into a single unified multi-section context document, re-indexing `id` (`0..N-1`), `batchIdx`, and `batchSectionIdx`, and propagating `stockPath`, `stockMode`, `stockUnit`, `workpieceHint`, and `rapidMode`.
+4. **Unified Continuous IPW Verification**: [`parse_context_dump()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L135-L475) extracts a single continuous `List[MotionSegment]` across all tools and operations. [`MillHeightfieldVerifier.verify_toolpath()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/heightfield_engine.py#L243-L738) (for 3D Milling) or [`Lathe2DIPWVerifier.verify_toolpath()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/lathe_engine.py#L130-L457) (for 2D Turning) is invoked **once** on the complete setup so that in-process workpiece (IPW) stock removal carries over accurately across all tools and operations.
+5. **Per-Event Rapid Promotion with Uniform Caller Length & Safety Filtering**:
+   - Verifiers evaluate air moves geometrically (`is_air_move`) and record candidate event keys `(sec_idx, event_idx)` in `report.promoted_events` without internal length filtering.
+   - The caller ([`PipelineOrchestrator.run()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/pipeline.py#L686-L735)) uniformly filters `report.promoted_events` via [`filter_promoted_events_by_length()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L525-L564) at **`DEFAULT_MIN_PROMOTE_LEN_MM = 1.5` mm**, suppresses promotion if `rapidMode` indicates dog-leg rapids (`highFeedMapping != 0` or `useG0 == False`), removes any colliding `(sec_idx, event_idx)` events, and stamps `ev["promote"] = True` via [`apply_promotions_to_context()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L478-L519).
 6. **Single-Pass Unmodified Vendor Post Replay**: [`universal_replayer.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_replayer.cps) compiles the unmodified vendor `.cps` inside a lexical closure that shadows the C++ engine's read-only globals (`currentSection`, `tool`, `movement`, etc.) and replays the entire multi-tool `onOpen() -> for each section: onSection() / events / onSectionEnd() -> onClose()` lifecycle in a single invocation.
 7. **Zero Modification of Stock Vendor Posts**: Stock vendor posts (`centroid_turning.cps`, `tormach.cps`, `shopbot.cps`, `acurite millpwr 2.cps`, etc.) remain 100% untouched.
 
@@ -38,28 +40,29 @@ By separating **Pass 1: Per-Batch Context Extraction (`universal_dumper.cps`)** 
 ```mermaid
 flowchart TD
     subgraph Fusion["Pass 1: Fusion 360 Add-In (PostProcessAll.py)"]
-        Setup["Active Turning / Milling Setup"] --> ExtractModel["_ExtractWorkpieceFromSetup() (Stock & Fixtures)"]
+        Setup["Active Turning / Milling Setup"] --> ExtractModel["_ExtractWorkpieceFromSetup()\n(Box / Cylinder / Tube / From Solid)"]
         Setup --> Partition["Partition into Single-Tool Batches\nBatch 0 (T1), Batch 1 (T2), ..."]
-        Partition --> Dump0["Post Batch 0 with universal_dumper.cps\n(BASE_POST + TARGET_INTERMEDIATE_CNC)"]
-        Partition --> Dump1["Post Batch 1..K with universal_dumper.cps\n(BASE_POST)"]
-        Dump0 --> JSON0["batch_0.json + bootstrap.intermediate.cnc"]
+        Partition --> Dump0["Post Batch 0 with universal_dumper(_export_stock).cps\n(DUMPER_CONFIG_PATH + BASE_POST + TARGET_INTERMEDIATE_CNC)"]
+        Partition --> Dump1["Post Batch 1..K with universal_dumper.cps\n(DUMPER_CONFIG_PATH + BASE_POST)"]
+        Dump0 --> JSON0["batch_0.json + bootstrap.intermediate.cnc + optional stock.stl"]
         Dump1 --> JSON1["batch_1.json ... batch_K.json"]
     end
 
-    subgraph Python["Pass 2: Context Merger & Unified 2D IPW Verifier (context_parser.py & geometry/)"]
+    subgraph Python["Pass 2: Context Merger & Unified IPW Verifier (pipeline.py, context_parser.py & geometry/)"]
         JSON0 & JSON1 --> Merger["merge_context_dumps([batch_0.json, ...])\nUnified Multi-Section Context JSON"]
         Merger --> Parser["parse_context_dump(combined_ctx)\nContinuous List[MotionSegment]"]
-        ExtractModel --> Verifier["Lathe2DIPWVerifier.verify_toolpath()\nSingle Continuous IPW Simulation"]
+        Merger --> ExtractWP["extract_workpiece_from_context()\n(Parametric or STL Stock + H2/H4 Checks)"]
+        ExtractModel --> ExtractWP
+        ExtractWP --> Verifier["MillHeightfieldVerifier / Lathe2DIPWVerifier\nSingle Continuous IPW Simulation"]
         Parser --> Verifier
-        Verifier --> Artifacts["Generate Verification Plot (.png)\n& Markdown Report (_report.md)"]
-        Verifier --> Gate{"Fatal Collisions?\n(RAPID_INTO_STOCK,\nHOLDER_STRIKE,\nFIXTURE_COLLISION)"}
-        Gate -- "Yes" --> Halt["Halt Pipeline & Alert User"]
-        Gate -- "No" --> Promote["apply_promotions_to_context()\nStamp ev.promote = true on safe high-feed moves"]
+        Verifier --> FilterLen["filter_promoted_events_by_length(min_len_mm=1.5)\n+ Dog-Leg & Collision Event Filtering"]
+        FilterLen --> Promote["apply_promotions_to_context()\nStamp ev.promote = true on safe air events"]
+        FilterLen --> Artifacts["Generate Verification Plot (.png)\n& Markdown Report (_report.md)"]
     end
 
     subgraph Replay["Pass 3: Single-Pass Vendor Post Replay (universal_replayer.cps)"]
         Promote --> PromotedJSON["combined_promoted.json"]
-        PromotedJSON --> Replayer["Autodesk post CLI:\nuniversal_replayer.cps + bootstrap.intermediate.cnc\n(BASE_POST, CONTEXT_DUMP_JSON)"]
+        PromotedJSON --> Replayer["Autodesk post CLI:\nuniversal_replayer.cps + bootstrap.intermediate.cnc\n(REPLAYER_CONFIG_PATH / BASE_POST / CONTEXT_DUMP_JSON)"]
         Replayer --> FinalNC["Final Combined Machine G-Code (.nc / .tap / .sbp)"]
     end
 ```
@@ -69,13 +72,15 @@ flowchart TD
 ## 3. Component & Tool Interfaces
 
 ### 3.1 `universal_dumper.cps` (Context & Intermediate Extractor)
-Executed by the Autodesk Fusion Post Kernel (`post` binary or `NCProgram.postProcess()`).
+Executed by the Autodesk Fusion Post Kernel (`post` binary or `cam.postProcess()`).
 
-#### Input Environment Variables
-| Variable | Required | Description |
+#### Input Configuration (`DUMPER_CONFIG_PATH` Sidecar & Environment Variables)
+| Variable / Config Key | Required | Description |
 | :--- | :---: | :--- |
-| `BASE_POST` | Optional (Recommended) | Absolute path to the target vendor `.cps` post processor. When provided, `universal_dumper.cps` evaluates the vendor post inside `buildVendor` so that kernel variables (`tolerance`, `minimumChordLength`, `maximumCircularRadius`, `allowedCircularPlanes`, `mapWorkOrigin`) match the target machine. |
+| `DUMPER_CONFIG_PATH` | Recommended | Path to per-run `0o700` `universal_dumper_config.json` containing `basePost`, `targetIntermediateCnc`, `postProperties`, `stockMode`, `export_stock`, `unit`, and `stockUnit`. |
+| `BASE_POST` | Optional (Recommended) | Absolute path to the target vendor `.cps` post processor. Loaded inside `universal_dumper.cps` so kernel tolerances (`tolerance`, `minimumChordLength`, `maximumCircularRadius`, `allowedCircularPlanes`) and `rapidMode` (`highFeedMapping`, `useG0`) match the target machine. |
 | `TARGET_INTERMEDIATE_CNC` | Optional | Absolute destination path where `universal_dumper.cps` copies the Fusion kernel's binary/Compact-NCI intermediate file (`getIntermediatePath()`) via `copyFile()`. |
+| `universal_dumper_export_stock.cps` | Automatic (Batch 0 of `PreviousSetupStock`) | Because `post --interrogate` executes in Safe Mode (where `getEnvironmentVariable` and `FileSystem.isFile` are disabled), staging a copy named `universal_dumper_export_stock.cps` allows `getConfigurationPath()` to enable `"exportStock": true` during interrogation so Fusion exports the setup's in-process stock STL and populates `autodeskcam:stock-path`. |
 
 #### Output Schema (`batch_i.json`)
 ```json
@@ -165,29 +170,28 @@ Executed by the Autodesk Fusion Post Kernel (`post` binary or `NCProgram.postPro
 ---
 
 ### 3.2 `context_parser.py` (Context Merger, Normalizer & Promotion Stamper)
-Provides four pure Python functions bridging [`universal_dumper.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_dumper.cps), [`Lathe2DIPWVerifier`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/lathe_engine.py), and [`universal_replayer.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_replayer.cps):
+Provides pure Python functions bridging [`universal_dumper.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_dumper.cps), the verification engines ([`MillHeightfieldVerifier`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/heightfield_engine.py), [`Lathe2DIPWVerifier`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/lathe_engine.py), [`MillClearanceVerifier`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/mill_engine.py)), and [`universal_replayer.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_replayer.cps):
 
 | Function | Signature | Responsibility |
 | :--- | :--- | :--- |
-| [`load_context_dump`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L22-L26) | `(json_path: str) -> Dict[str, Any]` | Loads a single JSON context dump produced by `universal_dumper.cps`. |
-| [`merge_context_dumps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L29-L115) | `(json_paths_or_dicts: Sequence[Union[str, Dict]]) -> Dict[str, Any]` | Concatenates `sections` across all single-tool batches, re-indexes `sec["id"] = 0..N-1`, records `batchIdx` and `batchSectionIdx`, and merges `globalParameters`. |
-| [`parse_context_dump`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L118-L295) | `(ctx_or_path: Union[str, Dict], scale_override: Optional[float] = None) -> List[MotionSegment]` | Converts all `onRapid`, `onLinear`, `onCircular`, and `onCyclePoint` events across all sections into a continuous millimeter-normalized `List[MotionSegment]`. Preserves `section_id`, `event_idx`, `batch_idx`, and `occurrence` in `seg.metadata`. |
-| [`apply_promotions_to_context`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L298-L355) | `(context: Dict[str, Any], promoted_events: Set[Tuple[int, int]]) -> int` | Directly applies safe `promoted_events` keys `(sec_idx, event_idx)` to `context` and stamps `ev["promote"] = True`. |
+| [`load_context_dump`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L22-L28) | `(json_path: str) -> Dict[str, Any]` | Loads a single JSON context dump produced by `universal_dumper.cps`. |
+| [`merge_context_dumps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L31-L132) | `(json_paths_or_dicts: Sequence[Union[str, Dict]]) -> Dict[str, Any]` | Concatenates `sections` across all single-tool batches, re-indexes `sec["id"] = 0..N-1`, records `batchIdx` and `batchSectionIdx`, and propagates `stockPath`, `stockMode`, `stockUnit`, `workpieceHint`, `rapidMode`, and `globalParams`. |
+| [`parse_context_dump`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L135-L475) | `(ctx_or_path: Union[str, Dict]) -> List[MotionSegment]` | Converts all `onRapid`, `onLinear`, `onCircular`, and `onCyclePoint` events across all sections into a continuous millimeter-normalized `List[MotionSegment]`, including dynamic Constant Surface Speed (`G96` CSS) RPM calculation and `rc_transition` tracking. |
+| [`filter_promoted_events_by_length`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L525-L564) | `(promoted_events: Sequence[Tuple[int, int]], segments: Sequence[MotionSegment], min_len_mm: float = 1.5) -> Set[Tuple[int, int]]` | Uniform caller-level filter retaining only `(sec_idx, event_idx)` events whose 3D Euclidean travel distance across `segments` is `>= min_len_mm` (`DEFAULT_MIN_PROMOTE_LEN_MM = 1.5` mm). Fails closed on unknown keys. |
+| [`apply_promotions_to_context`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L478-L519) | `(context_data: Dict[str, Any], promoted_moves: Sequence[Tuple[int, int]]) -> int` | Stamps `ev["promote"] = True` onto eligible `onLinear` events addressed by `(sec_idx, event_idx)` (blocking `in_cycle`, `sync`, and `rc != 0`). |
+| [`extract_workpiece_from_context`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L567-L685) | `(context_data: Dict[str, Any], fallback_workpiece: Any = None, is_turning: Optional[bool] = None) -> Optional[WorkpieceDefinition]` | Extracts `WorkpieceDefinition` (`mm`) from `workpiece` or exported `stockPath` STL (binary/ASCII), validating scale against `workpieceHint` and converting meshes into `SolidMeshStock3D` (milling) or `AxisymmetricStock2D` (turning). |
+| [`extract_tools_from_context`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L688-L907) | `(context_data: Dict[str, Any], is_turning: Optional[bool] = None) -> Dict[str, ToolAssembly]` | Builds `ToolAssembly` definitions (`MillToolGeometry` or `LatheToolGeometry`) per operation from section tool metadata. |
 
 ---
 
-### 3.3 `Lathe2DIPWVerifier` (`geometry/lathe_engine.py`)
-Executes analytical 2D axisymmetric In-Process Workpiece (IPW) simulation using Shapely polygon boolean operations.
-
-#### Inputs
-- `segments: Sequence[MotionSegment]` — Continuous toolpath sequence across all tools in the setup (in mm).
-- `tools_by_op: Mapping[str, ToolAssembly]` — Analytical cutter and holder polygons for each operation (`generate_rhombic_insert`, `generate_grooving_insert`, `generate_drill_cutter`, `generate_turning_holder`).
-- `workpiece: WorkpieceDefinition` — Initial cylindrical/tubular stock (`AxisymmetricStock2D`) and chuck jaw obstacles (`AxisymmetricChuckObstacle`).
-
-#### Outputs (`VerificationReport`)
-- `collisions: List[CollisionEvent]` — Classified into `RAPID_INTO_STOCK`, `HOLDER_STRIKE`, `FIXTURE_COLLISION`, and ` EXCESSIVE_DEPTH_OF_CUT`.
-- `promoted_events: Set[Tuple[int, int]]` — Set of safe high-feed traverse event keys `(sec_idx, event_idx)`. A high-feed linear move (`is_high_feed=True` or `feed >= high_feed_threshold`) is promoted if and only if its swept cutter+holder envelope maintains at least `c_clear` (default `0.5 mm`) clearance from both the current IPW stock and chuck fixtures on that specific event execution.
-- `mrr_spikes: List[MRRSpikeEvent]` & `total_volume_removed_mm3: float` — Material removal volume integrated via Pappus's Centroid Theorem ($V = 2\pi \cdot A \cdot \bar{x}$).
+### 3.3 Verification Engines (`MillHeightfieldVerifier`, `Lathe2DIPWVerifier`, `MillClearanceVerifier`)
+All verifiers implement [`IVerificationEngine`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/engine_interface.py#L21-L75):
+- **`MillHeightfieldVerifier` (`geometry/heightfield_engine.py`)**: 3D Z-map heightfield simulation supporting `BoxStock3D` and vectorized triangle rasterization of `SolidMeshStock3D`. Detects `RAPID_INTO_STOCK`, `HOLDER_STRIKE`, and `SHANK_RUB`, integrates volumetric MRR, and evaluates cutter/holder clearances for air moves.
+- **`Lathe2DIPWVerifier` (`geometry/lathe_engine.py`)**: 2D axisymmetric Shapely polygon clipping in the `(Z, R >= 0)` half-plane supporting `AxisymmetricStock2D` (including revolved profiles extracted from 3D solid/STL meshes) and `AxisymmetricChuckObstacle` fixtures.
+- **`MillClearanceVerifier` (`geometry/mill_engine.py`)**: Lightweight fallback verifier promoting pure `Z+` vertical retracts reaching at or above `zClearance`.
+- **Caller-Side Length & Alignment Gates (`pipeline.py`)**:
+  - Engines evaluate `is_air_move` purely geometrically without internal length thresholds; `PipelineOrchestrator.run()` applies `filter_promoted_events_by_length(..., min_len_mm=1.5)` uniformly across all verifiers.
+  - For STL-derived stock (`stockPath` / `is_stl_derived`), `PipelineOrchestrator.run()` verifies `>= 50%` bounding-box overlap between cutting toolpaths and the stock model (accounting for cutter radius in XY and in-air `G1` clearance retracts above `st_max_z` in milling).
 
 ---
 

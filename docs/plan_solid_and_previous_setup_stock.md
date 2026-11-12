@@ -106,23 +106,18 @@ a test for this.
   Error out if the solid isn't reasonably centered on the spindle axis.
 - **Enables Option B for multi-setup parts**: Users with multi-setup parts can use *Simulation → Save Stock* on Op 1 and assign the saved body as "From Solid" in Op 2.
 
-### Phase 2 — "From Preceding Setup" (Option A, stored IPW) — DEFERRED
-**Status: Deferred to a later stage.**
+### Phase 2 — "From Preceding Setup" (Native Fusion CAM STL Export) — COMPLETED
+**Status: Completed and active in production.**
 
-#### Safety Guarantees vs. User Convenience Analysis:
-1. **Is "From Preceding Setup" needed for safety guarantees?**
-   - **No.** The pipeline currently detects `adsk.cam.SetupStockModes.PreviousSetupStock` and aborts immediately with an explicit, user-facing error dialog without writing any NC output. This is a fail-safe, 100% safe state.
-   - At no point is an unverified setup allowed to execute rapids based on unmodeled predecessor stock.
-2. **Safety of Option B (Phase 1) vs. Option A (Phase 2)**:
-   - **Option B (Phase 1) is actually safer than Option A**: Fusion's *Simulation → Save Stock* computes the exact in-process mesh using its internal solid simulation engine (preserving undercuts, exact 180° flips, radial features, and 5-axis cuts). When fed into our Phase 1 "From Solid" verifier, the starting stock for Op 2 is exact.
-   - In contrast, Option A attempts to pass our 2.5D top-only heightfield across setups. Flipped setups lose bottom-side cuts, arbitrary rotations require coarse bounding envelopes, and complex toolpath caching/hash-chaining is required.
-3. **What is "From Preceding Setup" actually for?**
-   - It is purely a **workflow automation convenience**: avoiding the need for the user to manually click *Simulate → Save Stock → Edit Op 2 Setup → Pick Solid*.
-   - Because Phase 1 ("From Solid") already solves the physical multi-setup verification capability safely via Option B, automating the transfer via sidecar `.npz` files can be safely deferred.
-4. **Deferred implementation details (for future reference)**:
-   - Resolve predecessor by browser order (`cam.setups`).
-   - Load and validate stored IPW sidecar (`.ipw.npz`) using Pass 1 toolpath hash validation.
-   - Transfer IPW via $T = WCS_{\text{child}}^{-1} \cdot WCS_{\text{parent}}$.
+#### Implementation Summary:
+1. **Native CAM Post Engine Stock Export (`exportStock = true`)**:
+   - When Fusion 360's post engine interrogates a `.cps` post processor that declares `"exportStock": true` (used by CAMplete/Vericut integrations), `Iron::PostProcess::exportSetupMeshData` automatically exports the setup's exact simulated in-process stock mesh as an STL file in the post output directory and passes its path via the global parameter `autodeskcam:stock-path`.
+   - Because `post --interrogate` runs in Safe Mode (where `getEnvironmentVariable` and `FileSystem.isFile` are disabled), `_PostProcessUnifiedPipeline` in `PostProcessAll.py` stages `universal_dumper_export_stock.cps` for `batch_0` of any `PreviousSetupStock` setup. `universal_dumper.cps` inspects `getConfigurationPath()` (which is allowed in Safe Mode) and sets `"exportStock": true` only for `batch_0`.
+2. **Preceding Setup Validation (`PostProcessSetup`)**:
+   - Walks all earlier non-suppressed setups (`all_setups[:s_idx]`) in browser order, verifying that preceding operations have valid toolpaths before posting.
+3. **STL Parsing, Unit Cross-Check (H2) & Alignment Verification (H4)**:
+   - `extract_workpiece_from_context()` parses binary or ASCII STL files (`parse_stl_file`), cross-checks dimensions against `workpieceHint` (allowing 1–2 axes machined smaller while requiring at least one axis within 5% and no axis exceeding `workpieceHint * 1.05`), and converts the mesh to `SolidMeshStock3D` (milling) or `AxisymmetricStock2D` (turning).
+   - `PipelineOrchestrator.run()` verifies `>= 50%` bounding-box overlap between cutting toolpaths and the STL stock (accounting for maximum cutter radius in XY and vertical `G1` clearance retracts above `st_max_z`).
 
 ### Phase 3 — Optional fidelity upgrade
 - Add `z_bottom` to `HeightfieldGrid` for exact 3-axis flips.
@@ -202,7 +197,6 @@ Any mismatch triggers the stop-and-ask error from Phase 2, step 2.
 
 ## 5. Decisions
 1. **Stock-mode detection fix (Phase 0)**: COMPLETED and pushed (`decae38`).
-2. **Phase 2 ("From Preceding Setup")**: DEFERRED. Not required for safety guarantees (unsupported setups are safely rejected with zero NC output); Option B (*Simulation → Save Stock → From Solid*) serves multi-setup parts with exact 3D solid geometry once Phase 1 is in place.
-3. **Phase 1 ("From Solid")**: COMPLETED and pushed (`3923614`). Implements direct B-Rep and MeshBody extraction, WCS transforms, 2.5D heightfield rasterization, and lathe spindle-axis centering profile extraction.
-4. **Option B workflow**: Active in production. When multi-setup parts require stock transfer, users save stock in Simulation and select it as "From Solid", which is verified with exact 3D geometry.
+2. **Phase 1 ("From Solid")**: COMPLETED and pushed (`3923614`). Implements direct B-Rep and MeshBody extraction, WCS transforms, vectorized 2.5D heightfield rasterization, and lathe spindle-axis centering profile extraction.
+3. **Phase 2 ("From Preceding Setup")**: COMPLETED (`5a2d909`). Uses Fusion CAM's native `exportStock` + `autodeskcam:stock-path` STL export mechanism (enabled in Safe Mode via `universal_dumper_export_stock.cps`), with binary/ASCII STL loading, `workpieceHint` scale verification (H2), and toolpath/stock bounding-box overlap verification (H4).
 

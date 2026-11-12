@@ -90,14 +90,21 @@ You are responsible for ensuring a tool crash does not occur.
 
 ### Unified Toolpath Verification, Collision-Free Rapid Promotion & Diagnostics
 `Post Process All` includes a complete In-Process Workpiece (IPW) simulation and toolpath verifier for both **Milling** and **Turning** setups using a clean 2-pass architecture:
-- **Pass 1 (Direct Context Dump)**: Emits per-operation kinematic events and section data via `universal_dumper.cps` inside Fusion without modifying or registering in the user's Post Library.
+- **Pass 1 (Direct Context Dump)**: Emits per-operation kinematic events, tool definitions, and section data via `universal_dumper.cps` inside Fusion without modifying or registering in the user's Post Library.
+- **Full Stock Mode Support**:
+  - **Parametric Stock**: Box, Cylinder, and Tube stock definitions (`FixedBoxStock`, `RelativeBoxStock`, `FixedCylinderStock`, `RelativeCylinderStock`, `FixedTubeStock`, `RelativeTubeStock`).
+  - **From Solid (`SolidStock`)**: Extracts B-Rep and MeshBody stock geometry directly from Fusion, transforms vertices into the setup WCS, and builds an exact 3D heightfield or axisymmetric turning envelope.
+  - **From Preceding Setup (`PreviousSetupStock`)**: Automatically triggers Fusion CAM's native in-process stock STL export (`exportStock` via `universal_dumper_export_stock.cps`), validates unit scale against `workpieceHint`, and verifies toolpath/stock bounding-box alignment.
 - **Unified Verification Simulation**:
-  - **Milling (`geometry/heightfield_engine.py`)**: 3D Heightfield grid simulation tracking material removal, gouges, shank rubs, holder strikes, and rapids into stock.
-  - **Turning (`geometry/lathe_engine.py`)**: Exact 2D axisymmetric IPW polygon simulation using `shapely`, tracking swept inserts and holders with fixture/chuck guard monitoring.
+  - **Milling (`geometry/heightfield_engine.py`)**: Vectorized 3D Heightfield grid simulation tracking material removal, gouges, shank rubs, holder strikes, and rapids into stock (with `MillClearanceVerifier` fallback when NumPy is unavailable).
+  - **Turning (`geometry/lathe_engine.py`)**: Exact 2D axisymmetric IPW polygon simulation using `shapely`, tracking swept inserts and holders, fixture/chuck guard monitoring, and dynamic Constant Surface Speed (`G96` CSS) spindle RPM modeling clamped by `maximumSpindleSpeed`.
   - **Universal Collision Detection**: Detects `RAPID_INTO_STOCK`, `HOLDER_STRIKE`, `FIXTURE_COLLISION`, and `SHANK_RUB`, logging detailed diagnostics while continuing final NC code generation.
-- **Collision-Free Rapid Promotion**: When **Restore rapid moves** is enabled, verified air moves with zero material removal and safe clearances are promoted to `G0`. Promoted moves are strictly filtered to guarantee they do not cause or contribute to collisions.
+- **Collision-Free Rapid Promotion**: When **Restore rapid moves** is enabled, verified air moves with zero material removal and safe cutter/holder clearances are promoted to `G0` using per-event `(sec_idx, event_idx)` addressing:
+  - Enforces a uniform caller-level **`1.5 mm` minimum travel length filter** (`DEFAULT_MIN_PROMOTE_LEN_MM = 1.5`) so tiny micro-segments are never promoted to `G0`.
+  - Automatically disables promotion when the target post processor uses dog-leg rapid mapping (`highFeedMapping != 0` or `useG0 = false`).
+  - Blocks promotion inside canned cycles (`in_cycle`), during active cutter radius compensation (`rc != 0` or compensation transitions), on synchronized moves (`sync`), or on any event with a detected collision.
 - **Pass 2 (Single-Pass Vendor Replay)**: Emits final machine-dialect NC code by executing the user's unmodified vendor post processor (`universal_replayer.cps`) once across all merged sections, natively preserving tool changes and modal states.
-- **Diagnostics & High-Resolution Reports**: For each setup, generates a comprehensive markdown report (`<Setup>_report.md`) detailing operation metrics, MRR spikes, and collision breakdowns, accompanied by a high-resolution visual verification plot (`<Setup>.png`).
+- **Diagnostics & High-Resolution Reports**: For each setup, generates a comprehensive markdown report (`<Setup>_report.md`) detailing operation metrics, stock/toolpath alignment bounds, MRR spikes, and collision breakdowns, accompanied by a high-resolution visual verification plot (`<Setup>.png`).
 - **Installing Verifier Dependencies**: Run `python install_packages.py` once to install required dependencies (`shapely`, `numpy`, `matplotlib`) for Windows (`win_amd64`), macOS (`arm64`/`x86_64`), or Linux.
 
 ### Rename Setups

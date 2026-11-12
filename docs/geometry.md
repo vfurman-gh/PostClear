@@ -76,10 +76,13 @@ Given drill diameter $D$, point angle $\theta_{\text{point}}$ (standard $118^\ci
 
 ---
 
-### D. Workpiece & Fixture Stock (`stock_generator.py`)
-1. **Axisymmetric Solid Stock**: Box polygon in $(Z, R)$ extending across $[Z_{\min}, Z_{\max}] \times [0, R_{\text{outer}}]$.
+### D. Workpiece, Solid Mesh & Fixture Stock (`stock_generator.py`, `solid_mesh.py`, `mesh_utils.py`)
+1. **Axisymmetric Solid Stock (`AxisymmetricStock2D`)**: Box polygon in $(Z, R)$ extending across $[Z_{\min}, Z_{\max}] \times [0, R_{\text{outer}}]$, or arbitrary revolved solid polygon extracted from 3D mesh stock.
 2. **Hollow Bored Tubing**: Boolean difference subtracting inner core $[Z_{\min}, Z_{\max}] \times [0, R_{\text{inner}}]$.
-3. **Rotating Chuck Obstacle**: Axisymmetric keep-out bounding box across $[Z_{\text{chuck\_min}}, Z_{\text{chuck\_max}}] \times [R_{\text{clamping}}, R_{\text{chuck\_od}}]$.
+3. **Rotating Chuck Obstacle (`AxisymmetricChuckObstacle`)**: Axisymmetric keep-out bounding box across $[Z_{\text{chuck\_min}}, Z_{\text{chuck\_max}}] \times [R_{\text{clamping}}, R_{\text{chuck\_od}}]$.
+4. **3D Milling Box & Solid Mesh Stock (`BoxStock3D`, `SolidMeshStock3D`)**:
+   - Supports parametric prismatic stock (`BoxStock3D`) and arbitrary 3D triangle meshes (`SolidMeshStock3D`) from Fusion `From Solid` (`BRepBody`/`MeshBody`) or `From Preceding Setup` (binary/ASCII STL via `parse_stl_file`).
+   - Vectorized chunked NumPy triangle-to-heightfield rasterization (`rasterize_triangles_to_grid`) and axisymmetric turning profile extraction (`mesh_to_axisymmetric_stock`).
 
 ---
 
@@ -122,10 +125,17 @@ In [`tests/test_geometry_parity.py`](file:///Users/vadimf/Documents/Fusion360-Ba
 
 ```
 geometry/
-├── __init__.py           # Unified exports of domain models and analytical generators
-├── models.py             # Data classes: LatheToolGeometry, AxisymmetricStock2D, etc.
-├── tool_generator.py     # Pure-Python mathematical tool polygon generators
-├── stock_generator.py    # Analytical stock and fixture polygon generators
-├── legacy_adapter.py     # SVG parser and legacy comment deserializer (for test parity)
-└── README.md             # This document
+├── __init__.py            # Unified exports of domain models, engines, and analytical generators
+├── models.py              # Data classes: LatheToolGeometry, MillToolGeometry, SolidMeshStock3D, etc.
+├── engine_interface.py    # IVerificationEngine & BaseVerificationEngine contract
+├── heightfield_engine.py  # 3D Milling Z-map heightfield IPW & collision verification engine
+├── lathe_engine.py        # 2D Axisymmetric Turning Shapely IPW & collision verification engine
+├── mill_engine.py         # MillClearanceVerifier conservative Z+ clearance fallback engine
+├── solid_mesh.py          # Vectorized 3D mesh rasterization & axisymmetric profile extraction
+├── mesh_utils.py          # Binary/ASCII STL parser & 4x4 WCS coordinate transformations
+├── plotter.py             # High-resolution 2D Turning & 3D Milling verification plot generators
+├── tool_generator.py      # Pure-Python mathematical tool polygon generators
+├── stock_generator.py     # Analytical stock and fixture polygon generators
+├── legacy_adapter.py      # SVG parser and legacy comment deserializer (for test parity)
+└── README.md              # This document
 ```
