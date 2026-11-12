@@ -290,7 +290,9 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
             )
             verifier = Lathe2DIPWVerifier(tool_scale_to_mm=1.0)
             report = verifier.verify_toolpath(segments, tools_by_op, workpiece)
-            promoted_count = apply_promotions_to_context(combined_ctx, report.promoted_events)
+            from context_parser import filter_promoted_events_by_length
+            filtered_events = filter_promoted_events_by_length(report.promoted_events, segments)
+            promoted_count = apply_promotions_to_context(combined_ctx, filtered_events)
             self.assertGreaterEqual(promoted_count, 5)
 
             out_nc = os.path.join(tmp_dir, "centroid_2tool.nc")

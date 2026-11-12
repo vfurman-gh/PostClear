@@ -36,6 +36,8 @@ class MillClearanceVerifier(IVerificationEngine):
     Conservative Milling verifier that only promotes pure `Z+` vertical retract
     moves (`dx == 0, dy == 0, end.z > start.z`) reaching at or above the
     operation's clearance height (`zClearance`).
+    Note: `promoted_events` is not length-filtered by the engine; minimum travel length
+    filtering is applied by the caller (e.g. `filter_promoted_events_by_length` / `PipelineOrchestrator.run`).
     """
 
     def __init__(

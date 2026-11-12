@@ -20,6 +20,7 @@ Orchestrates the G-code-dialect-independent flow:
 
 import glob
 import json
+import math
 import os
 from pathlib import PurePosixPath, PureWindowsPath
 import re
@@ -37,9 +38,11 @@ from geometry.models import (
 )
 from geometry.engine_interface import IVerificationEngine
 from context_parser import (
+    DEFAULT_MIN_PROMOTE_LEN_MM,
     merge_context_dumps,
     parse_context_dump,
     apply_promotions_to_context,
+    filter_promoted_events_by_length,
     extract_workpiece_from_context,
     extract_tools_from_context,
 )
@@ -313,13 +316,18 @@ class PipelineOrchestrator:
         replayer_cps: Optional[str] = None,
         timeout: float = 120.0,
         *args,
+        min_promote_len_mm: float = DEFAULT_MIN_PROMOTE_LEN_MM,
         **kwargs,
     ):
+        min_len_val = float(min_promote_len_mm)
+        if not math.isfinite(min_len_val) or min_len_val < 0.0:
+            raise ValueError(f"min_promote_len_mm must be a finite number >= 0, got {min_promote_len_mm!r}")
         self.post_bin = post_bin or find_autodesk_post_binary()
         if not self.post_bin or not os.path.isfile(self.post_bin):
             raise FileNotFoundError(f"Autodesk post executable not found: {self.post_bin}")
         self.post_bin_path = self.post_bin
         self.timeout = float(timeout)
+        self.min_promote_len_mm = min_len_val
 
         repo_root = os.path.dirname(os.path.abspath(__file__))
         self.dumper_cps = dumper_cps or os.path.join(repo_root, "universal_dumper.cps")
@@ -419,6 +427,7 @@ class PipelineOrchestrator:
         fallback_workpiece: Optional[WorkpieceDefinition] = None,
         is_turning: Optional[bool] = None,
         unit: Optional[int] = None,
+        min_promote_len_mm: Optional[float] = None,
         **kwargs,
     ) -> Tuple[VerificationReport, str]:
         """
@@ -429,6 +438,14 @@ class PipelineOrchestrator:
         def _notify(msg: str, frac: float):
             if progress_cb and not progress_cb(msg, frac):
                 raise RuntimeError("Operation cancelled by user.")
+
+        eff_min_promote_len = (
+            float(getattr(self, "min_promote_len_mm", DEFAULT_MIN_PROMOTE_LEN_MM))
+            if min_promote_len_mm is None
+            else float(min_promote_len_mm)
+        )
+        if not math.isfinite(eff_min_promote_len) or eff_min_promote_len < 0.0:
+            raise ValueError(f"min_promote_len_mm must be a finite number >= 0, got {eff_min_promote_len!r}")
 
         if context_dump_paths:
             dump_files = list(context_dump_paths)
@@ -667,6 +684,12 @@ class PipelineOrchestrator:
                 )
 
             report = verifier.verify_toolpath(segments, tools_by_op, workpiece)
+            if report.promoted_events:
+                report.promoted_events = filter_promoted_events_by_length(
+                    report.promoted_events,
+                    segments,
+                    min_len_mm=eff_min_promote_len,
+                )
             if tp_box_log and st_box_log:
                 report.stock_bounding_box = st_box_log
                 report.toolpath_bounding_box = tp_box_log

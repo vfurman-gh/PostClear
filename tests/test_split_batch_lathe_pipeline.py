@@ -99,9 +99,11 @@ class TestSplitBatchLathePipeline(unittest.TestCase):
 
             verifier = Lathe2DIPWVerifier(tool_scale_to_mm=1.0)
             report = verifier.verify_toolpath(segments, tools_by_op, workpiece)
-            self.assertGreater(len(report.promoted_events), 0, "Expected authorized air promotions")
+            from context_parser import filter_promoted_events_by_length
+            filtered_events = filter_promoted_events_by_length(report.promoted_events, segments)
+            self.assertGreater(len(filtered_events), 0, "Expected authorized air promotions")
 
-            promoted_cnt = apply_promotions_to_context(combined_ctx, report.promoted_events)
+            promoted_cnt = apply_promotions_to_context(combined_ctx, filtered_events)
             self.assertGreater(promoted_cnt, 0)
 
             # Verify both batch 0 and batch 1 sections received promoted events

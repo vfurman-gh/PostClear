@@ -13,6 +13,7 @@ Implements IVerificationEngine using optimized Shapely 2D polygon clipping:
 """
 
 import math
+import warnings
 from typing import Dict, List, Optional, Sequence, Tuple
 from shapely.affinity import translate, scale as shapely_scale
 from shapely.geometry import Polygon, MultiPolygon, box
@@ -131,16 +132,25 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
     High-fidelity 2D Lathe IPW Verifier.
     All internal calculations use standardized metric units (mm, mm/min, mm³, sec).
     Stock is modeled strictly in the radial half-plane (R >= 0) for optimal GEOS performance.
+    Note: `promoted_events` is not length-filtered by the engine; minimum travel length
+    filtering is applied by the caller (e.g. `filter_promoted_events_by_length` / `PipelineOrchestrator.run`).
     """
 
     def __init__(
         self,
         clearance_tol_mm: float = 0.05,     # Tolerance before flagging stock collision (mm)
         promote_margin_mm: float = 0.15,    # Clearance required from stock to authorize G0 (mm)
-        min_promote_len_mm: float = 0.35,   # Minimum travel distance to justify G0 promotion (mm)
+        min_promote_len_mm: Optional[float] = None,  # Deprecated (ignored); caller filters by length
         tool_scale_to_mm: float = 1.0,      # Legacy tool polygon scale factor to mm
     ):
         super().__init__()
+        if min_promote_len_mm is not None:
+            warnings.warn(
+                "min_promote_len_mm on Lathe2DIPWVerifier is deprecated and ignored; "
+                "length filtering is applied by the caller via filter_promoted_events_by_length.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.clearance_tol_mm = clearance_tol_mm
         self.promote_margin_mm = promote_margin_mm
         self.min_promote_len_mm = min_promote_len_mm
@@ -381,7 +391,7 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
         is_sync = bool(getattr(move, "sync", False) or meta.get("sync", False))
         if (
             not move.is_arc
-            and dist >= self.min_promote_len_mm
+            and dist > 1e-6
             and not in_cycle
             and not is_sync
             and not self._promotion_blocked(move)

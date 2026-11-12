@@ -519,6 +519,51 @@ def apply_promotions_to_context(
     return promoted_count
 
 
+DEFAULT_MIN_PROMOTE_LEN_MM: float = 1.5
+
+
+def filter_promoted_events_by_length(
+    promoted_events: Sequence[Tuple[int, int]],
+    segments: Sequence[MotionSegment],
+    min_len_mm: float = DEFAULT_MIN_PROMOTE_LEN_MM,
+) -> Set[Tuple[int, int]]:
+    """
+    Filter promoted event keys `(sec_idx, event_idx)` to keep only events whose
+    3D travel length across `segments` is `>= min_len_mm` (in mm).
+
+    Fails closed (drops the key) if an event key is not found in `segments`.
+    Setting `min_len_mm=0.0` disables length filtering.
+    """
+    val = float(min_len_mm)
+    if not math.isfinite(val) or val < 0.0:
+        raise ValueError(f"min_len_mm must be a finite number >= 0, got {min_len_mm!r}")
+    if not promoted_events:
+        return set()
+    event_set: Set[Tuple[int, int]] = set(promoted_events)
+    if val == 0.0:
+        return event_set
+
+    event_lengths: Dict[Tuple[int, int], float] = {}
+    for seg in segments:
+        s_meta = getattr(seg, "metadata", None) or {}
+        sec_i = s_meta.get("sec_idx", seg.sec_id)
+        ev_i = s_meta.get("event_idx")
+        if ev_i is None:
+            ev_i = seg.segment_id
+        ev_k = (sec_i, ev_i)
+        seg_len = math.sqrt(
+            (seg.end.x - seg.start.x) ** 2
+            + (seg.end.y - seg.start.y) ** 2
+            + (seg.end.z - seg.start.z) ** 2
+        )
+        event_lengths[ev_k] = event_lengths.get(ev_k, 0.0) + seg_len
+
+    return {
+        ev for ev in event_set
+        if event_lengths.get(ev, 0.0) >= val
+    }
+
+
 def extract_workpiece_from_context(
     context_data: Dict[str, Any],
     fallback_workpiece: Any = None,

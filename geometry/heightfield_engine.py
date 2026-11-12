@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import warnings
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Ensure packages directory is discoverable for Fusion 360's Python 3.14 environment
@@ -244,6 +245,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
     """
     3D Milling In-Process Workpiece (IPW) & Collision Verification Engine using
     a regular Heightfield Grid (Z-Map).
+    Note: `promoted_events` is not length-filtered by the engine; minimum travel length
+    filtering is applied by the caller (e.g. `filter_promoted_events_by_length` / `PipelineOrchestrator.run`).
     """
 
     def __init__(
@@ -252,17 +255,24 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         pad_mm: float = 10.0,
         promote_margin_mm: float = 0.5,
         holder_margin_mm: float = 1.0,
-        min_promote_len_mm: float = 0.5,
+        min_promote_len_mm: Optional[float] = None,
         z_tol_mm: float = 1e-3,
         xy_tol_mm: float = 1e-3,
     ) -> None:
         super().__init__()
         if np is None:
             raise ImportError("numpy is required for MillHeightfieldVerifier but could not be imported")
+        if min_promote_len_mm is not None:
+            warnings.warn(
+                "min_promote_len_mm on MillHeightfieldVerifier is deprecated and ignored; "
+                "length filtering is applied by the caller via filter_promoted_events_by_length.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.grid = HeightfieldGrid(cell_size_mm=cell_size_mm, pad_mm=pad_mm)
         self.promote_margin_mm = float(promote_margin_mm)
         self.holder_margin_mm = float(holder_margin_mm)
-        self.min_promote_len_mm = float(min_promote_len_mm)
+        self.min_promote_len_mm = min_promote_len_mm
         self.z_tol_mm = float(z_tol_mm)
         self.xy_tol_mm = float(xy_tol_mm)
 
@@ -630,7 +640,7 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         is_air_move = False
         if is_retract_air:
             is_air_move = True
-        elif (not cuts_material) and (not in_cycle) and (dist_3d >= self.min_promote_len_mm):
+        elif (not cuts_material) and (not in_cycle) and (dist_3d > 1e-6):
             # Check holder clearance
             holder_margin_clear = True
             if np.any(mask_holder):

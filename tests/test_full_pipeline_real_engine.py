@@ -93,7 +93,10 @@ class TestFullPipelineRealEngine(unittest.TestCase):
             # 1. Physics & Simulation Assertions
             self.assertEqual(len(report.collisions), 0, "Real toolpath should have 0 collisions")
             self.assertGreater(report.total_volume_removed_mm3, 7000.0, "Expected >7000 mm3 material carved")
-            self.assertGreaterEqual(len(report.promoted_events), 10, "Expected at least 10 promoted air events")
+            # Engine marks (1, 16) (length ~0.4326 mm in [0.35, 1.5)) as air, and caller filters it out at 1.5 mm
+            self.assertIn((1, 16), verifier.promoted_events)
+            self.assertNotIn((1, 16), report.promoted_events)
+            self.assertEqual(len(report.promoted_events), 9, "Expected 9 promoted air events (>= 1.5 mm)")
 
             # 2. Final G-Code Output Assertions
             self.assertTrue(os.path.isfile(out_cnc))
@@ -101,7 +104,7 @@ class TestFullPipelineRealEngine(unittest.TestCase):
             self.assertIn("N32 G0 X11.938", gcode, "Expected block N32 promoted to G0 X11.938")
             self.assertIn("N33 Z-1.524", gcode, "Expected block N33 promoted to modal G0 Z-1.524")
             self.assertIn("N34 G1 X12.446 Z-1.778 F0.0508", gcode, "Expected block N34 restored to G1 and feedrate")
-            self.assertIn(";UNIVERSAL WRAPPER RESTORED 10 G0 RAPID MOVES", gcode)
+            self.assertIn(";UNIVERSAL WRAPPER RESTORED 9 G0 RAPID MOVES", gcode)
 
             # 3. Report Assertions
             self.assertTrue(os.path.isfile(out_report))
@@ -109,7 +112,7 @@ class TestFullPipelineRealEngine(unittest.TestCase):
                 report_text = f.read()
 
             self.assertIn("7819.26 mm³", report_text)
-            self.assertIn("**G0 Moves Restored in G-code**: 10", report_text)
+            self.assertIn("**G0 Moves Restored in G-code**: 9", report_text)
             self.assertIn("Zero collisions detected", report_text)
 
 
