@@ -11,7 +11,7 @@ Orchestrates the G-code-dialect-independent flow:
 3. Unified IPW Verification (`IVerificationEngine`): Simulates stock removal, detects collisions,
    and computes occurrence-gated rapid-promotion rules across the combined setup in a single pass.
 4. Direct Promotion Annotation: Annotates authorized air moves in the combined JSON context
-   (`ev["promote"] = True`) and exports `promoted_vectors.json`.
+   (`ev["promote"] = True`).
 5. Single-Pass Vendor Post Replay (`universal_replayer.cps`): Executes the unmodified vendor
    `.cps` post processor (`BASE_POST`) once across all merged sections, producing a single
    dialect-native multi-tool NC program with native tool changes and rapid promotions.
@@ -21,6 +21,7 @@ Orchestrates the G-code-dialect-independent flow:
 import glob
 import json
 import os
+from pathlib import PurePosixPath, PureWindowsPath
 import re
 import subprocess
 import sys
@@ -28,6 +29,7 @@ import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from geometry.models import (
+    MotionKind,
     MotionSegment,
     ToolAssembly,
     WorkpieceDefinition,
@@ -44,16 +46,44 @@ from context_parser import (
 
 
 def find_fusion_root_from_path(p: Optional[str]) -> Optional[str]:
-    """Extract Fusion webdeploy root or .app directory from a path."""
+    """Extract Fusion webdeploy root or .app directory from a path using path components."""
+    if not p or not isinstance(p, (str, bytes)):
+        return None
+    if isinstance(p, bytes):
+        p = p.decode("utf-8", errors="replace")
+    p = p.strip().strip('"\'')
     if not p:
         return None
-    norm = os.path.normpath(os.path.abspath(p))
-    match = re.search(r"([A-Za-z0-9_:\-\\/\s]+[\\/]webdeploy[\\/]production[\\/][^\\/]+)", norm, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    match_app = re.search(r"([A-Za-z0-9_:\-\\/\s]+[\\/]Autodesk Fusion(?: 360)?\.app)", norm, re.IGNORECASE)
-    if match_app:
-        return match_app.group(1)
+
+    # Determine whether Windows or POSIX path representation
+    is_win = ("\\" in p) or (len(p) >= 2 and p[1] == ":" and p[0].isalpha())
+    cls = PureWindowsPath if is_win else PurePosixPath
+
+    # If there are leading tokens before an absolute path (e.g. from command lines), strip to path start
+    if not is_win:
+        slash_idx = p.find("/")
+        if slash_idx > 0:
+            p = p[slash_idx:]
+    else:
+        m = re.search(r"([a-zA-Z]:[\\/]|\\\\[^\\/]+[\\/])", p)
+        if m and m.start() > 0:
+            p = p[m.start():]
+
+    path_obj = cls(p)
+    parts = path_obj.parts
+
+    # 1. Search for 'webdeploy' -> 'production' -> <hash>
+    for i in range(len(parts) - 2):
+        if parts[i].lower() == "webdeploy" and parts[i + 1].lower() == "production":
+            hash_comp = parts[i + 2]
+            if hash_comp and hash_comp not in (".", ".."):
+                return str(cls(*parts[: i + 3]))
+
+    # 2. Search for '*.app' (e.g. standalone /Applications/Autodesk Fusion 360.app)
+    for i in range(len(parts)):
+        if parts[i].lower().endswith(".app"):
+            return str(cls(*parts[: i + 1]))
+
     return None
 
 
@@ -149,6 +179,26 @@ def find_autodesk_fusion_invoking_root() -> Optional[str]:
         except Exception:
             pass
     elif sys.platform == "win32":
+        # Query running Fusion360.exe process via PowerShell Get-CimInstance (replaces deprecated wmic)
+        cmd_ps = [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            'Get-CimInstance Win32_Process -Filter "name = \'Fusion360.exe\'" | Select-Object -ExpandProperty ExecutablePath',
+        ]
+        try:
+            with subprocess.Popen(cmd_ps, stdout=subprocess.PIPE, text=True) as proc:
+                out, _ = proc.communicate(timeout=5)
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line:
+                        root = find_fusion_root_from_path(line)
+                        if root and os.path.isdir(root):
+                            return root
+        except Exception:
+            pass
+        # Fallback to wmic for legacy Windows environments
         try:
             with subprocess.Popen(["wmic", "process", "where", "name='Fusion360.exe'", "get", "ExecutablePath"], stdout=subprocess.PIPE, text=True) as proc:
                 out, _ = proc.communicate(timeout=5)
@@ -164,8 +214,11 @@ def find_autodesk_fusion_invoking_root() -> Optional[str]:
     return None
 
 
-def find_autodesk_post_binary() -> Optional[str]:
-    """Locate the standalone Autodesk CAM post processor binary (macOS post or Windows post.exe)."""
+def find_autodesk_post_binary() -> str:
+    """
+    Locate the standalone Autodesk CAM post processor binary (macOS post or Windows post.exe).
+    Fails with FileNotFoundError if undetectable.
+    """
     env_post = os.environ.get("AUTODESK_POST_BINARY")
     if env_post and os.path.isfile(env_post):
         return env_post
@@ -177,39 +230,27 @@ def find_autodesk_post_binary() -> Optional[str]:
         if post_bin and os.path.isfile(post_bin):
             return post_bin
 
-    candidates = []
-    patterns = [
-        # macOS paths
-        "/Users/*/Library/Application Support/Autodesk/webdeploy/production/*/Autodesk Fusion.app/Contents/Libraries/Applications/CAM360/post",
-        "/Applications/Autodesk Fusion 360.app/Contents/Libraries/Applications/CAM360/post",
-        os.path.expanduser("~/Library/Application Support/Autodesk/webdeploy/production/*/Autodesk Fusion.app/Contents/Libraries/Applications/CAM360/post"),
+    # No mtime fallback or /Users/* glob: fail closed with clear diagnostics
+    inspected = [
+        f"sys.executable: '{sys.executable}'",
+        f"sys.prefix: '{sys.prefix}'",
+        f"sys.path ({len(sys.path)} entries)",
+        "loaded adsk modules (adsk, adsk.core, adsk.cam, adsk.fusion)",
+        "running host processes (ps / tasklist)",
     ]
-
-    # Windows paths
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    programfiles = os.environ.get("ProgramFiles", "")
-    programfiles_x86 = os.environ.get("ProgramFiles(x86)", "")
-    for base in (localappdata, programfiles, programfiles_x86):
-        if base:
-            patterns.append(os.path.join(base, "Autodesk", "webdeploy", "production", "*", "Applications", "CAM360", "post.exe"))
-            patterns.append(os.path.join(base, "Autodesk", "webdeploy", "production", "*", "post.exe"))
-
-    for pattern in patterns:
-        if pattern:
-            for match in glob.glob(pattern):
-                if os.path.isfile(match):
-                    candidates.append(match)
-
-    if not candidates:
-        return None
-
-    # Fallback: sort descending by modification time if no invoking installation was detected
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return candidates[0]
+    raise FileNotFoundError(
+        "Could not determine invoking Autodesk Fusion installation or locate CAM post processor binary. "
+        f"Inspected paths: {'; '.join(inspected)}. "
+        "Please launch from within Autodesk Fusion 360, or set the 'AUTODESK_FUSION_ROOT' or "
+        "'AUTODESK_POST_BINARY' environment variable to override."
+    )
 
 
-def find_autodesk_system_posts_dir() -> Optional[str]:
-    """Locate Autodesk Fusion's system Posts directory."""
+def find_autodesk_system_posts_dir() -> str:
+    """
+    Locate Autodesk Fusion's system Posts directory.
+    Fails with FileNotFoundError if undetectable.
+    """
     env_dir = os.environ.get("AUTODESK_SYSTEM_POSTS_DIR")
     if env_dir and os.path.isdir(env_dir):
         return env_dir
@@ -221,42 +262,29 @@ def find_autodesk_system_posts_dir() -> Optional[str]:
         if posts_dir and os.path.isdir(posts_dir):
             return posts_dir
 
-    candidates = []
-    patterns = [
-        # macOS paths
-        "/Users/*/Library/Application Support/Autodesk/webdeploy/production/*/Autodesk Fusion.app/Contents/Libraries/Applications/CAM360/Data/Posts",
-        "/Applications/Autodesk Fusion 360.app/Contents/Libraries/Applications/CAM360/Data/Posts",
-        os.path.expanduser("~/Library/Application Support/Autodesk/webdeploy/production/*/Autodesk Fusion.app/Contents/Libraries/Applications/CAM360/Data/Posts"),
+    # 2. Check if AUTODESK_POST_BINARY is set and system posts live beside it
+    env_post = os.environ.get("AUTODESK_POST_BINARY")
+    if env_post and os.path.isfile(env_post):
+        cam_dir = os.path.dirname(env_post)
+        for sub in ("Data/Posts", "Posts"):
+            cand = os.path.join(cam_dir, sub)
+            if os.path.isdir(cand):
+                return cand
+
+    # No mtime fallback or /Users/* glob: fail closed with clear diagnostics
+    inspected = [
+        f"sys.executable: '{sys.executable}'",
+        f"sys.prefix: '{sys.prefix}'",
+        f"sys.path ({len(sys.path)} entries)",
+        "loaded adsk modules (adsk, adsk.core, adsk.cam, adsk.fusion)",
+        "running host processes (ps / tasklist)",
     ]
-
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    programfiles = os.environ.get("ProgramFiles", "")
-    programfiles_x86 = os.environ.get("ProgramFiles(x86)", "")
-    for base in (localappdata, programfiles, programfiles_x86):
-        if base:
-            patterns.append(os.path.join(base, "Autodesk", "webdeploy", "production", "*", "Applications", "CAM360", "Data", "Posts"))
-            patterns.append(os.path.join(base, "Autodesk", "webdeploy", "production", "*", "Data", "Posts"))
-
-    for pattern in patterns:
-        if pattern:
-            for match in glob.glob(pattern):
-                if os.path.isdir(match):
-                    candidates.append(match)
-
-    if not candidates:
-        post_bin = find_autodesk_post_binary()
-        if post_bin:
-            cam_dir = os.path.dirname(post_bin)
-            for sub in ("Data/Posts", "Posts"):
-                cand = os.path.join(cam_dir, sub)
-                if os.path.isdir(cand):
-                    candidates.append(cand)
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return candidates[0]
+    raise FileNotFoundError(
+        "Could not determine invoking Autodesk Fusion installation or locate system Posts directory. "
+        f"Inspected paths: {'; '.join(inspected)}. "
+        "Please launch from within Autodesk Fusion 360, or set the 'AUTODESK_FUSION_ROOT' or "
+        "'AUTODESK_SYSTEM_POSTS_DIR' environment variable to override."
+    )
 
 
 def find_autodesk_apt_cps() -> Optional[str]:
@@ -265,7 +293,11 @@ def find_autodesk_apt_cps() -> Optional[str]:
     if env_apt and os.path.isfile(env_apt):
         return env_apt
 
-    posts_dir = find_autodesk_system_posts_dir()
+    try:
+        posts_dir = find_autodesk_system_posts_dir()
+    except (FileNotFoundError, RuntimeError):
+        posts_dir = None
+
     if posts_dir:
         cand = os.path.join(posts_dir, "apt.cps")
         if os.path.isfile(cand):
@@ -336,7 +368,6 @@ class PipelineOrchestrator:
         bootstrap_cnc_path: str,
         base_post_path: str,
         final_cnc_path: str,
-        promoted_json_path: Optional[str] = None,
     ) -> str:
         """
         Run Pass 2 (`universal_replayer.cps`) with the unmodified `base_post_path`
@@ -354,8 +385,6 @@ class PipelineOrchestrator:
             env = os.environ.copy()
             env["BASE_POST"] = os.path.abspath(base_post_path)
             env["CONTEXT_JSON"] = os.path.abspath(ctx_path)
-            if promoted_json_path and os.path.isfile(promoted_json_path):
-                env["PROMOTED_MOVES_JSON"] = os.path.abspath(promoted_json_path)
 
             cmd = [self.post_bin, "--quiet", self.replayer_cps, bootstrap_cnc_path, final_cnc_path]
             try:
@@ -389,6 +418,7 @@ class PipelineOrchestrator:
         program_name: Optional[str] = None,
         fallback_workpiece: Optional[WorkpieceDefinition] = None,
         is_turning: Optional[bool] = None,
+        unit: Optional[int] = None,
         **kwargs,
     ) -> Tuple[VerificationReport, str]:
         """
@@ -450,6 +480,8 @@ class PipelineOrchestrator:
                         combined_ctx["maximumSpindleSpeed"] = float(post_properties["maximumSpindleSpeed"])
                     except (TypeError, ValueError):
                         pass
+            if unit is not None:
+                combined_ctx["unit"] = int(unit)
 
             if is_turning is None:
                 is_turning = any(
@@ -463,28 +495,49 @@ class PipelineOrchestrator:
                 or ""
             ).lower()
 
-            setup_label = f"'{program_name}'" if program_name else "this setup"
-            if any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
-                raise ValueError(
-                    f"Setup {setup_label} uses 'From Previous Setup' stock, "
-                    "which is currently unsupported for toolpath verification."
-                )
-            if any(k in stock_mode for k in ("solid", "body")):
-                if workpiece is None and fallback_workpiece is None:
-                    raise ValueError(
-                        f"Setup {setup_label} uses 'From Solid' stock, "
-                        "but no solid body geometry was provided or extracted."
-                    )
-
-            if workpiece is None:
-                workpiece = extract_workpiece_from_context(combined_ctx, fallback_workpiece=fallback_workpiece, is_turning=is_turning)
-
             def _dbg_pipe(msg: str) -> None:
                 try:
                     from PostProcessAll import _dbg_global
                     _dbg_global(msg)
                 except Exception:
                     pass
+
+            explicit_workpiece = workpiece is not None
+            if explicit_workpiece and (combined_ctx.get("stockPath") or (isinstance(combined_ctx.get("stockExport"), dict) and combined_ctx["stockExport"].get("destPath"))):
+                _dbg_pipe(
+                    f"PipelineOrchestrator.run: workpiece provided explicitly; ignoring stockPath '{combined_ctx.get('stockPath')}'"
+                )
+
+            if workpiece is None:
+                workpiece = extract_workpiece_from_context(combined_ctx, fallback_workpiece=fallback_workpiece, is_turning=is_turning)
+
+            setup_label = f"'{program_name}'" if program_name else "this setup"
+            if any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
+                if not explicit_workpiece and (workpiece is None or not getattr(workpiece, "is_stl_derived", False)):
+                    se = combined_ctx.get("stockExport")
+                    if isinstance(se, dict):
+                        diag = (
+                            f" [stockExport: enabled={se.get('enabled')}, "
+                            f"hasParam={se.get('hasParam')}, "
+                            f"srcPath={se.get('srcPath')!r}, "
+                            f"srcExists={se.get('srcExists')}, "
+                            f"destPath={se.get('destPath')!r}, "
+                            f"error={se.get('error')!r}]"
+                        )
+                    else:
+                        diag = " [stockExport: none]"
+                    raise ValueError(
+                        f"Setup {setup_label} uses 'From Previous Setup' stock, "
+                        "but Fusion 360 did not produce a preceding stock mesh. "
+                        "Please verify that the preceding setup has generated toolpaths "
+                        f"and valid in-process stock before posting.{diag}"
+                    )
+            if any(k in stock_mode for k in ("solid", "body")):
+                if workpiece is None and fallback_workpiece is None:
+                    raise ValueError(
+                        f"Setup {setup_label} uses 'From Solid' stock, "
+                        "but no solid body geometry was provided or extracted."
+                    )
 
             _dbg_pipe(f"PipelineOrchestrator.run: workpiece stock={getattr(workpiece, 'stock', None)}")
 
@@ -517,6 +570,91 @@ class PipelineOrchestrator:
                         from geometry.mill_engine import MillClearanceVerifier
                         verifier = MillClearanceVerifier()
 
+            # Phase 1 H4: Runtime coordinate frame check for STL-derived stock
+            is_stl_stock = (
+                getattr(workpiece, "is_stl_derived", False)
+                or getattr(getattr(workpiece, "stock", None), "is_stl_derived", False)
+                or bool(combined_ctx.get("stockPath"))
+            )
+            tp_box_log = None
+            st_box_log = None
+            if is_stl_stock and segments:
+                cutting_segments = [s for s in segments if s.motion != MotionKind.RAPID]
+                if cutting_segments:
+                    tp_xs = [s.start.x for s in cutting_segments] + [s.end.x for s in cutting_segments]
+                    tp_ys = [s.start.y for s in cutting_segments] + [s.end.y for s in cutting_segments]
+                    tp_zs = [s.start.z for s in cutting_segments] + [s.end.z for s in cutting_segments]
+                    tp_min_x, tp_max_x = min(tp_xs), max(tp_xs)
+                    tp_min_y, tp_max_y = min(tp_ys), max(tp_ys)
+                    tp_min_z, tp_max_z = min(tp_zs), max(tp_zs)
+
+                    st = getattr(workpiece, "stock", None)
+                    if hasattr(st, "x_min") and hasattr(st, "x_max"):
+                        st_min_x, st_max_x = st.x_min, st.x_max
+                        st_min_y, st_max_y = st.y_min, st.y_max
+                        st_min_z, st_max_z = st.z_min, st.z_max
+                    elif hasattr(st, "outer_radius") and hasattr(st, "z_min"):
+                        st_r = st.outer_radius
+                        st_min_x, st_max_x = -st_r, st_r
+                        st_min_y, st_max_y = -st_r, st_r
+                        st_min_z, st_max_z = st.z_min, st.z_max
+                    else:
+                        st_min_x = st_max_x = st_min_y = st_max_y = st_min_z = st_max_z = 0.0
+
+                    tp_box_log = f"[{tp_min_x:.2f}, {tp_max_x:.2f}] x [{tp_min_y:.2f}, {tp_max_y:.2f}] x [{tp_min_z:.2f}, {tp_max_z:.2f}]"
+                    st_box_log = f"[{st_min_x:.2f}, {st_max_x:.2f}] x [{st_min_y:.2f}, {st_max_y:.2f}] x [{st_min_z:.2f}, {st_max_z:.2f}]"
+
+                    if is_turning:
+                        tp_z_span = max(0.0, tp_max_z - tp_min_z)
+                        ov_z = max(0.0, min(tp_max_z, st_max_z) - max(tp_min_z, st_min_z))
+                        if tp_z_span > 1e-6:
+                            z_ratio = ov_z / tp_z_span
+                        else:
+                            z_ratio = 1.0 if (st_min_z <= tp_min_z <= st_max_z) else 0.0
+                        _dbg_pipe(f"H4 turning Z overlap: toolpath={tp_box_log}, stock={st_box_log}, ratio={z_ratio*100:.1f}%")
+                        if z_ratio < 0.5:
+                            raise ValueError(
+                                f"Cutting toolpath Z span [{tp_min_z:.2f}, {tp_max_z:.2f}] has insufficient overlap ({z_ratio*100:.1f}% < 50%) "
+                                f"with stock Z span [{st_min_z:.2f}, {st_max_z:.2f}]. "
+                                f"Toolpath bounding box: {tp_box_log}; Stock bounding box: {st_box_log}."
+                            )
+                    else:
+                        max_tool_r = max(
+                            (
+                                float(getattr(getattr(t, "geometry", None), "diameter", 0.0) or 0.0) * 0.5
+                                for t in (tools_by_op or {}).values()
+                            ),
+                            default=0.0,
+                        )
+                        eff_st_min_x = st_min_x - max_tool_r
+                        eff_st_max_x = st_max_x + max_tool_r
+                        eff_st_min_y = st_min_y - max_tool_r
+                        eff_st_max_y = st_max_y + max_tool_r
+                        # When the toolpath enters below the top of the stock, vertical G1 plunges/retracts
+                        # to the clearance plane above st_max_z are in-air positioning moves and should not
+                        # inflate the cutting Z span.
+                        eff_tp_max_z = min(tp_max_z, st_max_z) if tp_min_z < st_max_z else tp_max_z
+
+                        tp_dx = max(0.0, tp_max_x - tp_min_x)
+                        tp_dy = max(0.0, tp_max_y - tp_min_y)
+                        tp_dz = max(0.0, eff_tp_max_z - tp_min_z)
+
+                        ov_dx = max(0.0, min(tp_max_x, eff_st_max_x) - max(tp_min_x, eff_st_min_x))
+                        ov_dy = max(0.0, min(tp_max_y, eff_st_max_y) - max(tp_min_y, eff_st_min_y))
+                        ov_dz = max(0.0, min(eff_tp_max_z, st_max_z) - max(tp_min_z, st_min_z))
+
+                        r_x = (ov_dx / tp_dx) if tp_dx > 1e-6 else (1.0 if eff_st_min_x <= tp_min_x <= eff_st_max_x else 0.0)
+                        r_y = (ov_dy / tp_dy) if tp_dy > 1e-6 else (1.0 if eff_st_min_y <= tp_min_y <= eff_st_max_y else 0.0)
+                        r_z = (ov_dz / tp_dz) if tp_dz > 1e-6 else (1.0 if st_min_z <= tp_min_z <= st_max_z else 0.0)
+                        vol_ratio = r_x * r_y * r_z
+
+                        _dbg_pipe(f"H4 milling volume overlap: toolpath={tp_box_log}, stock={st_box_log}, ratio={vol_ratio*100:.1f}%")
+                        if vol_ratio < 0.5:
+                            raise ValueError(
+                                f"Toolpath bounding box {tp_box_log} has insufficient volume overlap ({vol_ratio*100:.1f}% < 50%) "
+                                f"with Stock bounding box {st_box_log}."
+                            )
+
             if segments:
                 all_x = [s.start.x for s in segments] + [s.end.x for s in segments]
                 all_y = [s.start.y for s in segments] + [s.end.y for s in segments]
@@ -529,38 +667,61 @@ class PipelineOrchestrator:
                 )
 
             report = verifier.verify_toolpath(segments, tools_by_op, workpiece)
+            if tp_box_log and st_box_log:
+                report.stock_bounding_box = st_box_log
+                report.toolpath_bounding_box = tp_box_log
+
+            # Phase 1 M1: When previous-mode turning has no fixtures, warn user
+            if is_turning and any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
+                if not getattr(workpiece, "fixtures", None):
+                    report.fixture_warning = (
+                        "Fixture checks disabled: previous-mode turning has no fixture/chuck definitions."
+                    )
+                    _dbg_pipe(f"PipelineOrchestrator.run: {report.fixture_warning}")
+
+            # Phase 2 C2: Rapid promotion dog-leg safety check
+            # Indicator: post-kernel global highFeedMapping and vendor post property useG0.
+            # Missing rapidMode (e.g. legacy dumps from older universal_dumper versions)
+            # defaults to keeping promotion enabled for backward compatibility.
+            rapid_mode = combined_ctx.get("rapidMode")
+            if rapid_mode is not None:
+                hfm = rapid_mode.get("highFeedMapping")
+                use_g0 = rapid_mode.get("useG0")
+                is_dog_leg = (hfm is not None and hfm != 0) or (use_g0 is False)
+                if is_dog_leg:
+                    promote = False
+                    hfm_val = hfm if (hfm is not None and hfm != 0) else (hfm if hfm is not None else 0)
+                    dog_leg_msg = (
+                        f"Rapid promotion disabled: post High feedrate mapping = {hfm_val} / useG0=false "
+                        "(controller may dog-leg rapids)"
+                    )
+                    report.dog_leg_warning = dog_leg_msg
+                    report.promoted_events = set()
+                    _dbg_pipe(f"PipelineOrchestrator.run: {dog_leg_msg}")
+
             _dbg_pipe(
                 f"PipelineOrchestrator.run: report.volume={report.total_volume_removed_mm3:.3f} mm³, "
-                f"segments={len(segments)}, promoted_vectors={len(report.promoted_vectors)}"
+                f"segments={len(segments)}, promoted_events={len(report.promoted_events)}"
             )
 
             # -----------------------------------------------------------------
-            # Step 4: Annotate Promoted Air Moves in Combined Context & JSON
+            # Step 4: Annotate Promoted Air Moves in Combined Context
             # -----------------------------------------------------------------
-            promoted_json_path = None
             restored_count = 0
             has_stock = (workpiece is not None and getattr(workpiece, "stock", None) is not None)
-            if promote and has_stock and report.promoted_vectors:
-                # S3: Sometimes toolpath collisions exist in CAM setups (e.g. minor holder touches
-                # or benign fixture/stock skim contacts that are difficult or impractical to eliminate
-                # in complex parts). We permit rapid promotion of verified air moves even when
-                # collisions are detected elsewhere in the setup, as long as the collisions do not
-                # result from the promoted moves themselves (i.e. every promoted move is strictly
-                # verified to be collision-free with zero stock removal and safe clearance).
-                collision_vector_keys = {c.vector_key for c in report.collisions if c.vector_key}
-                safe_promoted_vectors = {
-                    key: rule for key, rule in report.promoted_vectors.items()
-                    if key not in collision_vector_keys
+            if promote and has_stock and report.promoted_events:
+                # Q2 confirmed: collision filter blocks ONLY the colliding event (sec_idx, event_idx) from promoted_events
+                colliding_events = {
+                    (c.sec_idx, c.event_idx)
+                    for c in report.collisions
+                    if c.sec_idx is not None and c.event_idx is not None
                 }
-                if safe_promoted_vectors:
-                    restored_count = apply_promotions_to_context(combined_ctx, safe_promoted_vectors)
-                    promoted_json_path = os.path.join(tmp_dir, "promoted_vectors.json")
-                    json_payload = {
-                        key: {"minOccur": rule.min_occur}
-                        for key, rule in safe_promoted_vectors.items()
-                    }
-                    with open(promoted_json_path, "w", encoding="utf-8") as f:
-                        json.dump(json_payload, f, indent=2)
+                safe_promoted_events = {
+                    ev for ev in report.promoted_events
+                    if ev not in colliding_events
+                }
+                if safe_promoted_events:
+                    restored_count = apply_promotions_to_context(combined_ctx, safe_promoted_events)
 
             # -----------------------------------------------------------------
             # Step 5: Execute Single-Pass Vendor Post Replay
@@ -577,7 +738,6 @@ class PipelineOrchestrator:
                 bootstrap_cnc_path=bootstrap_cnc,
                 base_post_path=base_post_path,
                 final_cnc_path=effective_final_cnc,
-                promoted_json_path=promoted_json_path,
             )
 
             # -----------------------------------------------------------------
@@ -632,7 +792,7 @@ class PipelineOrchestrator:
         restored_count: Optional[int] = None,
     ) -> str:
         """Format a human-readable and structured markdown verification report."""
-        promoted_count = len(report.promoted_vectors)
+        promoted_count = len(report.promoted_events)
         collision_count = len(report.collisions)
 
         wrapper_restored_count = restored_count if restored_count is not None else 0
@@ -656,9 +816,34 @@ class PipelineOrchestrator:
             f"- **Flagged MRR Spikes**: {len(report.mrr_spikes)}",
             f"- **Authorized Air Moves**: {promoted_count}",
             f"- **G0 Moves Restored in G-code**: {wrapper_restored_count}",
+        ]
+
+        if getattr(report, "dog_leg_warning", None):
+            lines.append(f"- **Promotion Status**: {report.dog_leg_warning}")
+            lines.extend([
+                "",
+                f"> **Notice**: {report.dog_leg_warning}",
+            ])
+
+        if getattr(report, "fixture_warning", None):
+            lines.append(f"- **Fixture Status**: {report.fixture_warning}")
+            lines.extend([
+                "",
+                f"> **Warning**: {report.fixture_warning}",
+            ])
+
+        if getattr(report, "stock_bounding_box", None) and getattr(report, "toolpath_bounding_box", None):
+            lines.extend([
+                "",
+                "## Stock & Toolpath Alignment",
+                f"- **Stock Bounding Box**: `{report.stock_bounding_box}`",
+                f"- **Toolpath Cutting Bounding Box**: `{report.toolpath_bounding_box}`",
+            ])
+
+        lines.extend([
             "",
             "## Collision Status",
-        ]
+        ])
 
         # Collate collisions by operation
         cols_by_op: Dict[str, List[CollisionRecord]] = {}

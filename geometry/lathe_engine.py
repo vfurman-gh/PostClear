@@ -28,7 +28,6 @@ from .models import (
     MotionSegment,
     MoveEvaluation,
     MRRSample,
-    PromotedVectorRule,
     ToolAssembly,
     Vector3D,
     VerificationReport,
@@ -173,7 +172,7 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
         if math.isnan(r_out) or r_out <= 0.0 or math.isnan(z_min) or math.isnan(z_max) or z_min >= z_max:
             raise ValueError(f"Invalid stock dimensions for IPW: z_min={z_min}, z_max={z_max}, r_out={r_out}")
 
-        if hasattr(stock, "polygon") and isinstance(getattr(stock, "polygon", None), Polygon) and not stock.polygon.is_empty:
+        if hasattr(stock, "polygon") and isinstance(getattr(stock, "polygon", None), (Polygon, MultiPolygon)) and not stock.polygon.is_empty:
             self.ipw = stock.polygon
         else:
             self.ipw = box(z_min, r_in, z_max, r_out)
@@ -272,6 +271,10 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
         move_collisions: List[CollisionRecord] = []
         stock_bounds = self.ipw.bounds if not self.ipw.is_empty else (0.0, 0.0, 0.0, 0.0)
 
+        meta = getattr(move, "metadata", None) or {}
+        sec_idx = meta.get("sec_idx", move.sec_id)
+        event_idx = meta.get("event_idx", move.segment_id)
+
         # ---------------------------------------------------------------------
         # 1. Fixture (Chuck) Collision Check
         # ---------------------------------------------------------------------
@@ -289,6 +292,8 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                         penetration_volume_mm3=chuck_hit.area * ESTIMATED_PENETRATION_DEPTH_MM,
                         description=f"Tool collided with chuck fixture (overlap area: {chuck_hit.area:.3f} mm²)",
                         op_id=move.op_id,
+                        sec_idx=sec_idx,
+                        event_idx=event_idx,
                     )
                     self.collisions.append(col)
                     move_collisions.append(col)
@@ -310,6 +315,8 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                             penetration_volume_mm3=rapid_hit.area * ESTIMATED_PENETRATION_DEPTH_MM,
                             description=f"Rapid move crashed into uncut stock (overlap area: {rapid_hit.area:.3f} mm²)",
                             op_id=move.op_id,
+                            sec_idx=sec_idx,
+                            event_idx=event_idx,
                         )
                         self.collisions.append(col)
                         move_collisions.append(col)
@@ -326,6 +333,8 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                             penetration_volume_mm3=holder_hit.area * ESTIMATED_PENETRATION_DEPTH_MM,
                             description=f"Toolholder rapid strike into stock (overlap area: {holder_hit.area:.3f} mm²)",
                             op_id=move.op_id,
+                            sec_idx=sec_idx,
+                            event_idx=event_idx,
                         )
                         self.collisions.append(col)
                         move_collisions.append(col)
@@ -337,6 +346,8 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
                 collisions=move_collisions,
+                sec_idx=sec_idx,
+                event_idx=event_idx,
             )
 
         # ---------------------------------------------------------------------
@@ -356,6 +367,8 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                         penetration_volume_mm3=outside_wake.area * ESTIMATED_PENETRATION_DEPTH_MM,
                         description=f"Toolholder shank gouged raw stock (overlap area: {outside_wake.area:.3f} mm²)",
                         op_id=move.op_id,
+                        sec_idx=sec_idx,
+                        event_idx=event_idx,
                     )
                     self.collisions.append(col)
                     move_collisions.append(col)
@@ -363,7 +376,16 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
         # ---------------------------------------------------------------------
         # 4. Air Move & Rapid Promotion Check (Inverted Buffering)
         # ---------------------------------------------------------------------
-        if not move.is_arc and dist >= self.min_promote_len_mm:
+        meta = getattr(move, "metadata", None) or {}
+        in_cycle = bool(getattr(move, "in_cycle", False) or meta.get("in_cycle", False))
+        is_sync = bool(getattr(move, "sync", False) or meta.get("sync", False))
+        if (
+            not move.is_arc
+            and dist >= self.min_promote_len_mm
+            and not in_cycle
+            and not is_sync
+            and not self._promotion_blocked(move)
+        ):
             # Inverted buffering: buffer the simple tool instead of buffering the complex IPW
             sc_pad = swept_cutter.buffer(self.promote_margin_mm)
             sh_pad = swept_holder_radial.buffer(self.promote_margin_mm)
@@ -374,8 +396,22 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
             h_hit = sh_pad.intersection(self.ipw) if aabb_overlap(sh_pad.bounds, stock_bounds) else Polygon()
             holder_air = (not aabb_overlap(sh_pad.bounds, stock_bounds)) or h_hit.is_empty or (h_hit.area < 1e-4)
 
-            if cutter_air and holder_air:
-                self.record_vector_occurrence(v_key_str, is_air_move=True)
+            # Phase 2 M3: test padded cutter and holder against chuck obstacle in promotion gate
+            cutter_chuck_clear = True
+            holder_chuck_clear = True
+            if not self.chuck_obstacle.is_empty:
+                chuck_bounds = self.chuck_obstacle.bounds
+                if aabb_overlap(sc_pad.bounds, chuck_bounds):
+                    c_chk = sc_pad.intersection(self.chuck_obstacle)
+                    if not c_chk.is_empty and c_chk.area > 1e-4:
+                        cutter_chuck_clear = False
+                if aabb_overlap(sh_pad.bounds, chuck_bounds):
+                    h_chk = sh_pad.intersection(self.chuck_obstacle)
+                    if not h_chk.is_empty and h_chk.area > 1e-4:
+                        holder_chuck_clear = False
+
+            if cutter_air and holder_air and cutter_chuck_clear and holder_chuck_clear:
+                self.record_event_evaluation(move, is_air_move=True, collisions=move_collisions)
                 return MoveEvaluation(
                     segment_id=move.segment_id,
                     vector_key=v_key_str,
@@ -383,12 +419,14 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                     material_removed_mm3=0.0,
                     instantaneous_mrr=0.0,
                     collisions=move_collisions,
+                    sec_idx=sec_idx,
+                    event_idx=event_idx,
                 )
 
         # ---------------------------------------------------------------------
         # 5. Cutting Move: Material Removal & Volumetric MRR
         # ---------------------------------------------------------------------
-        self.record_vector_occurrence(v_key_str, is_air_move=False)
+        self.record_event_evaluation(move, is_air_move=False, collisions=move_collisions)
 
         vol_3d_mm3 = 0.0
         area_2d = 0.0
@@ -416,4 +454,6 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
             material_removed_mm3=vol_3d_mm3,
             instantaneous_mrr=sample.mrr_rate_mm3_per_min,
             collisions=move_collisions,
+            sec_idx=sec_idx,
+            event_idx=event_idx,
         )

@@ -238,8 +238,10 @@ def generate_verification_plot(
     for seg in segments:
         z1, r1 = seg.start.z * scale, seg.start.x * scale
         z2, r2 = seg.end.z * scale, seg.end.x * scale
-        v_key = seg.vector_key.to_wrapper_str()
-        is_promoted = v_key in report.promoted_vectors
+        meta = getattr(seg, "metadata", None) or {}
+        sec_idx = meta.get("sec_idx", seg.sec_id)
+        ev_idx = meta.get("event_idx")
+        is_promoted = (sec_idx, ev_idx) in report.promoted_events if (getattr(report, "promoted_events", None) and ev_idx is not None) else False
 
         if is_promoted:
             lbl = "G0 Promoted Rapid Move" if "G0 Promoted Rapid Move" not in seen_labels else None
@@ -273,9 +275,10 @@ def generate_verification_plot(
     ax_geo.set_aspect("equal", adjustable="datalim")
     ax_geo.set_xlabel(f"Z Axis ({u_label})", labelpad=5)
     ax_geo.set_ylabel(f"Radius R ({u_label})", labelpad=5)
+    promoted_count_lathe = len(report.promoted_events) if getattr(report, "promoted_events", None) else 0
     ax_geo.set_title(
         f"2D Lathe IPW Verification — Volume Removed: {report.total_volume_removed_mm3 * vol_scale:.3f} {vol_unit} | "
-        f"Promoted G0 Moves: {len(report.promoted_vectors)} | Collisions: {len(report.collisions)}",
+        f"Promoted G0 Moves: {promoted_count_lathe} | Collisions: {len(report.collisions)}",
         pad=8,
     )
     ax_geo.legend(loc="upper left", fontsize=7.5, framealpha=0.9)
@@ -445,8 +448,10 @@ def generate_mill_verification_plot(
     for seg in segments:
         x1, y1, z1 = seg.start.x * scale, seg.start.y * scale, seg.start.z * scale
         x2, y2, z2 = seg.end.x * scale, seg.end.y * scale, seg.end.z * scale
-        v_key = seg.vector_key.to_wrapper_str()
-        is_promoted = v_key in report.promoted_vectors
+        meta = getattr(seg, "metadata", None) or {}
+        sec_idx = meta.get("sec_idx", seg.sec_id)
+        ev_idx = meta.get("event_idx")
+        is_promoted = (sec_idx, ev_idx) in report.promoted_events if (getattr(report, "promoted_events", None) and ev_idx is not None) else False
 
         if is_promoted:
             lbl = "G0 Promoted Rapid Move" if "G0 Promoted Rapid Move" not in seen_labels else None
@@ -524,9 +529,10 @@ def generate_mill_verification_plot(
     ax_geo.set_xlabel(f"X Axis ({u_label})", labelpad=8)
     ax_geo.set_ylabel(f"Y Axis ({u_label})", labelpad=8)
     ax_geo.set_zlabel(f"Z Axis ({u_label})", labelpad=8)
+    promoted_count_mill = len(report.promoted_events) if getattr(report, "promoted_events", None) else 0
     ax_geo.set_title(
         f"3D Mill IPW Verification — Volume Removed: {report.total_volume_removed_mm3 * vol_scale:.3f} {vol_unit} | "
-        f"Promoted G0 Moves: {len(report.promoted_vectors)} | Collisions: {len(report.collisions)}",
+        f"Promoted G0 Moves: {promoted_count_mill} | Collisions: {len(report.collisions)}",
         pad=10,
         fontsize=10.5,
         weight="bold",

@@ -36,6 +36,13 @@ if "adsk" not in sys.modules:
     sys.modules["adsk.cam"] = adsk.cam
     sys.modules["adsk.core"] = adsk.core
     sys.modules["adsk.fusion"] = adsk.fusion
+else:
+    import adsk
+    import adsk.cam
+    if not hasattr(adsk.cam, "CAMFolder"):
+        adsk.cam.CAMFolder = type("CAMFolder", (), {})
+    if not hasattr(adsk.cam, "CAMPattern"):
+        adsk.cam.CAMPattern = type("CAMPattern", (adsk.cam.CAMFolder,), {})
 
 from PostProcessAll import (
     GetNcProgramSetupsAndOperations,

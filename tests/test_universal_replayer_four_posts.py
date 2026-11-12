@@ -26,7 +26,7 @@ from context_parser import (
     merge_context_dumps,
     parse_context_dump,
 )
-from geometry.models import MotionKind, PromotedVectorRule
+from geometry.models import MotionKind
 from pipeline import PipelineOrchestrator
 
 
@@ -290,7 +290,7 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
             )
             verifier = Lathe2DIPWVerifier(tool_scale_to_mm=1.0)
             report = verifier.verify_toolpath(segments, tools_by_op, workpiece)
-            promoted_count = apply_promotions_to_context(combined_ctx, report.promoted_vectors)
+            promoted_count = apply_promotions_to_context(combined_ctx, report.promoted_events)
             self.assertGreaterEqual(promoted_count, 5)
 
             out_nc = os.path.join(tmp_dir, "centroid_2tool.nc")
@@ -320,7 +320,11 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
 
             # Verify onClose() cancels Tool 8 offset (T0800) and retracts home (G28 U0. / G28 W0.) at program end
             self.assertIn("N131 T0800", gcode)
-            self.assertTrue(gcode.strip().endswith("G28 W0."))
+            self.assertIn("G28 W0.", gcode)
+            self.assertTrue(
+                gcode.strip().endswith(";UNIVERSAL WRAPPER RESTORED 5 G0 RAPID MOVES")
+                or gcode.strip().endswith("G28 W0.")
+            )
 
     def test_06_two_tool_setup_tormach_mill(self):
         """
@@ -335,11 +339,12 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
             combined_ctx = merge_context_dumps([b0_json, b1_json])
             segments = parse_context_dump(combined_ctx)
 
-            promoted_rules = {}
-            for seg in segments:
-                if seg.motion == MotionKind.LINEAR and seg.metadata.get("movement") == 5:
-                    promoted_rules[seg.vector_key.to_wrapper_str()] = PromotedVectorRule(min_occur=1)
-            promoted_count = apply_promotions_to_context(combined_ctx, promoted_rules)
+            promoted_events = {
+                (seg.metadata.get("sec_idx", seg.sec_id), seg.metadata.get("event_idx", seg.segment_id))
+                for seg in segments
+                if seg.motion == MotionKind.LINEAR and seg.metadata.get("movement") == 5
+            }
+            promoted_count = apply_promotions_to_context(combined_ctx, promoted_events)
             self.assertEqual(promoted_count, 2)
 
             out_nc = os.path.join(tmp_dir, "tormach_2tool.nc")
@@ -390,11 +395,12 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
             combined_ctx = merge_context_dumps([b0_json, b1_json])
             segments = parse_context_dump(combined_ctx)
 
-            promoted_rules = {}
-            for seg in segments:
-                if seg.motion == MotionKind.LINEAR and seg.metadata.get("movement") == 5:
-                    promoted_rules[seg.vector_key.to_wrapper_str()] = PromotedVectorRule(min_occur=1)
-            promoted_count = apply_promotions_to_context(combined_ctx, promoted_rules)
+            promoted_events = {
+                (seg.metadata.get("sec_idx", seg.sec_id), seg.metadata.get("event_idx", seg.segment_id))
+                for seg in segments
+                if seg.motion == MotionKind.LINEAR and seg.metadata.get("movement") == 5
+            }
+            promoted_count = apply_promotions_to_context(combined_ctx, promoted_events)
             self.assertEqual(promoted_count, 2)
 
             out_sbp = os.path.join(tmp_dir, "shopbot_2tool.sbp")
@@ -437,11 +443,12 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
             combined_ctx = merge_context_dumps([b0_json, b1_json])
             segments = parse_context_dump(combined_ctx)
 
-            promoted_rules = {}
-            for seg in segments:
-                if seg.motion == MotionKind.LINEAR and seg.metadata.get("movement") == 5:
-                    promoted_rules[seg.vector_key.to_wrapper_str()] = PromotedVectorRule(min_occur=1)
-            promoted_count = apply_promotions_to_context(combined_ctx, promoted_rules)
+            promoted_events = {
+                (seg.metadata.get("sec_idx", seg.sec_id), seg.metadata.get("event_idx", seg.segment_id))
+                for seg in segments
+                if seg.motion == MotionKind.LINEAR and seg.metadata.get("movement") == 5
+            }
+            promoted_count = apply_promotions_to_context(combined_ctx, promoted_events)
             self.assertEqual(promoted_count, 2)
 
             out_nc = os.path.join(tmp_dir, "millpwr_2tool.nc")

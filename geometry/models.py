@@ -4,7 +4,7 @@ Core Domain Models for Workpiece, Tool, and Kinematic Verification.
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     from shapely.geometry import Polygon
@@ -160,6 +160,7 @@ class WorkpieceDefinition:
     stock: WorkpieceGeometry
     fixtures: List[AxisymmetricChuckObstacle] = field(default_factory=list)
     work_offset: Vector3D = field(default_factory=lambda: Vector3D(0, 0, 0))
+    is_stl_derived: bool = False
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,8 @@ class CollisionRecord:
     penetration_volume_mm3: float
     description: str
     op_id: str = ""
+    sec_idx: Optional[int] = None
+    event_idx: Optional[int] = None
 
 
 @dataclass
@@ -236,6 +239,8 @@ class MoveEvaluation:
     material_removed_mm3: float   # Volume removed during this move
     instantaneous_mrr: float      # mm^3/min
     collisions: List[CollisionRecord] = field(default_factory=list)
+    sec_idx: Optional[int] = None
+    event_idx: Optional[int] = None
 
 
 @dataclass
@@ -250,11 +255,7 @@ class MRRSample:
     op_id: str = ""
 
 
-
-@dataclass
-class PromotedVectorRule:
-    """Occurrence-gated promotion rule ingested by universal_wrapper.cps."""
-    min_occur: int = 1            # Threshold occurrence index (>= min_occur is authorized air)
+PromotedEventKey = Tuple[int, int]  # (sec_idx, event_idx)
 
 
 @dataclass
@@ -262,7 +263,11 @@ class VerificationReport:
     total_machining_time_sec: float
     total_volume_removed_mm3: float
     collisions: List[CollisionRecord]
-    promoted_vectors: Dict[str, PromotedVectorRule] # Map of vector keys to occurrence rules
-    mrr_timeline: List[MRRSample]
-    mrr_spikes: List[MRRSample]
+    promoted_events: Set[PromotedEventKey] = field(default_factory=set)
+    mrr_timeline: List[MRRSample] = field(default_factory=list)
+    mrr_spikes: List[MRRSample] = field(default_factory=list)
     operation_names: List[str] = field(default_factory=list)
+    stock_bounding_box: Optional[str] = None
+    toolpath_bounding_box: Optional[str] = None
+    dog_leg_warning: Optional[str] = None
+    fixture_warning: Optional[str] = None

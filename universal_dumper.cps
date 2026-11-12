@@ -42,13 +42,6 @@ function _getDumperConfig() {
       }
     }
   } catch (e) {}
-  try {
-    var tf = FileSystem.getTemporaryFolder();
-    if (tf) {
-      cfgCandidates.push(FileSystem.getCombinedPath(tf, "universal_dumper_config.json"));
-    }
-  } catch (e) {}
-  cfgCandidates.push("/tmp/universal_dumper_config.json");
 
   for (var i = 0; i < cfgCandidates.length; ++i) {
     try {
@@ -103,6 +96,40 @@ try {
   }
 } catch (e) {}
 
+// Enable native stock export in Autodesk CAM post engine (CAMplete-compatible mechanism)
+var _wantExportStock = false;
+try {
+  var _scfg = _getDumperConfig();
+  if (_scfg && typeof _scfg.export_stock === "boolean") {
+    _wantExportStock = _scfg.export_stock;
+  } else if (_scfg && typeof _scfg.stockMode === "string") {
+    var _sm = _scfg.stockMode.toLowerCase();
+    if (_sm.indexOf("previous") !== -1 || _sm.indexOf("preceding") !== -1 || _sm.indexOf("prev") !== -1 || _sm.indexOf("rest") !== -1) {
+      _wantExportStock = true;
+    }
+  } else if (typeof getConfigurationPath === "function") {
+    var _cp = String(getConfigurationPath()).toLowerCase();
+    if (_cp.indexOf("export_stock") !== -1) {
+      _wantExportStock = true;
+    }
+  }
+} catch (e) {}
+
+if (typeof properties === "undefined" || !properties) {
+  properties = {};
+}
+properties.exportStock = {
+  title      : "Export stock",
+  description: "Specifies whether or not to export the stock model with the project.",
+  group      : "preferences",
+  type       : "boolean",
+  value      : _wantExportStock,
+  scope      : "post"
+};
+try {
+  exportStock = _wantExportStock;
+} catch (e) {}
+
 // Re-assert universal capabilities and JSON extension after including BASE_POST
 capabilities = CAPABILITY_TURNING | CAPABILITY_MILLING | CAPABILITY_INTERMEDIATE;
 extension = "json";
@@ -114,6 +141,47 @@ try {
   setCodePage("utf-8");
 } catch (e) {}
 
+function _resolveUseG0() {
+  try {
+    if (typeof getProperty === "function") {
+      var ug = getProperty("useG0");
+      if (typeof ug === "boolean") {
+        return ug;
+      }
+    }
+  } catch (e) {}
+  try {
+    if (typeof properties === "object" && properties && typeof properties.useG0 !== "undefined") {
+      var val = (typeof properties.useG0 === "object" && properties.useG0 !== null) ? properties.useG0.value : properties.useG0;
+      if (typeof val === "boolean") {
+        return val;
+      }
+    }
+  } catch (e) {}
+  try {
+    if (typeof _cfgProps === "object" && _cfgProps && typeof _cfgProps.useG0 === "boolean") {
+      return _cfgProps.useG0;
+    }
+  } catch (e) {}
+  return null;
+}
+
+function _resolveHighFeedMapping() {
+  try {
+    if (typeof highFeedMapping !== "undefined") {
+      return highFeedMapping;
+    }
+  } catch (e) {}
+  return null;
+}
+
+function _getRapidMode() {
+  return {
+    highFeedMapping: _resolveHighFeedMapping(),
+    useG0: _resolveUseG0()
+  };
+}
+
 var dumpData = {
   unit: 0,
   highFeedrate: 0,
@@ -121,12 +189,88 @@ var dumpData = {
   programComment: "",
   vendorExtension: vendorExtension,
   postProperties: _cfgProps,
+  rapidMode: _getRapidMode(),
   machine: {},
   workpiece: null,
+  stockPath: "",
+  stockExport: {
+    enabled: _wantExportStock,
+    hasParam: false,
+    srcPath: "",
+    srcExists: false,
+    destPath: "",
+    error: ""
+  },
   globalParams: {},
   comments: [],
   sections: []
 };
+
+function _captureStockFile() {
+  if (dumpData.stockPath && FileSystem.isFile(dumpData.stockPath)) {
+    return;
+  }
+  var se = dumpData.stockExport || {
+    enabled: !!_wantExportStock,
+    hasParam: false,
+    srcPath: "",
+    srcExists: false,
+    destPath: "",
+    error: ""
+  };
+  dumpData.stockExport = se;
+  se.enabled = !!_wantExportStock;
+  se.error = "";
+
+  try {
+    var srcStock = "";
+    var hasParam = false;
+    if (typeof hasGlobalParameter === "function" && hasGlobalParameter("autodeskcam:stock-path")) {
+      hasParam = true;
+      srcStock = getGlobalParameter("autodeskcam:stock-path") || "";
+    }
+    se.hasParam = hasParam;
+    se.srcPath = srcStock || "";
+
+    var srcExists = false;
+    if (srcStock) {
+      srcExists = FileSystem.isFile(srcStock);
+    }
+    se.srcExists = srcExists;
+
+    if (srcStock && srcExists) {
+      var outDir = "";
+      try {
+        var outP = getOutputPath();
+        if (outP) {
+          outDir = FileSystem.getFolderPath(outP);
+        }
+      } catch (e) {}
+      if (!outDir) {
+        try {
+          outDir = FileSystem.getTemporaryFolder();
+        } catch (e) {}
+      }
+      if (!outDir) {
+        outDir = "/tmp";
+      }
+      var pName = (typeof programFilename === "string" && programFilename) ? programFilename :
+                  ((typeof programName === "string" && programName) ? programName : "setup");
+      var destStock = FileSystem.getCombinedPath(outDir, pName + "_stock.stl");
+      se.destPath = destStock;
+      if (FileSystem.isFile(destStock)) {
+        try {
+          FileSystem.remove(destStock);
+        } catch (ignored) {}
+      }
+      FileSystem.copyFile(srcStock, destStock);
+      dumpData.stockPath = destStock;
+      se.error = "";
+    }
+  } catch (e) {
+    se.error = (e && e.message) ? e.message : String(e);
+  }
+}
 
 var curSec = null;
 var opened = false;
@@ -215,22 +359,32 @@ onOpen = function() {
       unit = cfg.unit;
       dumpData.unit = unit;
     }
+    if (cfg && cfg.stockUnit) {
+      dumpData.stockUnit = cfg.stockUnit;
+    }
     if (cfg && typeof cfg.maximumSpindleSpeed === "number" && cfg.maximumSpindleSpeed > 0) {
       dumpData.maximumSpindleSpeed = cfg.maximumSpindleSpeed;
     }
   } catch (e) {}
+  dumpData.rapidMode = _getRapidMode();
   try {
+    try {
+      dumpData.workpieceHint = serializeBox(getWorkpiece());
+    } catch (e) {
+      dumpData.workpieceHint = null;
+    }
     var sMode = (dumpData.stockMode || "").toLowerCase();
     var isUnsupported = sMode.indexOf("previous") !== -1 ||
                         sMode.indexOf("preceding") !== -1 ||
                         sMode.indexOf("solid") !== -1 ||
                         sMode.indexOf("body") !== -1;
     if (!isUnsupported) {
-      dumpData.workpiece = serializeBox(getWorkpiece());
+      dumpData.workpiece = dumpData.workpieceHint || serializeBox(getWorkpiece());
     } else {
       dumpData.workpiece = null;
     }
   } catch (e) {}
+  _captureStockFile();
 };
 
 onComment = function(c) {
@@ -552,6 +706,9 @@ onSectionEnd = function() {
 };
 
 onClose = function() {
+  // Capture native exported stock STL if available before writing dumpData
+  _captureStockFile();
+
   // Write raw JSON without any comment or line filters
   writeln(JSON.stringify(dumpData));
 

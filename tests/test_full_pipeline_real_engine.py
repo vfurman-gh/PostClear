@@ -87,22 +87,20 @@ class TestFullPipelineRealEngine(unittest.TestCase):
                 verifier=verifier,
                 final_cnc_path=out_cnc,
                 report_output_path=out_report,
+                unit=1,
             )
 
             # 1. Physics & Simulation Assertions
             self.assertEqual(len(report.collisions), 0, "Real toolpath should have 0 collisions")
             self.assertGreater(report.total_volume_removed_mm3, 7000.0, "Expected >7000 mm3 material carved")
-            self.assertGreaterEqual(len(report.promoted_vectors), 10, "Expected at least 10 promoted air moves")
-
-            # Verify Move 11 retract promotion rule
-            self.assertIn("0:133870,0,2540->59690,0,2540", report.promoted_vectors)
-            self.assertEqual(report.promoted_vectors["0:133870,0,2540->59690,0,2540"].min_occur, 1)
+            self.assertGreaterEqual(len(report.promoted_events), 10, "Expected at least 10 promoted air events")
 
             # 2. Final G-Code Output Assertions
             self.assertTrue(os.path.isfile(out_cnc))
-            self.assertIn("N32 G0 X0.47", gcode, "Expected block N32 promoted to G0 X0.47")
-            self.assertIn("N33 Z-0.06", gcode, "Expected block N33 promoted to modal G0 Z-0.06")
-            self.assertIn("N34 G1 X0.49 Z-0.07 F0.002", gcode, "Expected block N34 restored to G1 and feedrate")
+            self.assertIn("G21", gcode)
+            self.assertIn("N32 G0 X11.938", gcode, "Expected block N32 promoted to G0 X11.938")
+            self.assertIn("N33 Z-1.524", gcode, "Expected block N33 promoted to modal G0 Z-1.524")
+            self.assertIn("N34 G1 X12.446 Z-1.778 F0.0508", gcode, "Expected block N34 restored to G1 and feedrate")
             self.assertIn(";UNIVERSAL WRAPPER RESTORED 10 G0 RAPID MOVES", gcode)
 
             # 3. Report Assertions

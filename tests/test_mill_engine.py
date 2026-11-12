@@ -57,6 +57,8 @@ class TestMillClearanceVerifier(unittest.TestCase):
             duration_sec=0.1,
             vector_key=vkey,
             metadata={
+                "sec_idx": sec_id,
+                "event_idx": seg_id,
                 "in_cycle": in_cycle,
                 "z_clearance_mm": z_clearance_mm,
             },
@@ -84,6 +86,28 @@ class TestMillClearanceVerifier(unittest.TestCase):
         )
         res = self.verifier.step_segment(seg)
         self.assertTrue(res.is_air_move)
+
+    def test_pure_z_plus_retract_with_rc_or_transition_is_blocked(self):
+        """Pure vertical Z+ move reaching clearance is blocked if rc != 0 or rc_transition is True."""
+        seg_rc = self._make_segment(
+            seg_id=4,
+            start=Vector3D(10.0, 20.0, 0.0),
+            end=Vector3D(10.0, 20.0, 15.0),
+            z_clearance_mm=5.0,
+        )
+        seg_rc.metadata["rc"] = 1
+        res = self.verifier.step_segment(seg_rc)
+        self.assertFalse(res.is_air_move)
+
+        seg_trans = self._make_segment(
+            seg_id=5,
+            start=Vector3D(10.0, 20.0, 0.0),
+            end=Vector3D(10.0, 20.0, 15.0),
+            z_clearance_mm=5.0,
+        )
+        seg_trans.metadata["rc_transition"] = True
+        res_trans = self.verifier.step_segment(seg_trans)
+        self.assertFalse(res_trans.is_air_move)
 
     def test_partial_z_plus_below_clearance_is_not_promoted(self):
         """Pure vertical Z+ move that does NOT reach clearance height is NOT marked air move."""
@@ -166,8 +190,8 @@ class TestMillClearanceVerifier(unittest.TestCase):
         res = self.verifier.step_segment(seg)
         self.assertTrue(res.is_air_move)
 
-    def test_verify_toolpath_multi_pass_promoted_vectors(self):
-        """Test full toolpath verification and vector occurrence gating."""
+    def test_verify_toolpath_multi_pass_promoted_events(self):
+        """Test full toolpath verification and event promotion gating."""
         # Construct a sequence:
         # Pass 1: Cut down, retract up to clearance (Move A)
         # Pass 2: Cut down, retract up to clearance (Move A again)
@@ -187,10 +211,8 @@ class TestMillClearanceVerifier(unittest.TestCase):
             workpiece=self.workpiece,
         )
         self.assertEqual(len(report.collisions), 0)
-        # seg3 and seg7 share the same vector key: pure Z+ dz=+10.0, feed=1000
-        vkey_str = seg3.vector_key.to_wrapper_str()
-        self.assertIn(vkey_str, report.promoted_vectors)
-        self.assertEqual(report.promoted_vectors[vkey_str].min_occur, 1)
+        self.assertIn((0, 3), report.promoted_events)
+        self.assertIn((0, 7), report.promoted_events)
 
 
 class TestMillDomainExtraction(unittest.TestCase):

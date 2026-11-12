@@ -278,6 +278,236 @@ class TestLatheEngineCollisions(unittest.TestCase):
         self.assertEqual(len(eval_res.collisions), 1, "Expected chuck collision")
         self.assertEqual(eval_res.collisions[0].kind, CollisionKind.FIXTURE_COLLISION)
 
+    def test_06_radius_compensation_move_never_promoted(self):
+        """Verify that an air move with rc != 0 or rc_transition=True is never marked air move."""
+        holder_in_wake = Polygon([(2, 1), (2, 4), (10, 4), (10, 1)])
+        tool = ToolAssembly(
+            tool_id=1,
+            name="Tool",
+            geometry=LatheToolGeometry(
+                insert_shape="W",
+                nose_radius=0.8,
+                hand="R",
+                quadrant=ToolCompensationQuadrant.P3,
+                cutter_polygon=self.cutter_poly,
+                holder_polygon=holder_in_wake,
+            ),
+        )
+        verifier = Lathe2DIPWVerifier()
+        verifier.reset(self.workpiece)
+        verifier.load_tool(tool)
+
+        # Move well clear of stock in air: R=30 mm (stock outer_radius=20 mm)
+        air_move_rc = MotionSegment(
+            segment_id=1,
+            op_id="AirPass",
+            sec_id=0,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(30.0, 0.0, 0.0),
+            end=Vector3D(30.0, 0.0, -15.0),
+            feedrate_mmpm=200.0,
+            spindle_rpm=1000.0,
+            duration_sec=4.5,
+            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
+            metadata={"rc": 1},
+        )
+        res_rc = verifier.step(air_move_rc)
+        self.assertFalse(res_rc.is_air_move)
+        self.assertNotIn((0, 1), verifier.generate_report().promoted_events)
+
+        # Same move with rc=0 is an air move
+        verifier.reset(self.workpiece)
+        verifier.load_tool(tool)
+        air_move_no_rc = MotionSegment(
+            segment_id=2,
+            op_id="AirPass",
+            sec_id=0,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(30.0, 0.0, 0.0),
+            end=Vector3D(30.0, 0.0, -15.0),
+            feedrate_mmpm=200.0,
+            spindle_rpm=1000.0,
+            duration_sec=4.5,
+            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
+            metadata={"rc": 0},
+        )
+        res_no_rc = verifier.step(air_move_no_rc)
+        self.assertTrue(res_no_rc.is_air_move)
+        self.assertIn((0, 2), verifier.generate_report().promoted_events)
+
+        # Transition move (rc_transition=True) is also blocked
+        verifier.reset(self.workpiece)
+        verifier.load_tool(tool)
+        air_move_trans = MotionSegment(
+            segment_id=3,
+            op_id="AirPass",
+            sec_id=0,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(30.0, 0.0, 0.0),
+            end=Vector3D(30.0, 0.0, -15.0),
+            feedrate_mmpm=200.0,
+            spindle_rpm=1000.0,
+            duration_sec=4.5,
+            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
+            metadata={"rc": 0, "rc_transition": True},
+        )
+        res_trans = verifier.step(air_move_trans)
+        self.assertFalse(res_trans.is_air_move)
+        self.assertNotIn((0, 3), verifier.generate_report().promoted_events)
+
+    def test_sync_threading_move_in_air_never_marked_air_or_promoted(self):
+        """
+        Verify that a speed-feed synchronized (threading) move in air (F1 fix)
+        is NEVER marked as an air move and NEVER eligible for rapid promotion.
+        """
+        verifier = Lathe2DIPWVerifier()
+        verifier.reset(self.workpiece)
+
+        holder_wake = Polygon([(2, 1), (2, 4), (10, 4), (10, 1)])
+        tool = ToolAssembly(
+            tool_id=1,
+            name="Threading Tool",
+            geometry=LatheToolGeometry(
+                insert_shape="V",
+                nose_radius=0.2,
+                hand="R",
+                quadrant=ToolCompensationQuadrant.P3,
+                cutter_polygon=self.cutter_poly,
+                holder_polygon=holder_wake,
+            ),
+        )
+        verifier.load_tool(tool)
+
+        # Threading pass at R=30 (outside stock OD=20) with metadata["sync"]=True
+        sync_air_move = MotionSegment(
+            segment_id=1,
+            op_id="Threading",
+            sec_id=0,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(30.0, 0.0, 0.0),
+            end=Vector3D(30.0, 0.0, -15.0),
+            feedrate_mmpm=200.0,
+            spindle_rpm=1000.0,
+            duration_sec=4.5,
+            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
+            metadata={"sync": True},
+        )
+        res = verifier.step(sync_air_move)
+        self.assertFalse(res.is_air_move, "Lathe sync move must never be evaluated as an air move")
+        self.assertNotIn((0, 1), verifier.generate_report().promoted_events, "Sync move must never be in promoted_events")
+
+    def test_in_cycle_move_in_air_never_marked_air_or_promoted(self):
+        """
+        Verify that a move marked in_cycle (e.g. canned cycle point) in air
+        is NEVER marked as an air move and NEVER eligible for rapid promotion.
+        """
+        verifier = Lathe2DIPWVerifier()
+        verifier.reset(self.workpiece)
+
+        holder_wake = Polygon([(2, 1), (2, 4), (10, 4), (10, 1)])
+        tool = ToolAssembly(
+            tool_id=1,
+            name="Cycle Tool",
+            geometry=LatheToolGeometry(
+                insert_shape="W",
+                nose_radius=0.8,
+                hand="R",
+                quadrant=ToolCompensationQuadrant.P3,
+                cutter_polygon=self.cutter_poly,
+                holder_polygon=holder_wake,
+            ),
+        )
+        verifier.load_tool(tool)
+
+        # Cycle move at R=30 (outside stock OD=20) with metadata["in_cycle"]=True
+        cycle_air_move = MotionSegment(
+            segment_id=1,
+            op_id="CycleOp",
+            sec_id=0,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(30.0, 0.0, 0.0),
+            end=Vector3D(30.0, 0.0, -15.0),
+            feedrate_mmpm=200.0,
+            spindle_rpm=1000.0,
+            duration_sec=4.5,
+            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
+            metadata={"in_cycle": True, "sec_idx": 0, "event_idx": 1},
+        )
+        res = verifier.step(cycle_air_move)
+        self.assertFalse(res.is_air_move, "Lathe in-cycle move must never be evaluated as an air move")
+        self.assertNotIn((0, 1), verifier.generate_report().promoted_events, "In-cycle move must never be in promoted_events")
+        self.assertEqual(len(verifier.generate_report().promoted_events), 0)
+
+    def test_07_chuck_obstacle_margin_prevents_promotion(self):
+        """
+        Phase 2 M3: Verify that lathe air moves passing within promote_margin_mm
+        of chuck jaws are not authorized for rapid promotion.
+        - Chuck obstacle: Z from -60 to -40, clamping R=15 to OD=50.
+        - promote_margin_mm = 0.15 mm.
+        - Move 1 at Z=-39.90 (0.10 mm from chuck at Z=-40.0): within margin, promotion BLOCKED.
+        - Move 2 at Z=-39.50 (0.50 mm from chuck at Z=-40.0): outside margin, promotion ALLOWED.
+        """
+        from geometry.models import AxisymmetricChuckObstacle
+        chuck = AxisymmetricChuckObstacle(z_min=-60.0, z_max=-40.0, clamping_radius=15.0, outer_radius=50.0)
+        wp_with_chuck = WorkpieceDefinition(stock=self.stock, fixtures=[chuck])
+
+        cutter = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+        holder = Polygon([(1, 0), (5, 0), (5, 2), (1, 2)])
+        tool = ToolAssembly(
+            tool_id=1,
+            name="Tool",
+            geometry=LatheToolGeometry(
+                insert_shape="W",
+                nose_radius=0.8,
+                hand="R",
+                quadrant=ToolCompensationQuadrant.P3,
+                cutter_polygon=cutter,
+                holder_polygon=holder,
+            ),
+        )
+
+        verifier = Lathe2DIPWVerifier(promote_margin_mm=0.15)
+        verifier.reset(wp_with_chuck)
+        verifier.load_tool(tool)
+
+        # Move 1: Tool moves radially in air at Z = -39.90 (from R=25 to R=30)
+        # Chuck is at Z in [-60, -40]. Tool Z is -39.90 (0.10 mm from chuck Z=-40).
+        # Unpadded tool does not collide (Z >= -39.90 > -40.0).
+        # But padded tool (buffer 0.15 mm) reaches Z = -40.05, intersecting chuck!
+        move_near_chuck = MotionSegment(
+            segment_id=1,
+            op_id="AirNearChuck",
+            sec_id=0,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(25.0, 0.0, -39.90),
+            end=Vector3D(30.0, 0.0, -39.90),
+            feedrate_mmpm=200.0,
+            spindle_rpm=1000.0,
+            duration_sec=1.5,
+            vector_key=VectorKey.from_floats(0, Vector3D(25.0, 0.0, -39.90), Vector3D(30.0, 0.0, -39.90)),
+        )
+        eval_near = verifier.step(move_near_chuck)
+        self.assertEqual(len(eval_near.collisions), 0, "No collision expected")
+        self.assertFalse(eval_near.is_air_move, "Promotion must be BLOCKED when tool is within 0.15mm of chuck")
+
+        # Move 2: Tool moves radially in air at Z = -39.50 (0.50 mm from chuck at Z=-40.0)
+        # Padded tool reaches Z = -39.65 > -40.0, no intersection with chuck!
+        move_far_chuck = MotionSegment(
+            segment_id=2,
+            op_id="AirFarChuck",
+            sec_id=0,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(25.0, 0.0, -39.50),
+            end=Vector3D(30.0, 0.0, -39.50),
+            feedrate_mmpm=200.0,
+            spindle_rpm=1000.0,
+            duration_sec=1.5,
+            vector_key=VectorKey.from_floats(0, Vector3D(25.0, 0.0, -39.50), Vector3D(30.0, 0.0, -39.50)),
+        )
+        eval_far = verifier.step(move_far_chuck)
+        self.assertEqual(len(eval_far.collisions), 0, "No collision expected")
+        self.assertTrue(eval_far.is_air_move, "Promotion must be ALLOWED when tool is 0.50mm away from chuck")
+
     def test_lathe_verification_plot_omits_tool_artists(self):
         """Verify that generate_verification_plot does not render tool holder or insert polygons."""
         import tempfile

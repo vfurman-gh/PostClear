@@ -34,7 +34,7 @@ from .models import (
     CollisionRecord,
     MoveEvaluation,
     MRRSample,
-    PromotedVectorRule,
+    PromotedEventKey,
     VerificationReport,
 )
 
@@ -128,7 +128,7 @@ __all__ = [
     "CollisionRecord",
     "MoveEvaluation",
     "MRRSample",
-    "PromotedVectorRule",
+    "PromotedEventKey",
     "VerificationReport",
     "IVerificationEngine",
     "BaseVerificationEngine",

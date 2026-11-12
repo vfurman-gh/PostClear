@@ -3,6 +3,7 @@
 Unit and integration tests for Phase 1: From Solid Stock Support.
 """
 
+import json
 import math
 import os
 import sys
@@ -537,7 +538,7 @@ class TestSolidMeshStock(unittest.TestCase):
             mock_report.peak_mrr = 0.0
             mock_report.total_machining_time_sec = 10.0
             mock_report.total_volume_removed_mm3 = 500.0
-            mock_report.promoted_vectors = []
+            mock_report.promoted_events = set()
             mock_report.mrr_spikes = []
             mock_report.summary_text = "Verification Success"
 
@@ -554,6 +555,1115 @@ class TestSolidMeshStock(unittest.TestCase):
                     fileExt=".nc",
                 )
                 self.assertIsNone(res)  # Clean success returns None (no error)
+
+
+class TestPreviousSetupStockSupport(unittest.TestCase):
+    """Unit tests for Phase 2: From Previous Setup Stock via exported STL mesh."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="stl_stock_test_")
+        # Define a simple 3D box mesh (2 triangles on top face, etc.)
+        # Box from (-10, -10, 0) to (10, 10, 20)
+        self.triangles = [
+            # Top face (Z=20)
+            ((0.0, 0.0, 1.0), (-10.0, -10.0, 20.0), (10.0, -10.0, 20.0), (10.0, 10.0, 20.0)),
+            ((0.0, 0.0, 1.0), (-10.0, -10.0, 20.0), (10.0, 10.0, 20.0), (-10.0, 10.0, 20.0)),
+            # Bottom face (Z=0)
+            ((0.0, 0.0, -1.0), (-10.0, -10.0, 0.0), (10.0, 10.0, 0.0), (10.0, -10.0, 0.0)),
+            ((0.0, 0.0, -1.0), (-10.0, -10.0, 0.0), (-10.0, 10.0, 0.0), (10.0, 10.0, 0.0)),
+        ]
+        self.bin_stl = os.path.join(self.tmp_dir, "box_bin.stl")
+        self._write_binary_stl(self.bin_stl, self.triangles)
+
+        self.ascii_stl = os.path.join(self.tmp_dir, "box_ascii.stl")
+        self._write_ascii_stl(self.ascii_stl, self.triangles)
+
+    def tearDown(self):
+        import shutil
+        if os.path.isdir(self.tmp_dir):
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _write_binary_stl(self, filepath: str, triangles):
+        import struct
+        with open(filepath, "wb") as f:
+            f.write(b"Binary STL Test Header" + b"\x00" * 58)  # 80 bytes
+            f.write(struct.pack("<I", len(triangles)))
+            for norm, v1, v2, v3 in triangles:
+                f.write(struct.pack("<3f", *norm))
+                f.write(struct.pack("<3f", *v1))
+                f.write(struct.pack("<3f", *v2))
+                f.write(struct.pack("<3f", *v3))
+                f.write(struct.pack("<H", 0))
+
+    def _write_ascii_stl(self, filepath: str, triangles):
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("solid box\n")
+            for norm, v1, v2, v3 in triangles:
+                f.write(f"  facet normal {norm[0]} {norm[1]} {norm[2]}\n")
+                f.write("    outer loop\n")
+                f.write(f"      vertex {v1[0]} {v1[1]} {v1[2]}\n")
+                f.write(f"      vertex {v2[0]} {v2[1]} {v2[2]}\n")
+                f.write(f"      vertex {v3[0]} {v3[1]} {v3[2]}\n")
+                f.write("    endloop\n")
+                f.write("  endfacet\n")
+            f.write("endsolid box\n")
+
+    def test_load_binary_stl(self):
+        from geometry.solid_mesh import load_stl_mesh
+        verts, indices = load_stl_mesh(self.bin_stl, is_inch=False)
+        self.assertEqual(len(indices), 4)
+        self.assertEqual(len(verts), 12)
+        self.assertAlmostEqual(float(verts[:, 2].min()), 0.0, places=4)
+        self.assertAlmostEqual(float(verts[:, 2].max()), 20.0, places=4)
+
+    def test_load_binary_stl_with_inch_scaling(self):
+        from geometry.solid_mesh import load_stl_mesh
+        verts, indices = load_stl_mesh(self.bin_stl, is_inch=True)
+        self.assertEqual(len(indices), 4)
+        self.assertAlmostEqual(float(verts[:, 2].max()), 20.0 * 25.4, places=2)
+
+    def test_load_ascii_stl(self):
+        from geometry.solid_mesh import load_stl_mesh
+        verts, indices = load_stl_mesh(self.ascii_stl, is_inch=False)
+        self.assertEqual(len(indices), 4)
+        self.assertEqual(len(verts), 12)
+        self.assertAlmostEqual(float(verts[:, 2].min()), 0.0, places=4)
+        self.assertAlmostEqual(float(verts[:, 2].max()), 20.0, places=4)
+
+    def test_extract_workpiece_from_stl_milling(self):
+        from geometry.solid_mesh import extract_workpiece_from_stl
+        from geometry.models import SolidMeshStock3D
+        wp = extract_workpiece_from_stl(self.bin_stl, is_turning=False, is_inch=False)
+        self.assertIsInstance(wp.stock, SolidMeshStock3D)
+        self.assertAlmostEqual(wp.stock.x_min, -10.0, places=2)
+        self.assertAlmostEqual(wp.stock.x_max, 10.0, places=2)
+        self.assertAlmostEqual(wp.stock.z_max, 20.0, places=2)
+
+    def test_extract_workpiece_from_stl_turning(self):
+        from geometry.solid_mesh import extract_workpiece_from_stl
+        from geometry.models import AxisymmetricStock2D
+        wp = extract_workpiece_from_stl(self.bin_stl, is_turning=True, is_inch=False)
+        self.assertIsInstance(wp.stock, AxisymmetricStock2D)
+        self.assertAlmostEqual(wp.stock.z_min, 0.0, places=1)
+        self.assertAlmostEqual(wp.stock.z_max, 20.0, places=1)
+        # Bounding box hypot(-10, -10) = 14.14 mm + 0.05 pad
+        self.assertGreater(wp.stock.outer_radius, 14.0)
+
+    def test_context_parser_extracts_workpiece_from_stock_path(self):
+        from context_parser import extract_workpiece_from_context
+        from geometry.models import SolidMeshStock3D
+        ctx = {
+            "unit": 1,
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "sections": [{"type": 0, "tool": {"number": 1}}],
+        }
+        wp = extract_workpiece_from_context(ctx, fallback_workpiece=None, is_turning=False)
+        self.assertIsNotNone(wp)
+        self.assertIsInstance(wp.stock, SolidMeshStock3D)
+
+    def test_pipeline_raises_value_error_if_previous_stock_has_no_mesh(self):
+        from pipeline import PipelineOrchestrator
+        orchestrator = PipelineOrchestrator(
+            dumper_cps="universal_dumper.cps",
+            replayer_cps="universal_replayer.cps",
+        )
+        fake_dump = {
+            "unit": 1,
+            "stockMode": "previous-setup",
+            "sections": [],
+        }
+        json_path = os.path.join(self.tmp_dir, "batch_prev_no_mesh.json")
+        dummy_cps = os.path.join(self.tmp_dir, "base_dummy.cps")
+        dummy_cnc = os.path.join(self.tmp_dir, "base_dummy.cnc")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy"; capabilities = CAPABILITY_MILLING;\n')
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write('(bootstrap cnc)\n')
+
+        import json
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(fake_dump, f)
+
+        with self.assertRaises(ValueError) as cm:
+            orchestrator.run(
+                context_dump_paths=[json_path],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                final_cnc_path=os.path.join(self.tmp_dir, "out.nc"),
+                promote=False,
+            )
+        self.assertIn("uses 'From Previous Setup' stock", str(cm.exception))
+
+    def test_postprocessall_unified_pipeline_previous_setup_proceeds_to_pass_1(self):
+        import PostProcessAll
+        import json
+        mock_setup = MagicMock()
+        mock_setup.name = "Op2PrecedingSetup"
+        p_mode = MagicMock()
+        p_mode.value.value = 7  # PreviousSetupStock
+        p_mode.value = 7
+        mock_setup.parameters.itemByName.return_value = p_mode
+
+        dummy_cps = os.path.join(self.tmp_dir, "dummy.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+
+        mock_prog = MagicMock()
+        mock_prog.parameters.itemByName.return_value = MagicMock(value=MagicMock(value="tormach"))
+
+        mock_op = MagicMock()
+        mock_op.isSuppressed = False
+        mock_op.hasToolpath = True
+        p_tool = MagicMock()
+        p_tool.value.value = 1
+        mock_op.tool.parameters.itemByName.return_value = p_tool
+        mock_setup.allOperations = [mock_op]
+
+        def fake_post_process(target_ops, post_input):
+            out_json = os.path.join(post_input.outputFolder, f"{post_input.programName}.json")
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump({
+                    "unit": 1,
+                    "stockMode": "previous-setup",
+                    "stockPath": self.bin_stl,
+                    "sections": []
+                }, f)
+            return True
+
+        mock_cam = MagicMock()
+        mock_cam.postProcess.side_effect = fake_post_process
+
+        mock_app = MagicMock()
+        mock_app.activeDocument.products.itemByProductType.return_value = mock_cam
+
+        mock_report = MagicMock()
+        mock_report.collisions = []
+        mock_report.promoted_count = 0
+        mock_report.spike_count = 0
+        mock_report.peak_mrr = 0.0
+        mock_report.total_machining_time_sec = 10.0
+        mock_report.total_volume_removed_mm3 = 500.0
+        mock_report.promoted_events = set()
+        mock_report.mrr_spikes = []
+        mock_report.summary_text = "Verification Success"
+
+        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
+             patch("PostProcessAll._ResolveBasePostPath", return_value=dummy_cps), \
+             patch("pipeline.PipelineOrchestrator.run", return_value=(mock_report, "G0 X0 Y0")):
+            res = PostProcessAll._PostProcessUnifiedPipeline(
+                fname="Op2PrecedingSetup",
+                setup=mock_setup,
+                setupFolder=self.tmp_dir,
+                docSettings={},
+                program=mock_prog,
+                path=os.path.join(self.tmp_dir, "prev_stock.nc"),
+                fileExt=".nc",
+            )
+            # Returns None on success (does not reject early)
+            self.assertIsNone(res)
+
+    def test_context_parser_missing_stock_path_file_raises_filenotfound(self):
+        from context_parser import extract_workpiece_from_context
+        ctx = {
+            "unit": 1,
+            "stockMode": "previous-setup",
+            "stockPath": os.path.join(self.tmp_dir, "non_existent_stock.stl"),
+            "sections": [],
+        }
+        with self.assertRaises(FileNotFoundError) as cm:
+            extract_workpiece_from_context(ctx, fallback_workpiece=None, is_turning=False)
+        self.assertIn("Exported stock STL mesh file not found", str(cm.exception))
+
+    def test_context_parser_corrupt_stock_stl_raises_runtime_error(self):
+        from context_parser import extract_workpiece_from_context
+        corrupt_stl = os.path.join(self.tmp_dir, "corrupt.stl")
+        with open(corrupt_stl, "wb") as f:
+            f.write(b"NOT A VALID STL FILE" * 10)
+        ctx = {
+            "unit": 1,
+            "stockMode": "previous-setup",
+            "stockPath": corrupt_stl,
+            "sections": [],
+        }
+        with self.assertRaises(RuntimeError) as cm:
+            extract_workpiece_from_context(ctx, fallback_workpiece=None, is_turning=False)
+        self.assertIn("Failed to load stock from STL mesh", str(cm.exception))
+
+    def test_load_binary_stl_with_trailing_padding_bytes(self):
+        from geometry.solid_mesh import load_stl_mesh
+        trail_stl = os.path.join(self.tmp_dir, "box_trail.stl")
+        self._write_binary_stl(trail_stl, self.triangles)
+        with open(trail_stl, "ab") as f:
+            f.write(b"\x00\x00")
+        verts, indices = load_stl_mesh(trail_stl, is_inch=False)
+        self.assertEqual(len(indices), 4)
+        self.assertEqual(len(verts), 12)
+        self.assertAlmostEqual(float(verts[:, 2].min()), 0.0, places=4)
+        self.assertAlmostEqual(float(verts[:, 2].max()), 20.0, places=4)
+
+    def test_load_binary_stl_rejects_nan_vertices(self):
+        from geometry.solid_mesh import load_stl_mesh
+        nan_triangles = [
+            ((0.0, 0.0, 1.0), (-10.0, -10.0, 20.0), (10.0, -10.0, 20.0), (float("nan"), 10.0, 20.0)),
+        ]
+        nan_stl = os.path.join(self.tmp_dir, "nan.stl")
+        self._write_binary_stl(nan_stl, nan_triangles)
+        with self.assertRaises(ValueError) as cm:
+            load_stl_mesh(nan_stl, is_inch=False)
+        self.assertIn("non-finite", str(cm.exception))
+
+    def test_load_binary_stl_rejects_inf_vertices(self):
+        from geometry.solid_mesh import load_stl_mesh
+        inf_triangles = [
+            ((0.0, 0.0, 1.0), (-10.0, -10.0, 20.0), (float("inf"), -10.0, 20.0), (10.0, 10.0, 20.0)),
+        ]
+        inf_stl = os.path.join(self.tmp_dir, "inf.stl")
+        self._write_binary_stl(inf_stl, inf_triangles)
+        with self.assertRaises(ValueError) as cm:
+            load_stl_mesh(inf_stl, is_inch=False)
+        self.assertIn("non-finite", str(cm.exception))
+
+    def test_load_ascii_stl_rejects_nan_vertices(self):
+        from geometry.solid_mesh import load_stl_mesh
+        nan_ascii = os.path.join(self.tmp_dir, "nan_ascii.stl")
+        with open(nan_ascii, "w", encoding="utf-8") as f:
+            f.write("solid nan_box\n")
+            f.write("  facet normal 0 0 1\n")
+            f.write("    outer loop\n")
+            f.write("      vertex nan -10.0 20.0\n")
+            f.write("      vertex 10.0 -10.0 20.0\n")
+            f.write("      vertex 10.0 10.0 20.0\n")
+            f.write("    endloop\n")
+            f.write("  endfacet\n")
+            f.write("endsolid nan_box\n")
+        with self.assertRaises(ValueError) as cm:
+            load_stl_mesh(nan_ascii, is_inch=False)
+        self.assertIn("non-finite", str(cm.exception))
+
+    def test_context_parser_fixedbox_mode_with_stock_path_returns_box_stock(self):
+        from context_parser import extract_workpiece_from_context
+        from geometry.models import BoxStock3D
+        ctx = {
+            "unit": 1,
+            "stockMode": "fixedbox",
+            "stockPath": self.bin_stl,
+            "workpiece": {
+                "lower": {"x": -20.0, "y": -20.0, "z": 0.0},
+                "upper": {"x": 20.0, "y": 20.0, "z": 40.0},
+            },
+            "sections": [],
+        }
+        wp = extract_workpiece_from_context(ctx, fallback_workpiece=None, is_turning=False)
+        self.assertIsNotNone(wp)
+        self.assertIsInstance(wp.stock, BoxStock3D)
+        self.assertAlmostEqual(wp.stock.x_min, -20.0)
+        self.assertAlmostEqual(wp.stock.x_max, 20.0)
+        self.assertAlmostEqual(wp.stock.z_max, 40.0)
+
+    def test_merge_context_dumps_takes_stock_path_only_from_batch_0(self):
+        from context_parser import merge_context_dumps
+        dump0 = {
+            "sections": [],
+            "globalParams": {},
+            "stockPath": "",
+        }
+        dump1 = {
+            "sections": [],
+            "globalParams": {},
+            "stockPath": "/path/to/batch1_stock.stl",
+        }
+        merged = merge_context_dumps([dump0, dump1])
+        self.assertEqual(merged.get("stockPath"), "")
+
+        # When batch 0 has a stockPath, it is preserved
+        dump0_with_path = {
+            "sections": [],
+            "globalParams": {},
+            "stockPath": "/path/to/batch0_stock.stl",
+        }
+        merged2 = merge_context_dumps([dump0_with_path, dump1])
+        self.assertEqual(merged2.get("stockPath"), "/path/to/batch0_stock.stl")
+
+    def test_merge_context_dumps_propagates_stock_export_from_batch_0(self):
+        from context_parser import merge_context_dumps
+        se0 = {
+            "enabled": True,
+            "hasParam": False,
+            "srcPath": "",
+            "srcExists": False,
+            "destPath": "",
+            "error": "custom error b0",
+        }
+        se1 = {
+            "enabled": False,
+            "hasParam": True,
+            "srcPath": "/b1",
+            "srcExists": True,
+            "destPath": "/b1_dest",
+            "error": "",
+        }
+        dump0 = {"sections": [], "globalParams": {}, "stockExport": se0}
+        dump1 = {"sections": [], "globalParams": {}, "stockExport": se1}
+        merged = merge_context_dumps([dump0, dump1])
+        self.assertEqual(merged.get("stockExport"), se0)
+
+    def test_pipeline_previous_mode_value_error_includes_stock_export_diagnostic(self):
+        from pipeline import PipelineOrchestrator
+        orchestrator = PipelineOrchestrator(
+            dumper_cps="universal_dumper.cps",
+            replayer_cps="universal_replayer.cps",
+        )
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_diag.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_diag.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z10\n")
+
+        # 1. With stockExport populated
+        se = {
+            "enabled": True,
+            "hasParam": False,
+            "srcPath": "",
+            "srcExists": False,
+            "destPath": "",
+            "error": "simulated global parameter missing",
+        }
+        fake_dump = {
+            "programName": "TestOpDiag",
+            "stockMode": "previous-setup",
+            "unit": 1,
+            "sections": [],
+            "stockExport": se,
+        }
+        json_path = os.path.join(self.tmp_dir, "ctx_diag.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(fake_dump, f)
+
+        with self.assertRaises(ValueError) as cm:
+            orchestrator.run(
+                context_dump_paths=[json_path],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                final_cnc_path=os.path.join(self.tmp_dir, "out_diag.nc"),
+                promote=False,
+            )
+        err_msg = str(cm.exception)
+        self.assertIn("uses 'From Previous Setup' stock", err_msg)
+        self.assertIn("stockExport: enabled=True, hasParam=False", err_msg)
+        self.assertIn("error='simulated global parameter missing'", err_msg)
+
+        # 2. Without stockExport
+        fake_dump_no_se = {
+            "programName": "TestOpDiag2",
+            "stockMode": "previous-setup",
+            "unit": 1,
+            "sections": [],
+        }
+        json_path2 = os.path.join(self.tmp_dir, "ctx_diag2.json")
+        with open(json_path2, "w", encoding="utf-8") as f:
+            json.dump(fake_dump_no_se, f)
+
+        with self.assertRaises(ValueError) as cm2:
+            orchestrator.run(
+                context_dump_paths=[json_path2],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                final_cnc_path=os.path.join(self.tmp_dir, "out_diag2.nc"),
+                promote=False,
+            )
+        err_msg2 = str(cm2.exception)
+        self.assertIn("uses 'From Previous Setup' stock", err_msg2)
+        self.assertIn("[stockExport: none]", err_msg2)
+
+    def test_universal_dumper_export_stock_gated_by_stock_mode(self):
+        from pipeline import PipelineOrchestrator
+        orch = PipelineOrchestrator()
+        if not orch.post_bin:
+            raise unittest.SkipTest("Autodesk post binary not available")
+        cnc = "tests/fixtures/roughing_test.cnc"
+        cps = "centroid_turning.cps"
+        if not os.path.isfile(cnc) or not os.path.isfile(cps):
+            raise unittest.SkipTest("Required fixture or vendor post not found")
+
+        cfg_file = os.path.join(self.tmp_dir, "universal_dumper_config.json")
+        old_env = os.environ.get("DUMPER_CONFIG_PATH")
+        try:
+            os.environ["DUMPER_CONFIG_PATH"] = cfg_file
+
+            # 1. previous mode enables stockExport
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                json.dump({"stockMode": "previous"}, f)
+            out1 = os.path.join(self.tmp_dir, "dump_prev.json")
+            ctx1 = orch.dump_context(cnc, cps, out1)
+            self.assertIn("stockExport", ctx1)
+            self.assertTrue(ctx1["stockExport"]["enabled"])
+
+            # 2. non-previous mode disables stockExport
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                json.dump({"stockMode": "fixedbox"}, f)
+            out2 = os.path.join(self.tmp_dir, "dump_box.json")
+            ctx2 = orch.dump_context(cnc, cps, out2)
+            self.assertIn("stockExport", ctx2)
+            self.assertFalse(ctx2["stockExport"]["enabled"])
+
+            # 3. dead cfg.stockPath is ignored and does not inject stockPath even when the file exists
+            self.assertTrue(os.path.isfile(self.bin_stl))
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                json.dump({"stockMode": "previous", "stockPath": self.bin_stl}, f)
+            out3 = os.path.join(self.tmp_dir, "dump_dead_branch.json")
+            ctx3 = orch.dump_context(cnc, cps, out3)
+            self.assertEqual(ctx3.get("stockPath", ""), "")
+        finally:
+            if old_env is None:
+                os.environ.pop("DUMPER_CONFIG_PATH", None)
+            else:
+                os.environ["DUMPER_CONFIG_PATH"] = old_env
+
+    def test_notify_post_process_result_propagates_skip_errors_in_details(self):
+        import PostProcessAll
+        mock_ui = MagicMock()
+        mock_ui.palettes = MagicMock()
+
+        verify_results = [
+            {"setup": "Setup1", "cnc": "/path/setup1.nc", "report": "/path/setup1_report.md", "kinds": {}},
+            {"setup": "Setup2", "cnc": "/path/setup2.nc", "report": "/path/setup2_report.md", "error": "Previous stock missing", "kinds": {}},
+        ]
+        skip_msg = "Failed on setup Setup2: PostProcess pipeline error: Setup 'Setup2' uses 'From Previous Setup' stock, but Fusion 360 did not produce a preceding stock mesh."
+
+        with patch("PostProcessAll._BuildNotificationHTML") as mock_build_html, \
+             patch("PostProcessAll.open", unittest.mock.mock_open(), create=True):
+            PostProcessAll._NotifyPostProcessResult(
+                ui=mock_ui,
+                cntFiles=1,
+                cntSkipped=1,
+                lstSkipped=skip_msg,
+                outputFolder="/output/nc",
+                verifyResults=verify_results,
+            )
+            # Verify _BuildNotificationHTML received the skip error message in details
+            mock_build_html.assert_called_once()
+            args, _ = mock_build_html.call_args
+            title, status_type, msg, details, actions = args
+            self.assertEqual(status_type, "warning")
+            self.assertIn("Failed on setup Setup2", details)
+            self.assertIn("From Previous Setup", details)
+
+    def test_postprocesssetup_warns_when_preceding_stock_missing_and_cancels_on_no(self):
+        import PostProcessAll
+        mock_ui = MagicMock()
+        mock_ui.messageBox.return_value = adsk.core.DialogResults.DialogNo
+
+        # Setup 1 (preceding setup) with missing toolpath
+        s1 = MagicMock()
+        s1.name = "Setup1"
+        op1 = MagicMock()
+        op1.isSuppressed = False
+        s1.allOperations = [op1]
+
+        # Setup 2 using PreviousSetupStock
+        s2 = MagicMock()
+        s2.name = "Setup2"
+        s2.operationType = 0
+        s2.stockMode = adsk.cam.SetupStockModes.PreviousSetupStock
+        op2 = MagicMock()
+        op2.isSuppressed = False
+        s2.allOperations = [op2]
+
+        mock_cam = MagicMock()
+        mock_cam.setups = [s1, s2]
+        # checkToolpath returns False for op1
+        mock_cam.checkToolpath.side_effect = lambda op: op is op2
+
+        mock_doc = MagicMock()
+        mock_doc.products.itemByProductType.return_value = mock_cam
+        mock_app = MagicMock()
+        mock_app.activeDocument = mock_doc
+        mock_app.userInterface = mock_ui
+
+        mock_prog = MagicMock()
+        mock_prog.parameters.itemByName.return_value = None
+
+        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app):
+            ret = PostProcessAll.PostProcessSetup(
+                fname="Setup2",
+                setup=s2,
+                setupFolder=self.tmp_dir,
+                docSettings={},
+                program=mock_prog,
+                target_operations=[op2],
+            )
+            # Verify modal warning was called with the exact prompt
+            mock_ui.messageBox.assert_called_once()
+            prompt = mock_ui.messageBox.call_args[0][0]
+            self.assertIn("Preceding setup stock is likely missing", prompt)
+            self.assertIn("proceed?", prompt.lower())
+            self.assertEqual(ret, "Operation cancelled by user.")
+
+    def test_postprocesssetup_warns_when_preceding_stock_missing_and_proceeds_on_yes(self):
+        import PostProcessAll
+        mock_ui = MagicMock()
+        mock_ui.messageBox.return_value = adsk.core.DialogResults.DialogYes
+
+        s1 = MagicMock()
+        s1.name = "Setup1"
+        op1 = MagicMock()
+        op1.isSuppressed = False
+        s1.allOperations = [op1]
+
+        s2 = MagicMock()
+        s2.name = "Setup2"
+        s2.operationType = 0
+        s2.stockMode = adsk.cam.SetupStockModes.PreviousSetupStock
+        op2 = MagicMock()
+        op2.isSuppressed = False
+        s2.allOperations = [op2]
+
+        mock_cam = MagicMock()
+        mock_cam.setups = [s1, s2]
+        mock_cam.checkToolpath.return_value = False
+
+        mock_doc = MagicMock()
+        mock_doc.products.itemByProductType.return_value = mock_cam
+        mock_app = MagicMock()
+        mock_app.activeDocument = mock_doc
+        mock_app.userInterface = mock_ui
+
+        mock_prog = MagicMock()
+        mock_prog.parameters.itemByName.return_value = None
+
+        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
+             patch("PostProcessAll._PostProcessUnifiedPipeline", return_value=None) as mock_unified:
+            ret = PostProcessAll.PostProcessSetup(
+                fname="Setup2",
+                setup=s2,
+                setupFolder=self.tmp_dir,
+                docSettings={},
+                program=mock_prog,
+                target_operations=[op2],
+            )
+            mock_ui.messageBox.assert_called_once()
+            # Since user clicked Yes, it proceeded to _PostProcessUnifiedPipeline
+            mock_unified.assert_called_once()
+            self.assertIsNone(ret)
+
+    def test_revolve_cone_taper_accuracy(self):
+        """H3: Cone r 5->25 over Z 0->100 with 64 segments has model radius >= true_r - 0.01 mm."""
+        from shapely.geometry import LineString
+        n = 64
+        tris = []
+        for i in range(n):
+            a0 = 2 * math.pi * i / n
+            a1 = 2 * math.pi * (i + 1) / n
+            p00 = (5.0 * math.cos(a0), 5.0 * math.sin(a0), 0.0)
+            p01 = (5.0 * math.cos(a1), 5.0 * math.sin(a1), 0.0)
+            p10 = (25.0 * math.cos(a0), 25.0 * math.sin(a0), 100.0)
+            p11 = (25.0 * math.cos(a1), 25.0 * math.sin(a1), 100.0)
+            tris += [(p00, p01, p11), (p00, p11, p10)]
+            tris += [((0.0, 0.0, 0.0), p01, p00), ((0.0, 0.0, 100.0), p10, p11)]
+
+        verts = np.array(tris, dtype=np.float32).reshape(-1, 3)
+        indices = np.arange(len(verts), dtype=np.int32).reshape(-1, 3)
+
+        wp = revolve_mesh_to_lathe_stock(verts, indices, max_radial_offset_mm=None, tol_pad_r_mm=0.0)
+        self.assertIsNotNone(wp.stock.polygon)
+        poly = wp.stock.polygon
+
+        worst_diff = 0.0
+        for z in np.linspace(1.0, 99.0, 50):
+            true_r = 5.0 + 20.0 * z / 100.0
+            inter = poly.intersection(LineString([(z, 0.0), (z, 1000.0)]))
+            self.assertFalse(inter.is_empty, f"Intersection empty at z={z}")
+            model_r = inter.bounds[3]
+            diff = model_r - true_r
+            self.assertGreaterEqual(model_r, true_r - 0.01, f"Underestimation at z={z}: model={model_r}, true={true_r}")
+            worst_diff = min(worst_diff, diff)
+        self.assertGreaterEqual(worst_diff, -0.01)
+
+    def test_revolve_empty_slab_gets_zero_radius(self):
+        """H3: Slabs with no triangle overlap get radius 0."""
+        from shapely.geometry import LineString
+        def _cyl_tris(r, z0, z1, n=16):
+            theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+            x = r * np.cos(theta)
+            y = r * np.sin(theta)
+            v0 = np.column_stack([x, y, np.full(n, z0)])
+            v1 = np.column_stack([x, y, np.full(n, z1)])
+            res = []
+            for i in range(n):
+                nxt = (i + 1) % n
+                res.append([v0[i], v1[i], v1[nxt]])
+                res.append([v0[i], v1[nxt], v0[nxt]])
+                res.append([[0, 0, z0], v0[nxt], v0[i]])
+                res.append([[0, 0, z1], v1[i], v1[nxt]])
+            return np.array(res, dtype=np.float32)
+
+        c1 = _cyl_tris(10.0, 0.0, 10.0)
+        c2 = _cyl_tris(10.0, 20.0, 30.0)
+        tris = np.vstack([c1, c2])
+        verts = tris.reshape(-1, 3)
+        indices = np.arange(len(verts), dtype=np.int32).reshape(-1, 3)
+
+        wp = revolve_mesh_to_lathe_stock(verts, indices, z_slice_step_mm=1.0, tol_pad_r_mm=0.0, max_radial_offset_mm=None)
+        poly = wp.stock.polygon
+
+        # Test at z=15.0 (inside empty slab gap)
+        inter = poly.intersection(LineString([(15.0, 0.0), (15.0, 1000.0)]))
+        model_r = inter.bounds[3] if not inter.is_empty else 0.0
+        self.assertEqual(model_r, 0.0)
+
+    def test_context_parser_stock_unit_scaling(self):
+        """H2: context_parser uses stockUnit (not post unit) to scale STL."""
+        from context_parser import extract_workpiece_from_context
+        # 1. stockUnit = "mm" while post unit = 0 (IN)
+        ctx_mm = {
+            "unit": 0,
+            "stockUnit": "mm",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,  # box Z=0..20 mm
+            "sections": [],
+        }
+        wp_mm = extract_workpiece_from_context(ctx_mm, is_turning=False)
+        self.assertAlmostEqual(wp_mm.stock.z_max, 20.0, places=2)
+
+        # 2. stockUnit = "in" while post unit = 1 (MM)
+        ctx_in = {
+            "unit": 1,
+            "stockUnit": "in",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,  # box Z=0..20 inches -> 508 mm
+            "sections": [],
+        }
+        wp_in = extract_workpiece_from_context(ctx_in, is_turning=False)
+        self.assertAlmostEqual(wp_in.stock.z_max, 20.0 * 25.4, places=2)
+
+    def test_context_parser_workpiece_hint_cross_check(self):
+        """H2: workpieceHint selects scale matching candidate set within 5% or fails."""
+        from context_parser import extract_workpiece_from_context
+        # STL box has extents: dx=20, dy=20, dz=20
+        # Hint matching scale 1.0 (20 mm)
+        ctx_scale1 = {
+            "unit": 1,
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "workpieceHint": {
+                "lower": {"x": -10.0, "y": -10.0, "z": 0.0},
+                "upper": {"x": 10.0, "y": 10.0, "z": 20.0},
+            },
+            "sections": [],
+        }
+        wp1 = extract_workpiece_from_context(ctx_scale1, is_turning=False)
+        self.assertAlmostEqual(wp1.stock.z_max, 20.0, places=2)
+
+        # Hint matching scale 1.0 with unit=0 (inches): both STL and hint in inches -> 508 mm
+        ctx_scale1_inch = {
+            "unit": 0,
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "workpieceHint": {
+                "lower": {"x": -10.0, "y": -10.0, "z": 0.0},
+                "upper": {"x": 10.0, "y": 10.0, "z": 20.0},
+            },
+            "sections": [],
+        }
+        wp1_inch = extract_workpiece_from_context(ctx_scale1_inch, is_turning=False)
+        self.assertAlmostEqual(wp1_inch.stock.z_max, 508.0, places=1)
+
+        # Hint matching scale 25.4 (508 mm)
+        ctx_scale254 = {
+            "unit": 1,
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "workpieceHint": {
+                "lower": {"x": -254.0, "y": -254.0, "z": 0.0},
+                "upper": {"x": 254.0, "y": 254.0, "z": 508.0},
+            },
+            "sections": [],
+        }
+        wp254 = extract_workpiece_from_context(ctx_scale254, is_turning=False)
+        self.assertAlmostEqual(wp254.stock.z_max, 508.0, places=1)
+
+        # Hint matching scale 1/25.4 (0.7874 in)
+        ctx_scale_inv = {
+            "unit": 0,
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "workpieceHint": {
+                "lower": {"x": -10.0 / 25.4, "y": -10.0 / 25.4, "z": 0.0},
+                "upper": {"x": 10.0 / 25.4, "y": 10.0 / 25.4, "z": 20.0 / 25.4},
+            },
+            "sections": [],
+        }
+        wp_inv = extract_workpiece_from_context(ctx_scale_inv, is_turning=False)
+        self.assertAlmostEqual(wp_inv.stock.z_max, 20.0, places=2)
+
+        # Hint mismatch failure: extents 200 mm (none of {1, 25.4, 1/25.4} matches within 5%)
+        ctx_mismatch = {
+            "unit": 1,
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "workpieceHint": {
+                "lower": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "upper": {"x": 200.0, "y": 200.0, "z": 200.0},
+            },
+            "sections": [],
+        }
+        with self.assertRaises(ValueError) as cm:
+            extract_workpiece_from_context(ctx_mismatch, is_turning=False)
+        self.assertIn("do not match workpieceHint", str(cm.exception))
+        self.assertIn("within 5%", str(cm.exception))
+
+    def test_get_document_stock_unit_helper(self):
+        """H2: _GetDocumentStockUnit detects 'mm' or 'in' from unitsManager."""
+        import PostProcessAll
+        mock_doc = MagicMock()
+        mock_doc.unitsManager.defaultLengthUnits = "in"
+        self.assertEqual(PostProcessAll._GetDocumentStockUnit(mock_doc), "in")
+
+        mock_doc.unitsManager.defaultLengthUnits = "mm"
+        self.assertEqual(PostProcessAll._GetDocumentStockUnit(mock_doc), "mm")
+
+        mock_doc.unitsManager.defaultLengthUnits = "inches"
+        self.assertEqual(PostProcessAll._GetDocumentStockUnit(mock_doc), "in")
+
+        self.assertEqual(PostProcessAll._GetDocumentStockUnit(None), "mm")
+
+    def test_pipeline_stl_overlap_milling(self):
+        """H4: Milling STL stock requires >= 50% toolpath bounding-box volume overlap."""
+        from pipeline import PipelineOrchestrator
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_h4_m.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_h4_m.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z10\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+
+        # Stock box: X=[-10, 10], Y=[-10, 10], Z=[0, 20]
+        # 1. Toolpath with 100% overlap
+        tp_pass = {
+            "programName": "H4MillPass",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "events": [
+                        {"type": "onLinear", "x": -5.0, "y": -5.0, "z": 5.0, "f": 1000.0},
+                        {"type": "onLinear", "x": 5.0, "y": 5.0, "z": 15.0, "f": 1000.0},
+                    ],
+                }
+            ],
+        }
+        json_pass = os.path.join(self.tmp_dir, "h4_m_pass.json")
+        with open(json_pass, "w", encoding="utf-8") as f:
+            json.dump(tp_pass, f)
+
+        report_p = os.path.join(self.tmp_dir, "h4_m_report.md")
+        with patch.object(orchestrator, "replay_combined_context", return_value="G1 X0 Y0\n"):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[json_pass],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                report_output_path=report_p,
+                promote=False,
+            )
+        self.assertIsNotNone(rep.stock_bounding_box)
+        self.assertIsNotNone(rep.toolpath_bounding_box)
+        with open(report_p, "r", encoding="utf-8") as f:
+            report_text = f.read()
+        self.assertIn("Stock & Toolpath Alignment", report_text)
+        self.assertIn(rep.stock_bounding_box, report_text)
+
+        # 2. Toolpath with < 50% overlap: cutting moves in X=[15, 35], Y=[15, 35], Z=[5, 15] (outside stock)
+        tp_fail = {
+            "programName": "H4MillFail",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "events": [
+                        {"type": "onLinear", "x": 15.0, "y": 15.0, "z": 5.0, "f": 1000.0},
+                        {"type": "onLinear", "x": 35.0, "y": 35.0, "z": 15.0, "f": 1000.0},
+                    ],
+                }
+            ],
+        }
+        json_fail = os.path.join(self.tmp_dir, "h4_m_fail.json")
+        with open(json_fail, "w", encoding="utf-8") as f:
+            json.dump(tp_fail, f)
+
+        with self.assertRaises(ValueError) as cm:
+            orchestrator.run(
+                context_dump_paths=[json_fail],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIn("insufficient volume overlap", str(cm.exception))
+        self.assertIn("Toolpath bounding box", str(cm.exception))
+        self.assertIn("Stock bounding box", str(cm.exception))
+
+        # 3. Constant-Z planar cut out-of-bounds (dz == 0 at Z=30, stock Z=[0, 20])
+        tp_const_z = {
+            "programName": "H4MillConstZFail",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "events": [
+                        {"type": "onLinear", "sx": -5.0, "sy": -5.0, "sz": 30.0, "x": 5.0, "y": 5.0, "z": 30.0, "f": 1000.0},
+                    ],
+                }
+            ],
+        }
+        json_const_z = os.path.join(self.tmp_dir, "h4_m_const_z.json")
+        with open(json_const_z, "w", encoding="utf-8") as f:
+            json.dump(tp_const_z, f)
+
+        with self.assertRaises(ValueError) as cm_cz:
+            orchestrator.run(
+                context_dump_paths=[json_const_z],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIn("insufficient volume overlap", str(cm_cz.exception))
+
+    def test_pipeline_stl_overlap_turning(self):
+        """H4: Turning STL stock requires >= 50% toolpath Z span overlap."""
+        from pipeline import PipelineOrchestrator
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_h4_t.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_TURNING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_h4_t.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Z10\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+
+        # Stock box Z is [0, 20]
+        # 1. Passing turning toolpath: cutting moves from Z=5 to Z=15 (Z span 10 mm, 100% inside [0, 20])
+        tp_pass = {
+            "programName": "H4TurnPass",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 1,
+                    "tool": {"_isTurningTool": True, "type": 1},
+                    "events": [
+                        {"type": "onLinear", "x": 5.0, "y": 0.0, "z": 5.0, "f": 100.0},
+                        {"type": "onLinear", "x": 5.0, "y": 0.0, "z": 15.0, "f": 100.0},
+                    ],
+                }
+            ],
+        }
+        json_pass = os.path.join(self.tmp_dir, "h4_t_pass.json")
+        with open(json_pass, "w", encoding="utf-8") as f:
+            json.dump(tp_pass, f)
+
+        mock_tool = MagicMock()
+        with patch.object(orchestrator, "replay_combined_context", return_value="G1 Z5\n"), \
+             patch("pipeline.extract_tools_from_context", return_value={"0": mock_tool}):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[json_pass],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+                is_turning=True,
+            )
+        self.assertIsNotNone(rep.stock_bounding_box)
+        self.assertIsNotNone(rep.toolpath_bounding_box)
+
+        # 2. Failing turning toolpath: cutting moves from Z=25 to Z=45 (Z span 20 mm, overlap with [0, 20] is 0%)
+        tp_fail = {
+            "programName": "H4TurnFail",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 1,
+                    "tool": {"_isTurningTool": True, "type": 1},
+                    "events": [
+                        {"type": "onLinear", "x": 5.0, "y": 0.0, "z": 25.0, "f": 100.0},
+                        {"type": "onLinear", "x": 5.0, "y": 0.0, "z": 45.0, "f": 100.0},
+                    ],
+                }
+            ],
+        }
+        json_fail = os.path.join(self.tmp_dir, "h4_t_fail.json")
+        with open(json_fail, "w", encoding="utf-8") as f:
+            json.dump(tp_fail, f)
+
+        with patch("pipeline.extract_tools_from_context", return_value={"0": mock_tool}):
+            with self.assertRaises(ValueError) as cm:
+                orchestrator.run(
+                    context_dump_paths=[json_fail],
+                    base_post_path=dummy_cps,
+                    bootstrap_cnc_path=dummy_cnc,
+                    promote=False,
+                    is_turning=True,
+                )
+        self.assertIn("insufficient overlap", str(cm.exception))
+        self.assertIn("Toolpath bounding box", str(cm.exception))
+        self.assertIn("Stock bounding box", str(cm.exception))
+
+        # 3. Constant-Z facing cut out-of-bounds (dz == 0 at Z=30, stock Z=[0, 20])
+        tp_const_z = {
+            "programName": "H4TurnConstZFail",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 1,
+                    "tool": {"_isTurningTool": True, "type": 1},
+                    "events": [
+                        {"type": "onLinear", "sx": 5.0, "sy": 0.0, "sz": 30.0, "x": 15.0, "y": 0.0, "z": 30.0, "f": 100.0},
+                    ],
+                }
+            ],
+        }
+        json_const_z = os.path.join(self.tmp_dir, "h4_t_const_z.json")
+        with open(json_const_z, "w", encoding="utf-8") as f:
+            json.dump(tp_const_z, f)
+
+        with patch("pipeline.extract_tools_from_context", return_value={"0": mock_tool}):
+            with self.assertRaises(ValueError) as cm_cz:
+                orchestrator.run(
+                    context_dump_paths=[json_const_z],
+                    base_post_path=dummy_cps,
+                    bootstrap_cnc_path=dummy_cnc,
+                    promote=False,
+                    is_turning=True,
+                )
+        self.assertIn("insufficient overlap", str(cm_cz.exception))
+
+    def test_universal_dumper_export_stock_safe_mode_and_staging(self):
+        """Verify universal_dumper_export_stock.cps enables exportStock in post --interrogate safe mode."""
+        import shutil
+        import subprocess
+        import PostProcessAll
+        from pipeline import find_autodesk_post_binary
+
+        with open("universal_dumper.cps", "r", encoding="utf-8") as f:
+            cps_src = f.read()
+        self.assertIn("getConfigurationPath", cps_src)
+        self.assertIn("export_stock", cps_src)
+
+        cfg_path = PostProcessAll._WriteDumperConfig(
+            target_dir=self.tmp_dir,
+            stock_mode="previous-setup",
+            export_stock=True,
+            set_env=False,
+        )
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg_data = json.load(f)
+        self.assertTrue(cfg_data.get("export_stock"))
+
+        # If Autodesk post binary is available, verify actual `post --interrogate` safe-mode output
+        try:
+            post_exe = find_autodesk_post_binary()
+        except Exception:
+            post_exe = None
+        if post_exe and os.path.isfile(post_exe):
+            staged_export = os.path.join(self.tmp_dir, "universal_dumper_export_stock.cps")
+            shutil.copy2("universal_dumper.cps", staged_export)
+
+            res_default = subprocess.run(
+                [post_exe, "--interrogate", os.path.abspath("universal_dumper.cps")],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(res_default.returncode, 0)
+            self.assertIn('"exportStock":false', res_default.stdout.replace(" ", ""))
+
+            res_export = subprocess.run(
+                [post_exe, "--interrogate", staged_export],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(res_export.returncode, 0)
+            self.assertIn('"exportStock":true', res_export.stdout.replace(" ", ""))
+
+    def test_roundstock2_inprocess_stock_hint_and_overlap(self):
+        """Verify in-process stock with machined axes and G1 clearance retracts passes H2 and H4."""
+        from context_parser import extract_workpiece_from_context
+        from pipeline import PipelineOrchestrator
+
+        # 1. H2: In-process stock STL is 20x20x20 (X machined down from 28 -> 20, Z from 22 -> 20, Y unmachined = 20)
+        ctx_inprocess = {
+            "unit": 1,
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "workpieceHint": {
+                "lower": {"x": -14.0, "y": -10.0, "z": 0.0},
+                "upper": {"x": 14.0, "y": 10.0, "z": 22.0},
+            },
+            "sections": [],
+        }
+        wp = extract_workpiece_from_context(ctx_inprocess, is_turning=False)
+        self.assertIsNotNone(wp)
+        self.assertAlmostEqual(wp.stock.x_max, 10.0, places=2)
+
+        # 2. H4: RoundStock2 milling toolpath with vertical G1 retracts above st_max_z (Z=35 vs st_max_z=20)
+        # and cutter center stepping over by tool radius (X=12.5 with ø6mm tool on X=[-10, 10] stock)
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_rs2.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_rs2.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z10\n")
+
+        tp_rs2 = {
+            "programName": "RoundStock2",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "tool": {"number": 2, "type": 9, "diameter": 6.0},
+                    "events": [
+                        {"type": "onLinear", "sx": -4.8, "sy": -4.9, "sz": 35.0, "x": -4.8, "y": -4.9, "z": 13.0, "f": 500.0},
+                        {"type": "onLinear", "sx": -4.8, "sy": -4.9, "sz": 13.0, "x": 12.5, "y": 4.1, "z": 18.0, "f": 1000.0},
+                        {"type": "onLinear", "sx": 12.5, "sy": 4.1, "sz": 18.0, "x": 12.5, "y": 4.1, "z": 35.0, "f": 1000.0},
+                    ],
+                }
+            ],
+        }
+        json_rs2 = os.path.join(self.tmp_dir, "rs2_pass.json")
+        with open(json_rs2, "w", encoding="utf-8") as f:
+            json.dump(tp_rs2, f)
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+        with patch.object(orchestrator, "replay_combined_context", return_value="G1 X0 Y0\n"):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[json_rs2],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIsNotNone(rep.stock_bounding_box)
 
 
 if __name__ == "__main__":

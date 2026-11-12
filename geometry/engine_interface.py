@@ -3,14 +3,15 @@ Verification Engine Interface Contract and Base Implementation.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
 from .models import (
     CollisionRecord,
     MRRSample,
+    MotionKind,
     MotionSegment,
     MoveEvaluation,
-    PromotedVectorRule,
+    PromotedEventKey,
     ToolAssembly,
     VerificationReport,
     WorkpieceDefinition,
@@ -87,10 +88,8 @@ class BaseVerificationEngine(IVerificationEngine):
         self.total_volume_removed_mm3: float = 0.0
         self.collisions: List[CollisionRecord] = []
         self.mrr_timeline: List[MRRSample] = []
-        self.vector_occurrences: Dict[str, int] = {}
-        self.vector_last_cut_occurrence: Dict[str, int] = {}
-        self.vector_has_air_occurrence: Dict[str, bool] = {}
-        self.promoted_vectors: Dict[str, PromotedVectorRule] = {}
+        self.promoted_events: Set[PromotedEventKey] = set()
+        self._blocked_events: Set[PromotedEventKey] = set()
         self.operation_names: List[str] = []
 
     def _reset_base_state(self, workpiece: WorkpieceDefinition) -> None:
@@ -102,30 +101,54 @@ class BaseVerificationEngine(IVerificationEngine):
         self.total_volume_removed_mm3 = 0.0
         self.collisions.clear()
         self.mrr_timeline.clear()
-        self.vector_occurrences.clear()
-        self.vector_last_cut_occurrence.clear()
-        self.vector_has_air_occurrence.clear()
-        self.promoted_vectors.clear()
+        self.promoted_events.clear()
+        self._blocked_events.clear()
         self.operation_names.clear()
 
-    def record_vector_occurrence(self, v_key_str: str, is_air_move: bool) -> int:
+    def _promotion_blocked(self, move: MotionSegment) -> bool:
         """
-        Record occurrence of a vector key and update tentative promotion rules.
-        Returns the 1-based occurrence index for this move.
+        Check if rapid promotion must be blocked for this move.
+        Moves under active radius compensation (rc != 0) or transition moves
+        (rc_transition=True) must never be promoted to rapids.
         """
-        seen = self.vector_occurrences.get(v_key_str, 0) + 1
-        self.vector_occurrences[v_key_str] = seen
+        meta = getattr(move, "metadata", None) or {}
+        return int(meta.get("rc", 0) or 0) != 0 or bool(meta.get("rc_transition", False))
 
-        if is_air_move:
-            self.vector_has_air_occurrence[v_key_str] = True
-            if v_key_str not in self.promoted_vectors:
-                self.promoted_vectors[v_key_str] = PromotedVectorRule(min_occur=seen)
+    def record_event_evaluation(
+        self,
+        move: MotionSegment,
+        is_air_move: bool,
+        collisions: Sequence[CollisionRecord] = (),
+    ) -> None:
+        """
+        Record per-event promotion verdict.
+        An event (sec_idx, event_idx) is promoted if and only if it is an eligible
+        linear feed move and all its segments are verified air and collision-free.
+        """
+        meta = getattr(move, "metadata", None) or {}
+        sec_idx = meta.get("sec_idx", move.sec_id)
+        event_idx = meta.get("event_idx")
+        if event_idx is None:
+            event_idx = move.segment_id
+        ev_key: PromotedEventKey = (sec_idx, event_idx)
+
+        in_cycle = bool(getattr(move, "in_cycle", False) or meta.get("in_cycle", False))
+        is_sync = bool(getattr(move, "sync", False) or meta.get("sync", False))
+        is_blocked = self._promotion_blocked(move)
+
+        if (
+            is_air_move
+            and not in_cycle
+            and not is_sync
+            and not is_blocked
+            and move.motion == MotionKind.LINEAR
+            and not collisions
+        ):
+            if ev_key not in self._blocked_events:
+                self.promoted_events.add(ev_key)
         else:
-            self.vector_last_cut_occurrence[v_key_str] = seen
-            if v_key_str in self.promoted_vectors:
-                self.promoted_vectors[v_key_str] = PromotedVectorRule(min_occur=seen + 1)
-
-        return seen
+            self._blocked_events.add(ev_key)
+            self.promoted_events.discard(ev_key)
 
     def record_mrr_sample(
         self,
@@ -161,14 +184,6 @@ class BaseVerificationEngine(IVerificationEngine):
         collating collisions, total volume removed, and statistical MRR spikes.
         Top 3 spikes per operation are selected and sorted chronologically.
         """
-        final_promoted: Dict[str, PromotedVectorRule] = {}
-        for vkey, total_occ in self.vector_occurrences.items():
-            if not self.vector_has_air_occurrence.get(vkey, False):
-                continue
-            last_cut = self.vector_last_cut_occurrence.get(vkey, 0)
-            if last_cut < total_occ:
-                final_promoted[vkey] = PromotedVectorRule(min_occur=last_cut + 1)
-
         non_zero_mrrs = [s.mrr_rate_mm3_per_min for s in self.mrr_timeline if s.mrr_rate_mm3_per_min > 1.0]
         spikes: List[MRRSample] = []
         if non_zero_mrrs:
@@ -194,7 +209,7 @@ class BaseVerificationEngine(IVerificationEngine):
             total_machining_time_sec=self.total_machining_time_sec,
             total_volume_removed_mm3=self.total_volume_removed_mm3,
             collisions=list(self.collisions),
-            promoted_vectors=final_promoted,
+            promoted_events=set(self.promoted_events),
             mrr_timeline=list(self.mrr_timeline),
             mrr_spikes=spikes,
             operation_names=list(getattr(self, "operation_names", [])),

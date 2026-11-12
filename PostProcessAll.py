@@ -2,6 +2,7 @@
 #Description-Post process all CAM setups, using the setup name as the output file name.
 
 import collections
+import contextlib
 import datetime
 import enum
 import glob
@@ -78,9 +79,22 @@ constReplayerScript = os.path.join(constAddonDir, "universal_replayer.cps")
 constPackagesDir = os.path.join(constAddonDir, "packages")
 
 _LOG_PATH = os.path.join(tempfile.gettempdir(), "postprocess_debug.log")
+_MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB capped debug log
+
+def _RotateLogIfNeeded(log_path: str = _LOG_PATH, max_bytes: int = _MAX_LOG_SIZE_BYTES) -> None:
+    """Rotate log file to .1 if size exceeds max_bytes."""
+    try:
+        if os.path.isfile(log_path) and os.path.getsize(log_path) >= max_bytes:
+            rot_path = log_path + ".1"
+            if os.path.isfile(rot_path):
+                os.remove(rot_path)
+            os.replace(log_path, rot_path)
+    except Exception:
+        pass
 
 def _dbg_global(msg):
     try:
+        _RotateLogIfNeeded(_LOG_PATH)
         t = time.strftime('%H:%M:%S')
         with open(_LOG_PATH, "a", encoding="utf8") as f:
             f.write(f"[{t}] {msg}\n")
@@ -1101,6 +1115,7 @@ def PerformPostProcess(docSettings, setups=None):
                             except Exception:
                                 pass
                     return True
+                _cb.progress_dialog = progress
                 return _cb
 
             cntSetups = 0
@@ -1174,16 +1189,17 @@ def PerformPostProcess(docSettings, setups=None):
         )
         ShowVerifyResults(ui)
 
-    except:
+    except Exception as exc:
         if progress:
             progress.hide()
         err_msg = traceback.format_exc()
         _dbg_global("PerformPostProcess exception:\n" + err_msg)
+        user_err = f"Post processing encountered an error: {exc}"
         _NotifyPostProcessResult(
             ui=ui,
             cntFiles=0,
             cntSkipped=1,
-            lstSkipped=err_msg,
+            lstSkipped=user_err,
             outputFolder=outputFolder if 'outputFolder' in locals() else "",
             verifyResults=verifyResults,
             is_fatal=True,
@@ -1258,46 +1274,36 @@ def _IsInternalHelperPost(post_cfg) -> bool:
     return False
 
 
-def _GetPostSearchDirs():
-    """Return all directories on this machine where Autodesk Fusion and user post processors live."""
-    dirs = []
+def _GetPostSearchDirsByTier() -> Tuple[List[str], List[str], List[str]]:
+    """
+    Return post search directories partitioned by priority tier:
+    Tier 1 (User / Cloud): Personal and cloud post libraries.
+    Tier 2 (System): Autodesk installation system posts.
+    Tier 3 (Add-on): Fallback add-in local directory.
+    """
+    user_dirs: List[str] = []
+    system_dirs: List[str] = []
+    addon_dirs: List[str] = []
 
-    def _add_dir(path):
+    def _add(lst: List[str], path: Optional[str]):
         if not path:
             return
         norm = os.path.normpath(os.path.abspath(path))
-        if os.path.isdir(norm) and norm not in dirs:
-            dirs.append(norm)
+        if os.path.isdir(norm) and norm not in lst:
+            lst.append(norm)
 
-    try:
-        from pipeline import find_autodesk_system_posts_dir, find_autodesk_post_binary
-        sys_posts_dir = find_autodesk_system_posts_dir()
-        if sys_posts_dir:
-            _add_dir(sys_posts_dir)
-        post_b = find_autodesk_post_binary()
-        if post_b:
-            cam_dir = os.path.dirname(post_b)
-            for sub in ("Data/Posts", "Posts"):
-                _add_dir(os.path.join(cam_dir, sub))
-    except Exception as exc:
-        _dbg_global(f"_GetPostSearchDirs pipeline search exception: {exc}")
+    # --- Tier 1: User / Personal / Cloud Post Directories ---
+    _add(user_dirs, os.path.expanduser("~/Library/Application Support/Autodesk/Fusion 360 CAM/Posts"))
+    _add(user_dirs, os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/Posts"))
+    _add(user_dirs, os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/cache/posts"))
 
-    std_dirs = [
-        constAddonDir,
-        os.path.expanduser("~/Library/Application Support/Autodesk/Fusion 360 CAM/Posts"),
-        os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/Posts"),
-        os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/cache/posts"),
-    ]
     appdata = os.environ.get("APPDATA", "")
     if appdata:
-        std_dirs.append(os.path.join(appdata, "Autodesk", "Fusion 360 CAM", "Posts"))
-        std_dirs.append(os.path.join(appdata, "Autodesk", "Autodesk Fusion 360", "CAM", "Posts"))
+        _add(user_dirs, os.path.join(appdata, "Autodesk", "Fusion 360 CAM", "Posts"))
+        _add(user_dirs, os.path.join(appdata, "Autodesk", "Autodesk Fusion 360", "CAM", "Posts"))
     localappdata = os.environ.get("LOCALAPPDATA", "")
     if localappdata:
-        std_dirs.append(os.path.join(localappdata, "Autodesk", "Autodesk Fusion 360", "CAM", "cache", "posts"))
-
-    for d in std_dirs:
-        _add_dir(d)
+        _add(user_dirs, os.path.join(localappdata, "Autodesk", "Autodesk Fusion 360", "CAM", "cache", "posts"))
 
     for pattern in (
         os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/*/W.login/*/CAMPosts"),
@@ -1305,21 +1311,51 @@ def _GetPostSearchDirs():
     ):
         if pattern:
             for cd in glob.glob(pattern):
-                _add_dir(cd)
+                _add(user_dirs, cd)
 
-    return dirs
+    # --- Tier 2: System Post Directories ---
+    try:
+        from pipeline import find_autodesk_system_posts_dir, find_autodesk_post_binary
+        try:
+            sys_posts_dir = find_autodesk_system_posts_dir()
+            if sys_posts_dir:
+                _add(system_dirs, sys_posts_dir)
+        except Exception:
+            pass
+        try:
+            post_b = find_autodesk_post_binary()
+            if post_b:
+                cam_dir = os.path.dirname(post_b)
+                for sub in ("Data/Posts", "Posts"):
+                    _add(system_dirs, os.path.join(cam_dir, sub))
+        except Exception:
+            pass
+    except Exception as exc:
+        _dbg_global(f"_GetPostSearchDirsByTier pipeline search exception: {exc}")
+
+    # --- Tier 3: Add-on Directory Fallback ---
+    _add(addon_dirs, constAddonDir)
+
+    return user_dirs, system_dirs, addon_dirs
+
+
+def _GetPostSearchDirs() -> List[str]:
+    """Return all directories on this machine where Autodesk Fusion and user post processors live."""
+    user_dirs, sys_dirs, addon_dirs = _GetPostSearchDirsByTier()
+    combined = []
+    for d in user_dirs + sys_dirs + addon_dirs:
+        if d not in combined:
+            combined.append(d)
+    return combined
 
 
 def _GetPostCapabilities(cps_path: str) -> Optional[Dict[str, bool]]:
-    """Parse capabilities declared in a .cps post processor file."""
+    """Parse capabilities declared in a .cps post processor file (scans whole file)."""
     if not cps_path or not os.path.isfile(cps_path):
         return None
     try:
         with open(cps_path, "r", encoding="utf-8", errors="ignore") as f:
-            for _ in range(60):
-                line = f.readline()
-                if not line:
-                    break
+            for line in f:
                 m = re.search(r"\bcapabilities\s*=\s*([^;]+);", line)
                 if m:
                     expr = m.group(1)
@@ -1346,76 +1382,135 @@ def _IsPostCompatible(cps_path: str, is_turning: Optional[bool] = None) -> bool:
 
 
 def _ResolveBasePostPath(program=None, is_turning: Optional[bool] = None) -> str:
-    """Resolve target machine post processor path from NCProgram without mutating user settings."""
+    """
+    Resolve target machine post processor path from NCProgram without mutating user settings.
+    - Exact path or file:// URL is authoritative.
+    - For name/description matches, user/cloud post directories (Tier 1) are preferred over system posts (Tier 2).
+    - If more than one compatible file matches within the same priority tier, raises ValueError naming candidates.
+    """
+    if not program or not hasattr(program, "postConfiguration") or not program.postConfiguration:
+        return ""
+
+    post_cfg = program.postConfiguration
+    if _IsInternalHelperPost(post_cfg):
+        return ""
+
+    # 1. Authoritative check: Exact path or file:// URL
+    for attr in ("postPath", "location"):
+        val = getattr(post_cfg, attr, None)
+        if val and isinstance(val, str) and (os.path.isabs(val) or val.endswith(".cps")):
+            if os.path.isfile(val):
+                if _IsPostCompatible(val, is_turning):
+                    _dbg_global(f"_ResolveBasePostPath: authoritative exact path via postConfiguration.{attr} -> {val}")
+                    return os.path.abspath(val)
+
+    try:
+        if hasattr(post_cfg, "url") and post_cfg.url:
+            u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
+            if u_str and u_str.startswith("file://"):
+                import urllib.parse
+                f_path = urllib.parse.unquote(u_str[len("file://"):])
+                if os.path.isfile(f_path):
+                    if _IsPostCompatible(f_path, is_turning):
+                        _dbg_global(f"_ResolveBasePostPath: authoritative exact path via url file:// -> {f_path}")
+                        return os.path.abspath(f_path)
+    except Exception as u_exc:
+        _dbg_global(f"_ResolveBasePostPath url inspection exception: {u_exc}")
+
+    # Gather search candidate strings (names / descriptions)
+    candidates = []
+    for attr in ("postPath", "location", "name", "description"):
+        val = getattr(post_cfg, attr, None)
+        if val and isinstance(val, str):
+            candidates.append(val)
+    if hasattr(post_cfg, "url") and post_cfg.url:
+        u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
+        if u_str:
+            candidates.append(os.path.basename(u_str))
+
     search_dirs = _GetPostSearchDirs()
+    user_dirs_def, sys_dirs_def, addon_dirs_def = _GetPostSearchDirsByTier()
+    sys_set = set(sys_dirs_def)
+    addon_set = set(addon_dirs_def)
 
-    if program and hasattr(program, "postConfiguration") and program.postConfiguration:
-        post_cfg = program.postConfiguration
-        if not _IsInternalHelperPost(post_cfg):
-            candidates = []
-            for attr in ("postPath", "location", "name", "description"):
-                val = getattr(post_cfg, attr, None)
-                if val and isinstance(val, str):
-                    if os.path.isfile(val):
-                        if _IsPostCompatible(val, is_turning):
-                            _dbg_global(f"_ResolveBasePostPath: resolved directly via postConfiguration.{attr} -> {val}")
-                            return os.path.abspath(val)
-                    candidates.append(val)
-            try:
-                if hasattr(post_cfg, "url") and post_cfg.url:
-                    u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
-                    if u_str:
-                        if u_str.startswith("file://"):
-                            import urllib.parse
-                            f_path = urllib.parse.unquote(u_str[len("file://"):])
-                            if os.path.isfile(f_path):
-                                if _IsPostCompatible(f_path, is_turning):
-                                    _dbg_global(f"_ResolveBasePostPath: resolved via url file:// -> {f_path}")
-                                    return os.path.abspath(f_path)
-                        candidates.append(os.path.basename(u_str))
-            except Exception as u_exc:
-                _dbg_global(f"_ResolveBasePostPath url inspection exception: {u_exc}")
+    user_dirs = [d for d in search_dirs if d not in sys_set and d not in addon_set]
+    sys_dirs = [d for d in search_dirs if d in sys_set]
+    addon_dirs = [d for d in search_dirs if d in addon_set]
 
-            _dbg_global(f"_ResolveBasePostPath: candidate names={candidates}, is_turning={is_turning}")
-            for cand in candidates:
-                bname = os.path.basename(cand).split("?")[0].strip()
-                if not bname:
+    tiers = [
+        ("user/cloud", user_dirs),
+        ("system", sys_dirs),
+        ("add-on", addon_dirs),
+    ]
+
+    for tier_name, sdirs in tiers:
+        if not sdirs:
+            continue
+
+        # A. Basename search within this tier
+        for cand in candidates:
+            bname = os.path.basename(cand).split("?")[0].strip()
+            if not bname:
+                continue
+            names_to_try = [bname]
+            if not bname.lower().endswith(".cps"):
+                names_to_try.append(bname + ".cps")
+
+            matched_files = set()
+            for name_try in names_to_try:
+                for sdir in sdirs:
+                    p_try = os.path.join(sdir, name_try)
+                    if os.path.isfile(p_try) and _IsPostCompatible(p_try, is_turning):
+                        matched_files.add(os.path.abspath(p_try))
+
+            if len(matched_files) == 1:
+                res = list(matched_files)[0]
+                _dbg_global(f"_ResolveBasePostPath: matched {bname} in {tier_name} -> {res}")
+                return res
+            elif len(matched_files) > 1:
+                cand_list = ", ".join(f"'{p}'" for p in sorted(matched_files))
+                raise ValueError(
+                    f"Ambiguous post processor match for '{bname}' in {tier_name} post directories: "
+                    f"multiple compatible candidate files found ({cand_list}). Please specify an exact path."
+                )
+
+        # B. Description substring search within this tier
+        for cand in candidates:
+            cand_clean = cand.strip().lower()
+            if not cand_clean or len(cand_clean) < 3:
+                continue
+
+            matched_files = set()
+            for sdir in sdirs:
+                if not os.path.isdir(sdir):
                     continue
-                names_to_try = [bname]
-                if not bname.lower().endswith(".cps"):
-                    names_to_try.append(bname + ".cps")
-                for name_try in names_to_try:
-                    for sdir in search_dirs:
-                        p_try = os.path.join(sdir, name_try)
-                        if os.path.isfile(p_try) and _IsPostCompatible(p_try, is_turning):
-                            _dbg_global(f"_ResolveBasePostPath: matched {name_try} in {sdir} -> {p_try}")
-                            return os.path.abspath(p_try)
-
-            # Try matching candidate against post descriptions in search_dirs
-            for cand in candidates:
-                cand_clean = cand.strip().lower()
-                if not cand_clean or len(cand_clean) < 3:
-                    continue
-                for sdir in search_dirs:
-                    if not os.path.isdir(sdir):
-                        continue
-                    try:
-                        for entry in os.listdir(sdir):
-                            if entry.lower().endswith(".cps"):
-                                entry_path = os.path.join(sdir, entry)
-                                if not _IsPostCompatible(entry_path, is_turning):
-                                    continue
-                                try:
-                                    with open(entry_path, "r", encoding="utf-8", errors="ignore") as f:
-                                        first_lines = [f.readline() for _ in range(30)]
-                                    for line in first_lines:
+                try:
+                    for entry in os.listdir(sdir):
+                        if entry.lower().endswith(".cps"):
+                            entry_path = os.path.join(sdir, entry)
+                            if not _IsPostCompatible(entry_path, is_turning):
+                                continue
+                            try:
+                                with open(entry_path, "r", encoding="utf-8", errors="ignore") as f:
+                                    for line in f:
                                         if "description" in line and cand_clean in line.lower():
-                                            _dbg_global(f"_ResolveBasePostPath: matched description '{cand}' in {entry_path}")
-                                            return os.path.abspath(entry_path)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                                            matched_files.add(os.path.abspath(entry_path))
+                                            break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            if len(matched_files) == 1:
+                res = list(matched_files)[0]
+                _dbg_global(f"_ResolveBasePostPath: matched description '{cand}' in {tier_name} -> {res}")
+                return res
+            elif len(matched_files) > 1:
+                cand_list = ", ".join(f"'{p}'" for p in sorted(matched_files))
+                raise ValueError(
+                    f"Ambiguous post processor match for description '{cand}' in {tier_name} post directories: "
+                    f"multiple compatible candidate files found ({cand_list}). Please specify an exact path."
+                )
 
     return ""
 
@@ -1475,8 +1570,18 @@ def _EnsureLocalModulesLoaded(force=False):
     if sys.version_info >= (3, 14) and os.path.isdir(constPackagesDir) and constPackagesDir not in sys.path:
         sys.path.insert(0, constPackagesDir)
 
-    # Do not reload modules during automated test execution to preserve Enum and Class identities
-    if "unittest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
+    # Do not reload modules during automated test execution to preserve Enum and Class identities.
+    # Note: vendored pyparsing.testing imports 'unittest' in production Fusion 360 when plotting,
+    # so check whether 'adsk' is a real C++ extension module on disk (__file__ is a string) vs a test mock.
+    _adsk_mod = sys.modules.get("adsk")
+    _is_test_env = bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or (
+            "unittest" in sys.modules
+            and not isinstance(getattr(_adsk_mod, "__file__", None), str)
+        )
+    )
+    if _is_test_env:
         return
 
     if _modules_loaded_session and not force:
@@ -1484,24 +1589,17 @@ def _EnsureLocalModulesLoaded(force=False):
     _modules_loaded_session = True
 
     import importlib
-    # Only reload geometry.models if its schema is outdated (preserving class identities for isinstance/enum checks)
-    if "geometry.models" in sys.modules:
-        gm = sys.modules["geometry.models"]
-        ltg = getattr(gm, "LatheToolGeometry", None)
-        if not ltg or "is_boring" not in getattr(ltg, "__dataclass_fields__", {}):
-            try:
-                importlib.reload(gm)
-            except Exception as exc:
-                _dbg_global(f"Reload of geometry.models failed: {exc}")
-
-    # Reload in strict dependency order (engines, plotter, parser, pipeline)
+    # Reload in strict topological dependency order starting with geometry.models
+    # so all downstream modules share identical Enum and dataclass type objects.
     ordered_mods = (
+        "geometry.models",
         "geometry.engine_interface",
         "geometry.stock_generator",
         "geometry.tool_generator",
         "geometry.legacy_adapter",
         "geometry.lathe_engine",
         "geometry.solid_mesh",
+        "geometry.mesh_utils",
         "geometry.heightfield_engine",
         "geometry.mill_engine",
         "geometry.plotter",
@@ -1531,8 +1629,67 @@ def _EnsureLocalModulesLoaded(force=False):
         _dbg_global(f"_EnsureLocalModulesLoaded invoking root discovery failed: {exc}")
 
 
-def _WriteDumperConfig(base_post_path=None, target_cnc_path=None, post_properties=None, target_dir=None, stock_mode=None, unit=None):
-    """Write sidecar config for universal_dumper.cps when spawned by Fusion 360's C++ host process."""
+def _GetDocumentStockUnit(doc=None) -> str:
+    """
+    Get the document length unit ('mm' or 'in') from the CAM or Design units manager.
+    Defaults to 'mm' if not determinable.
+    """
+    try:
+        if doc is None and "adsk" in sys.modules and hasattr(adsk, "core"):
+            app = adsk.core.Application.get()
+            doc = getattr(app, "activeDocument", None) if app else None
+
+        if doc is not None:
+            units_mgr = getattr(doc, "unitsManager", None)
+            if not units_mgr:
+                products = getattr(doc, "products", None)
+                if products:
+                    for p_type in ("DesignProductType", "CAMProductType"):
+                        try:
+                            prod = products.itemByProductType(p_type) if hasattr(products, "itemByProductType") else None
+                            if prod and hasattr(prod, "unitsManager"):
+                                units_mgr = prod.unitsManager
+                                break
+                        except Exception:
+                            pass
+            if units_mgr:
+                unit_str = getattr(units_mgr, "defaultLengthUnits", None)
+                if isinstance(unit_str, str):
+                    u = unit_str.strip().lower()
+                    if u in ("in", "inch", "inches", "ft", "foot", "feet"):
+                        return "in"
+                    if u in ("mm", "cm", "m", "millimeter", "millimeters"):
+                        return "mm"
+    except Exception as exc:
+        _dbg_global(f"_GetDocumentStockUnit failed: {exc}")
+    return "mm"
+
+
+@contextlib.contextmanager
+def _ScopedEnv(env_updates: Dict[str, Optional[str]]):
+    """
+    Temporarily apply environment variable updates, saving previous values
+    and restoring them strictly in a finally block.
+    """
+    saved = {}
+    for k, v in env_updates.items():
+        saved[k] = os.environ.get(k)
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = str(v)
+    try:
+        yield
+    finally:
+        for k, prev in saved.items():
+            if prev is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev
+
+
+def _WriteDumperConfig(base_post_path=None, target_cnc_path=None, post_properties=None, target_dir=None, stock_mode=None, unit=None, stock_unit=None, set_env=True, export_stock=None):
+    """Write sidecar config for universal_dumper.cps exclusively into the per-run 0o700 mkdtemp directory."""
     cfg = {}
     if base_post_path and os.path.isfile(base_post_path):
         cfg["basePost"] = os.path.abspath(base_post_path)
@@ -1547,47 +1704,47 @@ def _WriteDumperConfig(base_post_path=None, target_cnc_path=None, post_propertie
                 pass
     if stock_mode:
         cfg["stockMode"] = str(stock_mode)
+    if export_stock is not None:
+        cfg["export_stock"] = bool(export_stock)
     if unit is not None:
         cfg["unit"] = int(unit)
+    if stock_unit:
+        cfg["stockUnit"] = str(stock_unit)
 
-    cfg_dirs = []
-    if target_dir and os.path.isdir(target_dir):
-        cfg_dirs.append(target_dir)
-        cfg_path_target = os.path.join(target_dir, "universal_dumper_config.json")
-        os.environ["DUMPER_CONFIG_PATH"] = cfg_path_target
-
-    temp_dir = tempfile.gettempdir()
-    if temp_dir not in cfg_dirs:
-        cfg_dirs.append(temp_dir)
-    if os.path.isdir("/tmp") and "/tmp" not in cfg_dirs:
-        cfg_dirs.append("/tmp")
-
-    for cfg_dir in cfg_dirs:
+    if not target_dir or not os.path.isdir(target_dir):
+        target_dir = tempfile.mkdtemp(prefix="dumper_cfg_")
         try:
-            if os.path.isdir(cfg_dir):
-                cfg_path = os.path.join(cfg_dir, "universal_dumper_config.json")
-                with open(cfg_path, "w", encoding="utf-8") as f:
-                    json.dump(cfg, f)
+            os.chmod(target_dir, 0o700)
         except Exception:
             pass
+    else:
+        try:
+            os.chmod(target_dir, 0o700)
+        except Exception:
+            pass
+
+    cfg_path = os.path.join(target_dir, "universal_dumper_config.json")
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    if set_env:
+        os.environ["DUMPER_CONFIG_PATH"] = cfg_path
+    return cfg_path
 
 
 def _ClearDumperConfig(target_dir=None):
     """Remove temporary sidecar config and clean environment variables for universal_dumper.cps."""
-    cfg_dirs = []
     if target_dir and os.path.isdir(target_dir):
-        cfg_dirs.append(target_dir)
-    temp_dir = tempfile.gettempdir()
-    if temp_dir not in cfg_dirs:
-        cfg_dirs.append(temp_dir)
-    if os.path.isdir("/tmp") and "/tmp" not in cfg_dirs:
-        cfg_dirs.append("/tmp")
-
-    for cfg_dir in cfg_dirs:
-        try:
-            cfg_path = os.path.join(cfg_dir, "universal_dumper_config.json")
-            if os.path.isfile(cfg_path):
+        cfg_path = os.path.join(target_dir, "universal_dumper_config.json")
+        if os.path.isfile(cfg_path):
+            try:
                 os.remove(cfg_path)
+            except Exception:
+                pass
+
+    env_cfg = os.environ.get("DUMPER_CONFIG_PATH")
+    if env_cfg and os.path.isfile(env_cfg):
+        try:
+            os.remove(env_cfg)
         except Exception:
             pass
 
@@ -1667,7 +1824,7 @@ def _ExtractWorkpieceFromSetup(setup):
     try:
         stock_mode = _GetSetupStockMode(setup)
         if any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
-            _dbg_global(f"_ExtractWorkpieceFromSetup: setup uses unsupported stock mode '{stock_mode}'; returning None")
+            _dbg_global(f"_ExtractWorkpieceFromSetup: setup uses stock mode '{stock_mode}'; relying on Pass 1 STL stock dump")
             return None
 
         if any(k in stock_mode for k in ("solid", "body")):
@@ -1985,7 +2142,8 @@ def _BuildNotificationHTML(title, status_type, message, details, actions):
     font-size: 11px;
     color: #9e9e9e;
     margin-bottom: 12px;
-    word-break: break-all;
+    word-break: break-word;
+    white-space: pre-wrap;
   }}
   .toast-actions {{
     display: flex;
@@ -2099,6 +2257,11 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
             msg = f"{cntFiles} file(s) successfully written."
 
     details = outputFolder if outputFolder else ""
+    if cntSkipped > 0 and lstSkipped:
+        skip_msg = lstSkipped.strip()
+        details = f"{skip_msg}\n\nFolder: {outputFolder}" if outputFolder else skip_msg
+    if len(details) > 600:
+        details = details[:600].rstrip() + "\n... (see report for full details)"
 
     # 2. Log status summary to Application console (without flickering status bar)
     status_summary = f"[PostProcessAll] {title}: {msg}"
@@ -2373,13 +2536,19 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
             program = GetNcProgram(cam, docSettings)
         except Exception:
             pass
-    base_post_path = _ResolveBasePostPath(program, is_turning=is_turning)
+    try:
+        base_post_path = _ResolveBasePostPath(program, is_turning=is_turning)
+    except (ValueError, RuntimeError) as err:
+        return str(err)
     if not base_post_path or not os.path.isfile(base_post_path):
         prog_name = getattr(program, "name", "None")
         post_cfg = getattr(program, "postConfiguration", None)
         post_name = getattr(post_cfg, "name", None) or getattr(post_cfg, "description", None) or "None"
         setup_type = "Turning" if is_turning else "Milling"
-        raw_post = _ResolveBasePostPath(program, is_turning=None)
+        try:
+            raw_post = _ResolveBasePostPath(program, is_turning=None)
+        except (ValueError, RuntimeError):
+            raw_post = ""
         if raw_post and os.path.isfile(raw_post):
             caps = _GetPostCapabilities(raw_post)
             if caps:
@@ -2414,26 +2583,6 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
 
     stock_mode = _GetSetupStockMode(setup)
     _dbg(f"_PostProcessUnifiedPipeline: setup '{setup.name}' stock_mode='{stock_mode}'")
-    if any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
-        err_msg = (
-            f"Setup '{setup.name}' uses 'From Previous Setup' stock, "
-            "which is currently unsupported for toolpath verification."
-        )
-        _dbg(f"_PostProcessUnifiedPipeline: {err_msg}")
-        _RecordVerifyResult(
-            setup=setup,
-            cncPath=path,
-            reportText=f"# Verification Failed\n\nError: {err_msg}",
-            reportPath=report_path,
-            pngPath=plot_path,
-            promoted=0,
-            spikes=0,
-            volume_mm3=0.0,
-            collisions=[],
-            error=err_msg,
-            warning=None,
-        )
-        return err_msg
 
     solid_wp = None
     if any(k in stock_mode for k in ("solid", "body")):
@@ -2512,6 +2661,10 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
 
     tmp_dir = tempfile.mkdtemp(prefix="unified_pipe_")
     try:
+        os.chmod(tmp_dir, 0o700)
+    except Exception:
+        pass
+    try:
         # -------------------------------------------------------------
         # PASS 1: Extract full post context (.json) per single-tool batch
         # Direct execution via cam.postProcess using constDumperScript path
@@ -2533,6 +2686,9 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
         elif units == in_opt:
             dumper_unit = 0  # IN in CPS post engine
 
+        stock_unit = _GetDocumentStockUnit(getattr(app, "activeDocument", None) if app else None)
+        is_prev_stock = any(k in stock_mode for k in ("previous", "preceding", "prev", "rest"))
+
         n_batches = max(1, len(batches))
         for b_idx, (t_num, op_list) in enumerate(batches):
             b_frac = 0.08 + 0.32 * (b_idx / n_batches)
@@ -2540,38 +2696,30 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
                 return "Operation cancelled by user."
             b_prefix = f"batch_{b_idx}"
             b_json = os.path.join(tmp_dir, f"{b_prefix}.json")
+            want_export_stock = bool(is_prev_stock and b_idx == 0)
 
-            os.environ["BASE_POST"] = os.path.abspath(base_post_path)
-            if b_idx == 0:
-                os.environ["TARGET_INTERMEDIATE_CNC"] = bootstrap_cnc
-                _WriteDumperConfig(
-                    base_post_path=base_post_path,
-                    target_cnc_path=bootstrap_cnc,
-                    post_properties=post_props,
-                    target_dir=tmp_dir,
-                    stock_mode=stock_mode,
-                    unit=dumper_unit,
-                )
-            else:
-                os.environ.pop("TARGET_INTERMEDIATE_CNC", None)
-                _WriteDumperConfig(
-                    base_post_path=base_post_path,
-                    target_cnc_path=None,
-                    post_properties=post_props,
-                    target_dir=tmp_dir,
-                    stock_mode=stock_mode,
-                    unit=dumper_unit,
-                )
-
-            _dbg(f"Pass 1: Posting batch {b_idx} (Tool {t_num}, {len(op_list)} ops) with universal_dumper.cps via direct PostProcessInput...")
-            post_input = adsk.cam.PostProcessInput.create(
-                b_prefix,
-                constDumperScript,
-                tmp_dir,
-                units,
+            cfg_path = _WriteDumperConfig(
+                base_post_path=base_post_path,
+                target_cnc_path=bootstrap_cnc if b_idx == 0 else None,
+                post_properties=post_props,
+                target_dir=tmp_dir,
+                stock_mode=stock_mode,
+                unit=dumper_unit,
+                stock_unit=stock_unit,
+                set_env=False,
+                export_stock=want_export_stock,
             )
-            post_input.isOpenInEditor = False
 
+            dumper_cps_for_batch = constDumperScript
+            if want_export_stock:
+                staged_dumper = os.path.join(tmp_dir, "universal_dumper_export_stock.cps")
+                try:
+                    shutil.copy2(constDumperScript, staged_dumper)
+                    dumper_cps_for_batch = staged_dumper
+                except Exception as cp_exc:
+                    _dbg(f"Pass 1: Failed to stage {staged_dumper}: {cp_exc}")
+
+            _dbg(f"Pass 1: Posting batch {b_idx} (Tool {t_num}, {len(op_list)} ops, exportStock={want_export_stock}) with {os.path.basename(dumper_cps_for_batch)} via direct PostProcessInput...")
             if len(op_list) == 1:
                 target_ops = op_list[0]
             else:
@@ -2586,12 +2734,25 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
                 except Exception:
                     pass
 
+            env_updates = {
+                "BASE_POST": os.path.abspath(base_post_path),
+                "TARGET_INTERMEDIATE_CNC": bootstrap_cnc if b_idx == 0 else None,
+                "DUMPER_CONFIG_PATH": cfg_path,
+            }
             post_ok = False
-            try:
-                post_ok = bool(cam.postProcess(target_ops, post_input))
-            except Exception as pp_exc:
-                _dbg(f"Pass 1: cam.postProcess exception for batch {b_idx}: {pp_exc}")
-                post_ok = False
+            with _ScopedEnv(env_updates):
+                post_input = adsk.cam.PostProcessInput.create(
+                    b_prefix,
+                    dumper_cps_for_batch,
+                    tmp_dir,
+                    units,
+                )
+                post_input.isOpenInEditor = False
+                try:
+                    post_ok = bool(cam.postProcess(target_ops, post_input))
+                except Exception as pp_exc:
+                    _dbg(f"Pass 1: cam.postProcess exception for batch {b_idx}: {pp_exc}")
+                    post_ok = False
 
             if not os.path.isfile(b_json):
                 # Search tmp_dir strictly for batch_{b_idx}.json or batch_{b_idx}_<digits>.json
@@ -2672,14 +2833,28 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
             except Exception:
                 pass
 
+        if getattr(report, "fixture_warning", None):
+            _dbg(f"Pass 2: WARNING: {report.fixture_warning} in setup {setup.name}!")
+            try:
+                adsk.core.Application.get().log(f"[PostProcessAll] WARNING: {report.fixture_warning} in setup {setup.name}!")
+            except Exception:
+                pass
+            if warning_msg:
+                warning_msg += f"; {report.fixture_warning}"
+            else:
+                warning_msg = report.fixture_warning
+
         _notify_p("Setup completed.", 1.0)
 
-        collision_vector_keys = {c.vector_key for c in report.collisions if c.vector_key}
-        promoted_total = (
-            len([k for k in report.promoted_vectors if k not in collision_vector_keys])
-            if (do_promote and getattr(report, "promoted_vectors", None))
-            else 0
-        )
+        if do_promote and getattr(report, "promoted_events", None):
+            colliding_events = {
+                (c.sec_idx, c.event_idx)
+                for c in report.collisions
+                if c.sec_idx is not None and c.event_idx is not None
+            }
+            promoted_total = len([ev for ev in report.promoted_events if ev not in colliding_events])
+        else:
+            promoted_total = 0
 
         summary_md = ""
         if os.path.isfile(report_path):
@@ -2771,6 +2946,74 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
         except Exception as exc:
             return "Unable to create output file '" + path + "'. Make sure the setup name is valid as a file name."
 
+        # For setups using 'From preceding setup' stock, warn if preceding setup stock is likely missing
+        stock_mode = _GetSetupStockMode(setup)
+        if any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
+            prior_missing = False
+            try:
+                if cam and hasattr(cam, "setups"):
+                    all_setups = list(cam.setups)
+                    s_idx = -1
+                    for idx, s in enumerate(all_setups):
+                        if s == setup or (
+                            hasattr(setup, "entityToken") and hasattr(s, "entityToken") and setup.entityToken == s.entityToken
+                        ) or getattr(s, "name", None) == getattr(setup, "name", None):
+                            s_idx = idx
+                            break
+
+                    if s_idx > 0:
+                        # Walk all earlier setups (not just the immediate predecessor)
+                        earlier_setups = [s for s in all_setups[:s_idx] if not getattr(s, "isSuppressed", False)]
+                        if not earlier_setups:
+                            prior_missing = True
+                        else:
+                            for prior_setup in earlier_setups:
+                                prior_ops = [
+                                    p_op for p_op in getattr(prior_setup, "allOperations", [])
+                                    if not getattr(p_op, "isSuppressed", False)
+                                ]
+                                if not prior_ops:
+                                    prior_missing = True
+                                    break
+                                for p_op in prior_ops:
+                                    if not cam.checkToolpath(p_op):
+                                        prior_missing = True
+                                        break
+                                if prior_missing:
+                                    break
+                    else:
+                        prior_missing = True
+                else:
+                    prior_missing = True
+            except Exception as prior_exc:
+                _dbg_global(f"PostProcessSetup: prior setup check exception: {prior_exc}")
+                prior_missing = True  # Fail closed on any exception
+
+            if prior_missing and ui:
+                prog_dialog = getattr(progress_cb, "progress_dialog", None)
+                if prog_dialog and hasattr(prog_dialog, "hide"):
+                    try:
+                        prog_dialog.hide()
+                    except Exception:
+                        pass
+                try:
+                    res = ui.messageBox(
+                        "Preceding setup stock is likely missing, proceed?",
+                        constCmdName,
+                        adsk.core.MessageBoxButtonTypes.YesNoButtonType,
+                        adsk.core.MessageBoxIconTypes.WarningIconType,
+                    )
+                finally:
+                    if prog_dialog and hasattr(prog_dialog, "show"):
+                        try:
+                            prog_dialog.show("Post Processing...", "Initializing post processing... (%p%)", 0, 100)
+                        except Exception:
+                            pass
+                if res != adsk.core.DialogResults.DialogYes:
+                    _dbg_global(f"PostProcessSetup: user chose not to proceed with setup '{setup.name}' due to missing preceding stock")
+                    # Answering "No" returns "Operation cancelled by user.", which causes the caller loop to abort all remaining setups.
+                    return "Operation cancelled by user."
+
         # Ensure toolpaths are generated for active operations
         for item in target_operations:
             if not cam.checkToolpath(item):
@@ -2797,6 +3040,5 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
         return _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program, path, fileExt, target_operations=target_operations, progress_cb=progress_cb)
 
     except Exception as exc:
-        if ui:
-            retVal += " " + traceback.format_exc()
-        return retVal
+        _dbg_global(f"PostProcessSetup exception: {traceback.format_exc()}")
+        return f"Fusion reported an exception: {exc}"

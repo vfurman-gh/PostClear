@@ -60,6 +60,9 @@ def _make_segment(
         end_y=round(end.y, 3),
         end_z=round(end.z, 3),
     )
+    meta = dict(metadata or {})
+    meta.setdefault("sec_idx", sec_id)
+    meta.setdefault("event_idx", seg_id)
     return MotionSegment(
         segment_id=seg_id,
         op_id=op_id,
@@ -73,7 +76,7 @@ def _make_segment(
         vector_key=vkey,
         is_arc=is_arc,
         arc_center=arc_center,
-        metadata=metadata or {},
+        metadata=meta,
     )
 
 
@@ -214,9 +217,8 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         self.assertTrue(res2.is_air_move)
 
         report = self.verifier.generate_report()
-        vkey_str = seg_pass1.vector_key.to_wrapper_str()
-        self.assertIn(vkey_str, report.promoted_vectors)
-        self.assertEqual(report.promoted_vectors[vkey_str].min_occur, 2)
+        self.assertIn((0, 2), report.promoted_events)
+        self.assertNotIn((0, 1), report.promoted_events)
 
     def test_rapid_into_stock_collision(self):
         """A rapid (G0) move traversing into raw stock must trigger RAPID_INTO_STOCK."""
@@ -318,8 +320,7 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         self.assertGreater(len(report.mrr_timeline), 0)
 
         # Move 4 (vertical retract) should be promoted
-        retract_key = moves[3].vector_key.to_wrapper_str()
-        self.assertIn(retract_key, report.promoted_vectors)
+        self.assertIn((0, moves[3].segment_id), report.promoted_events)
 
     def test_ball_endmill_carving(self):
         """Ball endmill carves a hemispherical/curved bottom trench."""
@@ -363,8 +364,52 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         res = self.verifier.step(cycle_move)
         self.assertFalse(res.is_air_move)
         report = self.verifier.generate_report()
-        vkey_str = cycle_move.vector_key.to_wrapper_str()
-        self.assertNotIn(vkey_str, report.promoted_vectors)
+        self.assertNotIn((0, 60), report.promoted_events)
+
+    def test_radius_compensation_moves_never_promoted(self):
+        """Moves with metadata['rc'] != 0 or 'rc_transition' are never authorized for rapid promotion."""
+        self.verifier.reset(self.workpiece)
+        self.verifier.load_tool(self.tool)
+
+        # Move with rc=1 (in the air, well above stock z_max=0)
+        rc_move = _make_segment(
+            seg_id=61,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(0.0, 0.0, 15.0),
+            end=Vector3D(10.0, 0.0, 15.0),
+            metadata={"rc": 1},
+        )
+        res_rc = self.verifier.step(rc_move)
+        self.assertFalse(res_rc.is_air_move)
+        self.assertNotIn((0, 61), self.verifier.generate_report().promoted_events)
+
+        # Same move with rc=0 is an air move and authorized for promotion
+        self.verifier.reset(self.workpiece)
+        self.verifier.load_tool(self.tool)
+        no_rc_move = _make_segment(
+            seg_id=62,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(0.0, 0.0, 15.0),
+            end=Vector3D(10.0, 0.0, 15.0),
+            metadata={"rc": 0},
+        )
+        res_no_rc = self.verifier.step(no_rc_move)
+        self.assertTrue(res_no_rc.is_air_move)
+        self.assertIn((0, 62), self.verifier.generate_report().promoted_events)
+
+        # Transition move (rc_transition=True) is also blocked
+        self.verifier.reset(self.workpiece)
+        self.verifier.load_tool(self.tool)
+        trans_move = _make_segment(
+            seg_id=63,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(0.0, 0.0, 15.0),
+            end=Vector3D(10.0, 0.0, 15.0),
+            metadata={"rc": 0, "rc_transition": True},
+        )
+        res_trans = self.verifier.step(trans_move)
+        self.assertFalse(res_trans.is_air_move)
+        self.assertNotIn((0, 63), self.verifier.generate_report().promoted_events)
 
     def test_mrr_spike_detection(self):
         """Heavy step-down cut among light cuts triggers an MRR spike."""
@@ -556,6 +601,100 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         # Verify chronological ordering across report.mrr_spikes
         timestamps = [s.timestamp_sec for s in report.mrr_spikes]
         self.assertEqual(timestamps, sorted(timestamps))
+
+    def test_promotion_clearance_wall_at_tool_r_plus_margin(self):
+        """
+        Phase 2 H2: Verify that mill heightfield promotion clearance checks lateral clearance
+        with clearance_r = tool_r + promote_margin_mm + cell_size * sqrt(2)/2.
+        - Tool radius = 5.0 mm, promote_margin_mm = 0.5 mm, cell_size = 0.5 mm.
+        - Wall at tool_r + 0.2 mm (X = 5.2 mm): inside clearance_r (~5.85 mm), so promotion is BLOCKED.
+        - Wall at tool_r + 1.0 mm (X = 6.0 mm): outside clearance_r, so promotion is ALLOWED.
+        """
+        tool_r = 5.0
+        tool = ToolAssembly(
+            tool_id=1,
+            name="Flat Endmill D10",
+            geometry=MillToolGeometry(
+                diameter=tool_r * 2.0,
+                corner_radius=0.0,
+                flute_length=25.0,
+                overall_length=50.0,
+                holder_diameter=30.0,
+                holder_length=40.0,
+            ),
+        )
+
+        verifier = MillHeightfieldVerifier(cell_size_mm=0.5, pad_mm=5.0, promote_margin_mm=0.5)
+
+        # 1. Wall at tool_r + 0.2 mm (x_min = 5.2 mm)
+        stock_wall_close = BoxStock3D(x_min=5.2, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=0.0)
+        verifier.reset(WorkpieceDefinition(stock=stock_wall_close))
+        verifier.load_tool(tool)
+
+        # Feed move passing beside the wall along Y at X=0, Z=-5.0 (tool outer edge at X=5.0)
+        move_near_wall = _make_segment(
+            seg_id=1,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(0.0, -10.0, -5.0),
+            end=Vector3D(0.0, 10.0, -5.0),
+            feedrate=600.0,
+            duration_sec=2.0,
+        )
+        eval_near = verifier.step(move_near_wall)
+        self.assertEqual(eval_near.material_removed_mm3, 0.0, "Tool must not cut stock")
+        self.assertEqual(len(eval_near.collisions), 0, "No collision")
+        self.assertFalse(eval_near.is_air_move, "Promotion must be BLOCKED for wall at tool_r + 0.2 mm")
+
+        # 2. Wall at tool_r + 1.0 mm (x_min = 6.0 mm)
+        stock_wall_far = BoxStock3D(x_min=6.0, x_max=20.0, y_min=-20.0, y_max=20.0, z_min=-20.0, z_max=0.0)
+        verifier.reset(WorkpieceDefinition(stock=stock_wall_far))
+        verifier.load_tool(tool)
+
+        move_far_wall = _make_segment(
+            seg_id=2,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(0.0, -10.0, -5.0),
+            end=Vector3D(0.0, 10.0, -5.0),
+            feedrate=600.0,
+            duration_sec=2.0,
+        )
+        eval_far = verifier.step(move_far_wall)
+        self.assertEqual(eval_far.material_removed_mm3, 0.0)
+        self.assertEqual(len(eval_far.collisions), 0)
+        self.assertTrue(eval_far.is_air_move, "Promotion must be ALLOWED for wall at tool_r + 1.0 mm")
+
+    def test_vertical_retract_falls_back_to_sec_clearance_when_meta_z_clearance_is_none(self):
+        """
+        Verify that when metadata contains {'z_clearance_mm': None} (as emitted by context_parser
+        when z_clearance_mm is absent), _step_linear falls back to _sec_clearance_mm[sec_id]
+        and promotes a pure vertical Z+ retract to clearance height.
+        """
+        verifier = MillHeightfieldVerifier(cell_size_mm=0.5, pad_mm=5.0, promote_margin_mm=0.5)
+        verifier.reset(self.workpiece)
+        verifier.load_tool(self.tool)
+
+        # Initial positioning at Z=15.0 establishes _sec_clearance_mm[0] = 15.0
+        init_move = _make_segment(
+            seg_id=1,
+            motion=MotionKind.RAPID,
+            start=Vector3D(0.0, 0.0, 15.0),
+            end=Vector3D(10.0, 10.0, 15.0),
+            metadata={"z_clearance_mm": None},
+        )
+        verifier.step(init_move)
+
+        # Pure vertical Z+ retract from inside pocket (Z=-5) to Z=15 with z_clearance_mm=None
+        retract_move = _make_segment(
+            seg_id=2,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(10.0, 10.0, -5.0),
+            end=Vector3D(10.0, 10.0, 15.0),
+            feedrate=500.0,
+            metadata={"z_clearance_mm": None},
+        )
+        eval_retract = verifier.step(retract_move)
+        self.assertTrue(eval_retract.is_air_move)
+        self.assertIn((0, 2), verifier.promoted_events)
 
 
 if __name__ == "__main__":

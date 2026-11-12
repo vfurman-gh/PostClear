@@ -8,7 +8,7 @@ that retract to or above the operation's clearance height (`zClearance`).
 """
 
 import math
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
 from .engine_interface import IVerificationEngine
 from .heightfield_engine import HeightfieldGrid, MillHeightfieldVerifier
@@ -24,7 +24,7 @@ from .models import (
     MotionSegment,
     MoveEvaluation,
     MRRSample,
-    PromotedVectorRule,
+    PromotedEventKey,
     ToolAssembly,
     VerificationReport,
     WorkpieceDefinition,
@@ -50,9 +50,8 @@ class MillClearanceVerifier(IVerificationEngine):
         self._sec_clearance_mm: Dict[int, float] = {}
         self.total_machining_time_sec = 0.0
         self.all_collisions: List[CollisionRecord] = []
-        self.vector_total_occurrences: Dict[str, int] = {}
-        self.vector_last_non_air_occurrence: Dict[str, int] = {}
-        self.vector_has_air_occurrence: Dict[str, bool] = {}
+        self.promoted_events: Set[PromotedEventKey] = set()
+        self._blocked_events: Set[PromotedEventKey] = set()
 
     def reset(self, workpiece: WorkpieceDefinition) -> None:
         """Initialize or reset the workpiece state and per-section clearance cache."""
@@ -64,9 +63,8 @@ class MillClearanceVerifier(IVerificationEngine):
         self._sec_clearance_mm.clear()
         self.total_machining_time_sec = 0.0
         self.all_collisions.clear()
-        self.vector_total_occurrences.clear()
-        self.vector_last_non_air_occurrence.clear()
-        self.vector_has_air_occurrence.clear()
+        self.promoted_events.clear()
+        self._blocked_events.clear()
 
     def reset_workpiece(self, workpiece: WorkpieceDefinition) -> None:
         """Alias for reset() for backwards compatibility."""
@@ -97,6 +95,47 @@ class MillClearanceVerifier(IVerificationEngine):
 
         return None
 
+    def _promotion_blocked(self, move: MotionSegment) -> bool:
+        """Return True if rapid promotion is blocked for this move."""
+        meta = getattr(move, "metadata", None) or {}
+        return int(meta.get("rc", 0) or 0) != 0 or bool(meta.get("rc_transition", False))
+
+    def record_event_evaluation(
+        self,
+        move: MotionSegment,
+        is_air_move: bool,
+        collisions: Sequence[CollisionRecord] = (),
+    ) -> None:
+        """
+        Record per-event promotion verdict.
+        An event (sec_idx, event_idx) is promoted if and only if it is an eligible
+        linear feed move and all its segments are verified air and collision-free.
+        """
+        meta = getattr(move, "metadata", None) or {}
+        sec_idx = meta.get("sec_idx", move.sec_id)
+        event_idx = meta.get("event_idx")
+        if event_idx is None:
+            event_idx = move.segment_id
+        ev_key: PromotedEventKey = (sec_idx, event_idx)
+
+        in_cycle = bool(getattr(move, "in_cycle", False) or meta.get("in_cycle", False))
+        is_sync = bool(getattr(move, "sync", False) or meta.get("sync", False))
+        is_blocked = self._promotion_blocked(move)
+
+        if (
+            is_air_move
+            and not in_cycle
+            and not is_sync
+            and not is_blocked
+            and move.motion == MotionKind.LINEAR
+            and not collisions
+        ):
+            if ev_key not in self._blocked_events:
+                self.promoted_events.add(ev_key)
+        else:
+            self._blocked_events.add(ev_key)
+            self.promoted_events.discard(ev_key)
+
     def step_segment(
         self,
         segment: MotionSegment,
@@ -108,6 +147,9 @@ class MillClearanceVerifier(IVerificationEngine):
         are marked as `is_air_move = True` for `G0` promotion.
         """
         vkey_str = segment.vector_key.to_wrapper_str()
+        meta = segment.metadata or {}
+        sec_idx = meta.get("sec_idx", segment.sec_id)
+        event_idx = meta.get("event_idx", segment.segment_id)
 
         if segment.motion == MotionKind.RAPID:
             top_z = max(segment.start.z, segment.end.z)
@@ -121,13 +163,14 @@ class MillClearanceVerifier(IVerificationEngine):
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
                 collisions=[],
+                sec_idx=sec_idx,
+                event_idx=event_idx,
             )
 
-        meta = segment.metadata or {}
         in_cycle = bool(meta.get("in_cycle", False))
 
         is_air_move = False
-        if segment.motion == MotionKind.LINEAR and not in_cycle:
+        if segment.motion == MotionKind.LINEAR and not in_cycle and not self._promotion_blocked(segment):
             dx = segment.end.x - segment.start.x
             dy = segment.end.y - segment.start.y
             dz = segment.end.z - segment.start.z
@@ -144,6 +187,8 @@ class MillClearanceVerifier(IVerificationEngine):
             material_removed_mm3=0.0,
             instantaneous_mrr=0.0,
             collisions=[],
+            sec_idx=sec_idx,
+            event_idx=event_idx,
         )
 
     def step(self, move: MotionSegment) -> MoveEvaluation:
@@ -156,33 +201,17 @@ class MillClearanceVerifier(IVerificationEngine):
         if eval_res.collisions:
             self.all_collisions.extend(eval_res.collisions)
 
-        meta = move.metadata or {}
-        if move.motion == MotionKind.LINEAR and not bool(meta.get("in_cycle", False)):
-            vkey = eval_res.vector_key
-            occ = self.vector_total_occurrences.get(vkey, 0) + 1
-            self.vector_total_occurrences[vkey] = occ
-            if eval_res.is_air_move:
-                self.vector_has_air_occurrence[vkey] = True
-            else:
-                self.vector_last_non_air_occurrence[vkey] = occ
+        self.record_event_evaluation(move, is_air_move=eval_res.is_air_move, collisions=eval_res.collisions)
 
         return eval_res
 
     def generate_report(self) -> VerificationReport:
-        """Compile VerificationReport with promoted_vectors for Z+ clearance retracts."""
-        promoted_vectors: Dict[str, PromotedVectorRule] = {}
-        for vkey, total_occ in self.vector_total_occurrences.items():
-            if not self.vector_has_air_occurrence.get(vkey, False):
-                continue
-            last_non_air = self.vector_last_non_air_occurrence.get(vkey, 0)
-            if last_non_air < total_occ:
-                promoted_vectors[vkey] = PromotedVectorRule(min_occur=last_non_air + 1)
-
+        """Compile VerificationReport with promoted_events for Z+ clearance retracts."""
         return VerificationReport(
             total_machining_time_sec=self.total_machining_time_sec,
             total_volume_removed_mm3=0.0,
             collisions=list(self.all_collisions),
-            promoted_vectors=promoted_vectors,
+            promoted_events=set(self.promoted_events),
             mrr_timeline=[],
             mrr_spikes=[],
         )
@@ -196,7 +225,7 @@ class MillClearanceVerifier(IVerificationEngine):
     ) -> VerificationReport:
         """
         Run the complete Milling verification pass across all segments and return
-        a `VerificationReport` with `promoted_vectors` for `Z+` clearance retracts.
+        a `VerificationReport` with `promoted_events` for `Z+` clearance retracts.
         """
         moves_seq = moves if moves is not None else (segments or [])
         if workpiece is not None:

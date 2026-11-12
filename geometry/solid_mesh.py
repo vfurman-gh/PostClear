@@ -7,6 +7,8 @@ from Autodesk Fusion 360 CAM Setups into simulation-ready verification structure
 """
 
 import math
+import os
+import struct
 import sys
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -330,9 +332,16 @@ def rasterize_triangles_to_grid(
     vertices: np.ndarray,
     indices: np.ndarray,
     tol_pad_z_mm: float = 0.05,
+    chunk_size: int = 50000,
 ) -> None:
     """
     Rasterize 3D triangular mesh facets onto a 2.5D HeightfieldGrid.
+
+    Vectorized implementation with chunked numpy processing:
+    - Atomically updates vertex cells using np.maximum.at.
+    - Fast path for single-cell triangles using np.maximum.at.
+    - Vectorized grid offset loop for small triangles (dr < 6, dc < 6).
+    - Conservative fallback for large or near-vertical triangles.
 
     For each grid cell (row, col) overlapping a triangle, sets:
         grid.H[row, col] = max(grid.H[row, col], interpolated_z + tol_pad_z_mm)
@@ -342,104 +351,174 @@ def rasterize_triangles_to_grid(
         vertices: (N, 3) float32 array in setup WCS (mm)
         indices: (M, 3) int32 triangle vertex indices
         tol_pad_z_mm: Upward padding (mm) to guarantee chordal conservatism
+        chunk_size: Number of triangles to process per vectorized batch
     """
     if vertices.size == 0 or indices.size == 0:
         return
 
-    cell_size = grid.cell_size_mm
-    gx_min = grid.grid_x_min
-    gy_min = grid.grid_y_min
-    nx = grid.nx
-    ny = grid.ny
+    cell_size = float(grid.cell_size_mm)
+    gx_min = float(grid.grid_x_min)
+    gy_min = float(grid.grid_y_min)
+    nx = int(grid.nx)
+    ny = int(grid.ny)
 
-    # Extract triangle vertices: (M, 3, 3)
-    t_verts = vertices[indices]  # M triangles, 3 vertices each, (x, y, z)
-
-    # 1. Update vertex cells directly to ensure small features and vertices are always captured
-    v_cols = np.clip(np.floor((vertices[:, 0] - gx_min) / cell_size).astype(int), 0, nx - 1)
-    v_rows = np.clip(np.floor((vertices[:, 1] - gy_min) / cell_size).astype(int), 0, ny - 1)
+    # 1. Update vertex cells directly using np.maximum.at
+    v_cols = np.clip(np.floor((vertices[:, 0] - gx_min) / cell_size).astype(np.int64), 0, nx - 1)
+    v_rows = np.clip(np.floor((vertices[:, 1] - gy_min) / cell_size).astype(np.int64), 0, ny - 1)
     v_z = vertices[:, 2] + tol_pad_z_mm
-    for r, c, z in zip(v_rows, v_cols, v_z):
-        if z > grid.H[r, c]:
-            grid.H[r, c] = z
+    np.maximum.at(grid.H, (v_rows, v_cols), v_z)
 
-    # 2. Rasterize each triangle
-    for v0, v1, v2 in t_verts:
-        x0, y0, z0 = v0
-        x1, y1, z1 = v1
-        x2, y2, z2 = v2
+    total_tris = len(indices)
+    for c_start in range(0, total_tris, chunk_size):
+        c_end = min(c_start + chunk_size, total_tris)
+        idx_chunk = indices[c_start:c_end]
 
-        # 2D cross product normal in XY
+        t_verts = vertices[idx_chunk]  # (M, 3, 3)
+        v0 = t_verts[:, 0, :]
+        v1 = t_verts[:, 1, :]
+        v2 = t_verts[:, 2, :]
+
+        x0, y0, z0 = v0[:, 0], v0[:, 1], v0[:, 2]
+        x1, y1, z1 = v1[:, 0], v1[:, 1], v1[:, 2]
+        x2, y2, z2 = v2[:, 0], v2[:, 1], v2[:, 2]
+
         nx_val = (y1 - y0) * (z2 - z0) - (z1 - z0) * (y2 - y0)
         ny_val = (z1 - z0) * (x2 - x0) - (x1 - x0) * (z2 - z0)
         nz_val = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
 
-        t_min_x = min(x0, x1, x2)
-        t_max_x = max(x0, x1, x2)
-        t_min_y = min(y0, y1, y2)
-        t_max_y = max(y0, y1, y2)
+        t_min_x = np.minimum(np.minimum(x0, x1), x2)
+        t_max_x = np.maximum(np.maximum(x0, x1), x2)
+        t_min_y = np.minimum(np.minimum(y0, y1), y2)
+        t_max_y = np.maximum(np.maximum(y0, y1), y2)
 
-        c_min = max(0, int(math.floor((t_min_x - gx_min) / cell_size)))
-        c_max = min(nx - 1, int(math.ceil((t_max_x - gx_min) / cell_size)))
-        r_min = max(0, int(math.floor((t_min_y - gy_min) / cell_size)))
-        r_max = min(ny - 1, int(math.ceil((t_max_y - gy_min) / cell_size)))
+        c_min = np.clip(np.floor((t_min_x - gx_min) / cell_size).astype(np.int64), 0, nx - 1)
+        c_max = np.clip(np.ceil((t_max_x - gx_min) / cell_size).astype(np.int64), 0, nx - 1)
+        r_min = np.clip(np.floor((t_min_y - gy_min) / cell_size).astype(np.int64), 0, ny - 1)
+        r_max = np.clip(np.ceil((t_max_y - gy_min) / cell_size).astype(np.int64), 0, ny - 1)
 
-        if c_max < c_min or r_max < r_min:
+        valid = (c_max >= c_min) & (r_max >= r_min)
+        if not np.any(valid):
             continue
 
-        # Fast path: triangle fits inside a single cell
-        if c_min == c_max and r_min == r_max:
-            top_z = max(z0, z1, z2) + tol_pad_z_mm
-            if top_z > grid.H[r_min, c_min]:
-                grid.H[r_min, c_min] = top_z
-            continue
+        dr = r_max - r_min
+        dc = c_max - c_min
 
-        # Near-vertical triangles: interpolate edge segments
-        if abs(nz_val) < 1e-7:
-            max_edge_z = max(z0, z1, z2) + tol_pad_z_mm
-            for pa, pb in ((v0, v1), (v1, v2), (v2, v0)):
-                dx = pb[0] - pa[0]
-                dy = pb[1] - pa[1]
-                dz = pb[2] - pa[2]
-                length = math.hypot(dx, dy)
-                steps = max(1, int(math.ceil(length / (cell_size * 0.5))))
-                for s in range(steps + 1):
-                    frac = s / steps
-                    px = pa[0] + frac * dx
-                    py = pa[1] + frac * dy
-                    pz = pa[2] + frac * dz + tol_pad_z_mm
-                    c_idx = int(math.floor((px - gx_min) / cell_size))
-                    r_idx = int(math.floor((py - gy_min) / cell_size))
-                    if 0 <= c_idx < nx and 0 <= r_idx < ny:
-                        if pz > grid.H[r_idx, c_idx]:
-                            grid.H[r_idx, c_idx] = pz
-            continue
+        # Fast path 1: Single-cell triangles
+        single_mask = valid & (dr == 0) & (dc == 0)
+        if np.any(single_mask):
+            top_z = np.maximum(np.maximum(z0[single_mask], z1[single_mask]), z2[single_mask]) + tol_pad_z_mm
+            np.maximum.at(grid.H, (r_min[single_mask], c_min[single_mask]), top_z)
 
-        # General non-vertical triangle: compute cell centers in bounding box
-        cols = np.arange(c_min, c_max + 1)
-        rows = np.arange(r_min, r_max + 1)
-        grid_x = gx_min + (cols + 0.5) * cell_size
-        grid_y = gy_min + (rows + 0.5) * cell_size
+        # Fast path 2: Small multi-cell non-vertical triangles (dr < 6, dc < 6, not single cell)
+        is_vert = np.abs(nz_val) < 1e-7
+        small_multi = valid & ~single_mask & ~is_vert & (dr < 6) & (dc < 6)
 
-        X, Y = np.meshgrid(grid_x, grid_y)
+        if np.any(small_multi):
+            sub_r_min = r_min[small_multi]
+            sub_c_min = c_min[small_multi]
+            sub_dr = dr[small_multi]
+            sub_dc = dc[small_multi]
 
-        # Edge function test for point-in-triangle (2D cross product: V_edge x V_point)
-        e01 = (x1 - x0) * (Y - y0) - (y1 - y0) * (X - x0)
-        e12 = (x2 - x1) * (Y - y1) - (y2 - y1) * (X - x1)
-        e20 = (x0 - x2) * (Y - y2) - (y0 - y2) * (X - x2)
+            sub_x0, sub_y0, sub_z0 = x0[small_multi], y0[small_multi], z0[small_multi]
+            sub_x1, sub_y1 = x1[small_multi], y1[small_multi]
+            sub_x2, sub_y2 = x2[small_multi], y2[small_multi]
+            sub_nx = nx_val[small_multi]
+            sub_ny = ny_val[small_multi]
+            sub_nz = nz_val[small_multi]
 
-        eps = 1e-4
-        inside = ((e01 >= -eps) & (e12 >= -eps) & (e20 >= -eps)) | ((e01 <= eps) & (e12 <= eps) & (e20 <= eps))
+            # Vectorize over (orow, ocol) offsets
+            max_dr = int(np.max(sub_dr))
+            max_dc = int(np.max(sub_dc))
+            for orow in range(max_dr + 1):
+                row_mask = sub_dr >= orow
+                if not np.any(row_mask):
+                    continue
+                r_cells = sub_r_min + orow
+                grid_y = gy_min + (r_cells + 0.5) * cell_size
 
-        if not np.any(inside):
-            continue
+                for ocol in range(max_dc + 1):
+                    cell_mask = row_mask & (sub_dc >= ocol)
+                    if not np.any(cell_mask):
+                        continue
 
-        # Plane equation: N . (P - V0) = 0 => Z = z0 - (Nx*(X - x0) + Ny*(Y - y0)) / Nz
-        Z = z0 - (nx_val * (X - x0) + ny_val * (Y - y0)) / nz_val + tol_pad_z_mm
+                    c_cells = sub_c_min[cell_mask] + ocol
+                    r_c = r_cells[cell_mask]
+                    gy = grid_y[cell_mask]
+                    gx = gx_min + (c_cells + 0.5) * cell_size
 
-        sub_h = grid.H[r_min : r_max + 1, c_min : c_max + 1]
-        mask = inside & (Z > sub_h)
-        sub_h[mask] = Z[mask]
+                    sx0, sy0, sz0 = sub_x0[cell_mask], sub_y0[cell_mask], sub_z0[cell_mask]
+                    sx1, sy1 = sub_x1[cell_mask], sub_y1[cell_mask]
+                    sx2, sy2 = sub_x2[cell_mask], sub_y2[cell_mask]
+                    snx = sub_nx[cell_mask]
+                    sny = sub_ny[cell_mask]
+                    snz = sub_nz[cell_mask]
+
+                    e01 = (sx1 - sx0) * (gy - sy0) - (sy1 - sy0) * (gx - sx0)
+                    e12 = (sx2 - sx1) * (gy - sy1) - (sy2 - sy1) * (gx - sx1)
+                    e20 = (sx0 - sx2) * (gy - sy2) - (sy0 - sy2) * (gx - sx2)
+
+                    eps = 1e-4
+                    inside = ((e01 >= -eps) & (e12 >= -eps) & (e20 >= -eps)) | ((e01 <= eps) & (e12 <= eps) & (e20 <= eps))
+                    if not np.any(inside):
+                        continue
+
+                    Z = sz0[inside] - (snx[inside] * (gx[inside] - sx0[inside]) + sny[inside] * (gy[inside] - sy0[inside])) / snz[inside] + tol_pad_z_mm
+                    np.maximum.at(grid.H, (r_c[inside], c_cells[inside]), Z)
+
+        # Conservative fallback: Vertical or large triangles (dr >= 6 or dc >= 6)
+        fallback_mask = valid & ~single_mask & (is_vert | (dr >= 6) | (dc >= 6))
+        if np.any(fallback_mask):
+            fb_indices = np.where(fallback_mask)[0]
+            for i in fb_indices:
+                x0_i, y0_i, z0_i = x0[i], y0[i], z0[i]
+                x1_i, y1_i, z1_i = x1[i], y1[i], z1[i]
+                x2_i, y2_i, z2_i = x2[i], y2[i], z2[i]
+                c_min_i = int(c_min[i])
+                c_max_i = int(c_max[i])
+                r_min_i = int(r_min[i])
+                r_max_i = int(r_max[i])
+                nz_i = nz_val[i]
+
+                if abs(nz_i) < 1e-7:
+                    for pa, pb in (((x0_i, y0_i, z0_i), (x1_i, y1_i, z1_i)),
+                                   ((x1_i, y1_i, z1_i), (x2_i, y2_i, z2_i)),
+                                   ((x2_i, y2_i, z2_i), (x0_i, y0_i, z0_i))):
+                        dx = pb[0] - pa[0]
+                        dy = pb[1] - pa[1]
+                        dz = pb[2] - pa[2]
+                        length = math.hypot(dx, dy)
+                        steps = max(1, int(math.ceil(length / (cell_size * 0.5))))
+                        for s in range(steps + 1):
+                            frac = s / steps
+                            px = pa[0] + frac * dx
+                            py = pa[1] + frac * dy
+                            pz = pa[2] + frac * dz + tol_pad_z_mm
+                            c_idx = int(math.floor((px - gx_min) / cell_size))
+                            r_idx = int(math.floor((py - gy_min) / cell_size))
+                            if 0 <= c_idx < nx and 0 <= r_idx < ny:
+                                if pz > grid.H[r_idx, c_idx]:
+                                    grid.H[r_idx, c_idx] = pz
+                    continue
+
+                cols = np.arange(c_min_i, c_max_i + 1)
+                rows = np.arange(r_min_i, r_max_i + 1)
+                grid_x = gx_min + (cols + 0.5) * cell_size
+                grid_y = gy_min + (rows + 0.5) * cell_size
+                X, Y = np.meshgrid(grid_x, grid_y)
+
+                e01 = (x1_i - x0_i) * (Y - y0_i) - (y1_i - y0_i) * (X - x0_i)
+                e12 = (x2_i - x1_i) * (Y - y1_i) - (y2_i - y1_i) * (X - x1_i)
+                e20 = (x0_i - x2_i) * (Y - y2_i) - (y0_i - y2_i) * (X - x2_i)
+
+                eps = 1e-4
+                inside = ((e01 >= -eps) & (e12 >= -eps) & (e20 >= -eps)) | ((e01 <= eps) & (e12 <= eps) & (e20 <= eps))
+                if not np.any(inside):
+                    continue
+
+                Z = z0_i - (nx_val[i] * (X - x0_i) + ny_val[i] * (Y - y0_i)) / nz_i + tol_pad_z_mm
+                sub_h = grid.H[r_min_i : r_max_i + 1, c_min_i : c_max_i + 1]
+                mask = inside & (Z > sub_h)
+                sub_h[mask] = Z[mask]
 
 
 def revolve_mesh_to_lathe_stock(
@@ -447,7 +526,7 @@ def revolve_mesh_to_lathe_stock(
     indices: np.ndarray,
     z_slice_step_mm: float = 0.5,
     tol_pad_r_mm: float = 0.05,
-    max_radial_offset_mm: float = 1.0,
+    max_radial_offset_mm: Optional[float] = 1.0,
     fixtures: Optional[List[AxisymmetricChuckObstacle]] = None,
 ) -> WorkpieceDefinition:
     """
@@ -471,53 +550,100 @@ def revolve_mesh_to_lathe_stock(
     x_min, y_min, z_min = v.min(axis=0)
     x_max, y_max, z_max = v.max(axis=0)
 
-    center_x = (x_min + x_max) * 0.5
-    center_y = (y_min + y_max) * 0.5
-    offset_from_spindle = math.hypot(center_x, center_y)
+    if max_radial_offset_mm is not None:
+        center_x = (x_min + x_max) * 0.5
+        center_y = (y_min + y_max) * 0.5
+        offset_from_spindle = math.hypot(center_x, center_y)
 
-    if offset_from_spindle > max_radial_offset_mm:
-        raise ValueError(
-            f"Solid stock is not centered on the turning spindle axis (Z-axis offset is {offset_from_spindle:.2f} mm, "
-            f"exceeding maximum tolerance of {max_radial_offset_mm:.2f} mm). "
-            "Ensure the stock body axis is aligned with the setup Z-axis."
-        )
+        if offset_from_spindle > max_radial_offset_mm:
+            raise ValueError(
+                f"Solid stock is not centered on the turning spindle axis (Z-axis offset is {offset_from_spindle:.2f} mm, "
+                f"exceeding maximum tolerance of {max_radial_offset_mm:.2f} mm). "
+                "Ensure the stock body axis is aligned with the setup Z-axis."
+            )
 
-    # 2. Compute radius for all vertices: R = sqrt(X^2 + Y^2)
-    radii = np.hypot(v[:, 0], v[:, 1]) + tol_pad_r_mm
-    z_coords = v[:, 2]
-
-    # Include edge midpoint samples to ensure convex curves between vertices are enveloped
+    # 2. Vectorized triangle clipping per Z slab
     t_verts = v[indices]
-    edge_mids = (t_verts[:, [0, 1, 2], :] + t_verts[:, [1, 2, 0], :]) * 0.5
-    mids_flat = edge_mids.reshape(-1, 3)
-    mids_r = np.hypot(mids_flat[:, 0], mids_flat[:, 1]) + tol_pad_r_mm
-    mids_z = mids_flat[:, 2]
+    tri_z = t_verts[:, :, 2]
+    tri_z_min = tri_z.min(axis=1)
+    tri_z_max = tri_z.max(axis=1)
 
-    all_z = np.concatenate([z_coords, mids_z])
-    all_r = np.concatenate([radii, mids_r])
+    # Triangle edges: (T, 3, 3) where second dim is edge index 0->(0,1), 1->(1,2), 2->(2,0)
+    e_A = t_verts[:, [0, 1, 2], :]
+    e_B = t_verts[:, [1, 2, 0], :]
+    e_Az = e_A[:, :, 2]
+    e_Bz = e_B[:, :, 2]
+    e_dz = e_Bz - e_Az
 
     # 3. Discretize into Z slices to construct the outer boundary profile
     total_z_len = max(0.1, z_max - z_min)
     num_slices = max(2, int(math.ceil(total_z_len / z_slice_step_mm)))
     slice_edges = np.linspace(z_min, z_max, num_slices + 1)
 
+    max_radii = np.zeros(num_slices, dtype=np.float64)
+
+    for i in range(num_slices):
+        z_lo = slice_edges[i]
+        z_hi = slice_edges[i + 1]
+
+        # Overlap condition: triangle overlaps [z_lo, z_hi]
+        if i == 0:
+            ov = (tri_z_max > z_lo) | ((tri_z_max == z_lo) & (tri_z_min == z_lo))
+        else:
+            ov = (tri_z_max > z_lo)
+        if i == num_slices - 1:
+            ov &= (tri_z_min < z_hi) | ((tri_z_min == z_hi) & (tri_z_max == z_hi))
+        else:
+            ov &= (tri_z_min < z_hi)
+
+        if not np.any(ov):
+            max_radii[i] = 0.0
+            continue
+
+        sub_tris = t_verts[ov]
+        cand_r = []
+
+        # 1) Triangle vertices inside slab [z_lo, z_hi]
+        v_in = (sub_tris[:, :, 2] >= z_lo) & (sub_tris[:, :, 2] <= z_hi)
+        if np.any(v_in):
+            sub_v = sub_tris[v_in]
+            cand_r.append(np.hypot(sub_v[:, 0], sub_v[:, 1]))
+
+        # 2) Edge intersections with z = z_lo
+        sub_e_A = e_A[ov]
+        sub_e_B = e_B[ov]
+        sub_e_Az = e_Az[ov]
+        sub_e_Bz = e_Bz[ov]
+        sub_e_dz = e_dz[ov]
+
+        cross_lo = ((sub_e_Az - z_lo) * (sub_e_Bz - z_lo) <= 0) & (sub_e_dz != 0)
+        if np.any(cross_lo):
+            t_lo = (z_lo - sub_e_Az[cross_lo]) / sub_e_dz[cross_lo]
+            px_lo = sub_e_A[cross_lo, 0] + t_lo * (sub_e_B[cross_lo, 0] - sub_e_A[cross_lo, 0])
+            py_lo = sub_e_A[cross_lo, 1] + t_lo * (sub_e_B[cross_lo, 1] - sub_e_A[cross_lo, 1])
+            cand_r.append(np.hypot(px_lo, py_lo))
+
+        # 3) Edge intersections with z = z_hi
+        cross_hi = ((sub_e_Az - z_hi) * (sub_e_Bz - z_hi) <= 0) & (sub_e_dz != 0)
+        if np.any(cross_hi):
+            t_hi = (z_hi - sub_e_Az[cross_hi]) / sub_e_dz[cross_hi]
+            px_hi = sub_e_A[cross_hi, 0] + t_hi * (sub_e_B[cross_hi, 0] - sub_e_A[cross_hi, 0])
+            py_hi = sub_e_A[cross_hi, 1] + t_hi * (sub_e_B[cross_hi, 1] - sub_e_A[cross_hi, 1])
+            cand_r.append(np.hypot(px_hi, py_hi))
+
+        if cand_r:
+            max_radii[i] = float(np.max(np.concatenate(cand_r))) + tol_pad_r_mm
+        else:
+            max_radii[i] = 0.0
+
     profile_pts = []
     # Start at bottom centerline: (z_min, 0)
     profile_pts.append((float(z_min), 0.0))
 
-    global_max_r = 0.0
     for i in range(num_slices):
         z_lo = slice_edges[i]
         z_hi = slice_edges[i + 1]
-        in_slice = (all_z >= z_lo) & (all_z <= z_hi)
-        if np.any(in_slice):
-            max_r = float(np.max(all_r[in_slice]))
-        else:
-            max_r = global_max_r
-
-        if max_r > global_max_r:
-            global_max_r = max_r
-
+        max_r = float(max_radii[i])
         profile_pts.append((float(z_lo), max_r))
         profile_pts.append((float(z_hi), max_r))
 
@@ -530,10 +656,12 @@ def revolve_mesh_to_lathe_stock(
     else:
         poly = None
 
+    outer_r = float(np.max(max_radii)) if len(max_radii) > 0 else 0.0
+
     stock = AxisymmetricStock2D(
         z_min=float(z_min),
         z_max=float(z_max),
-        outer_radius=float(global_max_r),
+        outer_radius=outer_r,
         inner_radius=0.0,
         polygon=poly,
     )
@@ -596,3 +724,118 @@ def extract_solid_workpiece_from_fusion_setup(
             f"X=[{stock.x_min:.2f}, {stock.x_max:.2f}], Y=[{stock.y_min:.2f}, {stock.y_max:.2f}], Z=[{stock.z_min:.2f}, {stock.z_max:.2f}]"
         )
         return WorkpieceDefinition(stock=stock)
+
+
+def load_stl_mesh(stl_path: str, is_inch: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load binary or ASCII STL mesh file into setup coordinates (vertices_mm, indices).
+
+    Args:
+        stl_path: Absolute path to the STL file
+        is_inch: True if coordinates in the STL file are in inches, False if millimeters
+
+    Returns:
+        (vertices_mm, indices) as numpy arrays (float32 and int32)
+    """
+    if np is None:
+        raise ImportError("numpy is required for loading STL mesh")
+
+    if not os.path.isfile(stl_path):
+        raise FileNotFoundError(f"STL file not found: {stl_path}")
+
+    file_size = os.path.getsize(stl_path)
+    if file_size < 84:
+        raise ValueError(f"STL file too small ({file_size} bytes): {stl_path}")
+
+    # Check for standard binary STL format (80-byte header, uint32 triangle count, 50-byte records)
+    with open(stl_path, "rb") as f:
+        header = f.read(80)
+        count_bytes = f.read(4)
+        if len(count_bytes) == 4:
+            num_tris = struct.unpack("<I", count_bytes)[0]
+            expected_binary_size = 84 + num_tris * 50
+
+            is_ascii_header = header.lstrip().startswith(b"solid") and b"facet" in header
+            if not is_ascii_header and file_size >= expected_binary_size and num_tris > 0:
+                record_dtype = np.dtype([
+                    ("normal", "<f4", (3,)),
+                    ("v1", "<f4", (3,)),
+                    ("v2", "<f4", (3,)),
+                    ("v3", "<f4", (3,)),
+                    ("attr", "<u2"),
+                ])
+                data = np.fromfile(f, dtype=record_dtype, count=num_tris)
+                v1 = data["v1"]
+                v2 = data["v2"]
+                v3 = data["v3"]
+                verts = np.stack([v1, v2, v3], axis=1).reshape(-1, 3).astype(np.float32)
+                if not np.all(np.isfinite(verts)):
+                    raise ValueError(f"STL mesh contains non-finite vertex coordinates: {stl_path}")
+                indices = np.arange(len(verts), dtype=np.int32).reshape(-1, 3)
+                if is_inch:
+                    verts *= 25.4
+                _dbg(f"load_stl_mesh: loaded binary STL '{stl_path}' with {num_tris} triangles ({len(verts)} vertices)")
+                return verts, indices
+
+    # Fallback to ASCII STL parser
+    verts_list = []
+    with open(stl_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line_str = line.strip()
+            if line_str.startswith("vertex"):
+                parts = line_str.split()
+                if len(parts) >= 4:
+                    verts_list.append([float(parts[1]), float(parts[2]), float(parts[3])])
+
+    if not verts_list or len(verts_list) % 3 != 0:
+        raise ValueError(f"Could not parse valid triangle vertices from STL: {stl_path}")
+
+    verts = np.asarray(verts_list, dtype=np.float32)
+    if not np.all(np.isfinite(verts)):
+        raise ValueError(f"STL mesh contains non-finite vertex coordinates: {stl_path}")
+    indices = np.arange(len(verts), dtype=np.int32).reshape(-1, 3)
+    if is_inch:
+        verts *= 25.4
+    _dbg(f"load_stl_mesh: loaded ASCII STL '{stl_path}' with {len(indices)} triangles ({len(verts)} vertices)")
+    return verts, indices
+
+
+def extract_workpiece_from_stl(
+    stl_path: str,
+    is_turning: bool = False,
+    is_inch: bool = False,
+    fixtures: Optional[List[AxisymmetricChuckObstacle]] = None,
+) -> WorkpieceDefinition:
+    """
+    Construct a simulation-ready WorkpieceDefinition from an exported STL mesh file.
+
+    In Autodesk Fusion 360, when exportStock is enabled on a setup with 'From preceding setup'
+    stock, Fusion exports the preceding setup's in-process stock oriented in the active setup's WCS.
+
+    Args:
+        stl_path: Path to the exported binary/ASCII STL file
+        is_turning: True if lathe/turning setup, False if milling
+        is_inch: True if STL vertices are in inches (post unit 0), False if millimeters
+        fixtures: Optional list of chuck obstacles / fixtures
+
+    Returns:
+        WorkpieceDefinition ready for verifier simulation
+    """
+    vertices_mm, indices = load_stl_mesh(stl_path, is_inch=is_inch)
+
+    if is_turning:
+        wp = revolve_mesh_to_lathe_stock(
+            vertices_mm,
+            indices,
+            max_radial_offset_mm=None,  # Preceding setup stock is already aligned to active setup WCS
+            fixtures=fixtures,
+        )
+    else:
+        stock = SolidMeshStock3D.from_mesh(vertices_mm, indices)
+        _dbg(
+            f"extract_workpiece_from_stl: created SolidMeshStock3D from '{stl_path}' "
+            f"X=[{stock.x_min:.2f}, {stock.x_max:.2f}], Y=[{stock.y_min:.2f}, {stock.y_max:.2f}], Z=[{stock.z_min:.2f}, {stock.z_max:.2f}]"
+        )
+        wp = WorkpieceDefinition(stock=stock, fixtures=fixtures or [])
+    wp.is_stl_derived = True
+    return wp

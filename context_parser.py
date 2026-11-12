@@ -16,14 +16,20 @@ Processes structured JSON context dumps emitted by `universal_dumper.cps`:
 import copy
 import json
 import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import os
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+
+try:
+    import numpy as np
+except (ImportError, OSError):
+    np = None
 
 from geometry.models import (
     MotionKind,
     MotionSegment,
     Vector3D,
     VectorKey,
-    PromotedVectorRule,
+    PromotedEventKey,
 )
 
 
@@ -53,6 +59,12 @@ def merge_context_dumps(sources: Sequence[Union[str, Dict[str, Any]]]) -> Dict[s
         for d in dumps:
             if d.get("maximumSpindleSpeed"):
                 merged["maximumSpindleSpeed"] = d["maximumSpindleSpeed"]
+                break
+
+    if "rapidMode" not in merged:
+        for d in dumps:
+            if "rapidMode" in d:
+                merged["rapidMode"] = copy.deepcopy(d["rapidMode"])
                 break
 
     global_sec_id = 0
@@ -197,13 +209,26 @@ def parse_context_dump(
                 return feed_mm * eff_rpm
             return feed_mm
 
+        pending_rc_event = False
+        prev_linear_rc = int(sec.get("initRadiusComp", 0) or 0)
+        in_cycle_active = False
+
         for ev_idx, ev in enumerate(sec.get("events", [])):
             ev_type = ev.get("type")
+            if ev_type == "onCycle":
+                in_cycle_active = True
+                continue
+            if ev_type == "onCycleEnd":
+                in_cycle_active = False
+                continue
             if ev_type == "onSpindleSpeed":
                 spindle_rpm = float(ev.get("s", spindle_rpm) or spindle_rpm)
                 continue
             if ev_type == "onFeedMode":
                 feed_mode = int(ev.get("fm", feed_mode))
+                continue
+            if ev_type == "onRadiusCompensation":
+                pending_rc_event = True
                 continue
 
             if ev_type == "onRapid":
@@ -239,9 +264,10 @@ def parse_context_dump(
                         arc_plane="ZX" if sec_type == 1 else "XY",
                         metadata={
                             "tool_id": tool_id,
-                            "in_cycle": False,
+                            "in_cycle": in_cycle_active,
                             "batch_idx": batch_idx,
                             "batch_sec_id": orig_sec_id,
+                            "sec_idx": sec_idx,
                             "event_idx": ev_idx,
                             "z_clearance_mm": z_clearance_mm,
                             "z_retract_mm": z_retract_mm,
@@ -264,6 +290,10 @@ def parse_context_dump(
                 dist = math.hypot(end_pos.x - start_pos.x, end_pos.y - start_pos.y, end_pos.z - start_pos.z)
                 if dist < 1e-9:
                     continue
+                cur_rc = int(ev.get("rc", 0) or 0)
+                is_rc_transition = pending_rc_event or (prev_linear_rc != 0 and cur_rc == 0)
+                pending_rc_event = False
+                prev_linear_rc = cur_rc
                 raw_ev_rpm = float(ev.get("rpm", 0.0)) if ev.get("rpm") else None
                 feed_mmpm, rpm = _calc_move_feed_and_rpm(float(ev.get("feed", 0.0)), start_pos, end_pos, raw_ev_rpm)
                 duration = (dist / max(1.0, feed_mmpm)) * 60.0 if feed_mmpm > 0 else 0.0
@@ -285,14 +315,18 @@ def parse_context_dump(
                         arc_plane="ZX" if sec_type == 1 else "XY",
                         metadata={
                             "tool_id": tool_id,
-                            "in_cycle": bool(ev.get("sync", False)),
+                            "in_cycle": in_cycle_active or bool(ev.get("sync", False)),
+                            "sync": bool(ev.get("sync", False)),
                             "movement": ev.get("movement", 1),
                             "batch_idx": batch_idx,
                             "batch_sec_id": orig_sec_id,
+                            "sec_idx": sec_idx,
                             "event_idx": ev_idx,
                             "z_clearance_mm": z_clearance_mm,
                             "z_retract_mm": z_retract_mm,
                             "sec_type": sec_type,
+                            "rc": cur_rc,
+                            "rc_transition": is_rc_transition,
                         },
                     )
                 )
@@ -343,9 +377,10 @@ def parse_context_dump(
                         arc_plane=plane_str,
                         metadata={
                             "tool_id": tool_id,
-                            "in_cycle": False,
+                            "in_cycle": in_cycle_active,
                             "batch_idx": batch_idx,
                             "batch_sec_id": orig_sec_id,
+                            "sec_idx": sec_idx,
                             "event_idx": ev_idx,
                         },
                     )
@@ -397,6 +432,7 @@ def parse_context_dump(
                                 "in_cycle": True,
                                 "batch_idx": batch_idx,
                                 "batch_sec_id": orig_sec_id,
+                                "sec_idx": sec_idx,
                                 "event_idx": ev_idx,
                             },
                         )
@@ -426,9 +462,10 @@ def parse_context_dump(
                         arc_center=None,
                         metadata={
                             "tool_id": tool_id,
-                            "in_cycle": False,
+                            "in_cycle": in_cycle_active,
                             "batch_idx": batch_idx,
                             "batch_sec_id": orig_sec_id,
+                            "sec_idx": sec_idx,
                             "event_idx": ev_idx,
                         },
                     )
@@ -439,29 +476,27 @@ def parse_context_dump(
 
 def apply_promotions_to_context(
     context_data: Dict[str, Any],
-    promoted_vectors: Dict[str, Union[PromotedVectorRule, Dict[str, Any]]],
+    promoted_moves: Union[Set[PromotedEventKey], Sequence[PromotedEventKey]],
 ) -> int:
     """
     Annotate authorized `onLinear` moves directly inside `context_data` with
-    `ev["promote"] = True`, respecting `min_occur` occurrence thresholds and
-    skipping moves inside canned cycles or speed-feed synchronization.
+    `ev["promote"] = True`, skipping moves inside canned cycles or speed-feed synchronization.
+
+    Addresses events strictly by per-event key `(sec_idx, event_idx)`.
 
     Returns the total number of individual `onLinear` move events promoted.
     """
-    if not promoted_vectors:
+    if not promoted_moves:
         return 0
 
-    unit = context_data.get("unit", 0)
-    scale = 25.4 if unit == 0 else 1.0
-    occur_counts: Dict[str, int] = {}
+    sections = context_data.get("sections", [])
     promoted_count = 0
+    event_set: Set[Tuple[int, int]] = set(promoted_moves) if not isinstance(promoted_moves, set) else promoted_moves
 
-    for sec_idx, sec in enumerate(context_data.get("sections", [])):
-        sec_id = sec.get("id", sec_idx)
-        orig_sec_id = sec.get("origSecId", sec_id)
+    for s_idx, sec in enumerate(sections):
         in_cycle = False
-
-        for ev in sec.get("events", []):
+        events = sec.get("events", [])
+        for e_idx, ev in enumerate(events):
             ev_type = ev.get("type")
             if ev_type == "onCycle":
                 in_cycle = True
@@ -469,39 +504,17 @@ def apply_promotions_to_context(
             if ev_type == "onCycleEnd":
                 in_cycle = False
                 continue
-
-            if ev_type == "onLinear" and not in_cycle and not ev.get("sync", False):
-                s_pos = Vector3D(
-                    float(ev.get("sx", 0.0)) * scale,
-                    float(ev.get("sy", 0.0)) * scale,
-                    float(ev.get("sz", 0.0)) * scale,
-                )
-                e_pos = Vector3D(
-                    float(ev.get("x", 0.0)) * scale,
-                    float(ev.get("y", 0.0)) * scale,
-                    float(ev.get("z", 0.0)) * scale,
-                )
-                v_key = VectorKey.from_floats(sec_id, s_pos, e_pos).to_wrapper_str()
-                rule = promoted_vectors.get(v_key)
-                if rule is None and orig_sec_id != sec_id:
-                    alt_key = VectorKey.from_floats(orig_sec_id, s_pos, e_pos).to_wrapper_str()
-                    rule = promoted_vectors.get(alt_key)
-                    if rule is not None:
-                        v_key = alt_key
-
-                if rule is not None:
-                    occ = occur_counts.get(v_key, 0) + 1
-                    occur_counts[v_key] = occ
-                    if isinstance(rule, PromotedVectorRule):
-                        min_occ = rule.min_occur
-                    elif isinstance(rule, dict):
-                        min_occ = int(rule.get("minOccur", rule.get("min_occur", 1)))
-                    else:
-                        min_occ = 1
-
-                    if occ >= min_occ:
-                        ev["promote"] = True
-                        promoted_count += 1
+            if (s_idx, e_idx) in event_set:
+                # Verify event eligibility (defense in depth)
+                if (
+                    ev_type == "onLinear"
+                    and not in_cycle
+                    and not ev.get("sync", False)
+                    and not ev.get("in_cycle", False)
+                    and int(ev.get("rc", 0) or 0) == 0
+                ):
+                    ev["promote"] = True
+                    promoted_count += 1
 
     return promoted_count
 
@@ -539,8 +552,128 @@ def extract_workpiece_from_context(
         or ""
     ).lower()
     _dbg_ctx(f"extract_workpiece_from_context: stock_mode='{stock_mode}', fallback={fallback_workpiece}")
-    if any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
-        return None
+
+    is_previous_mode = any(k in stock_mode for k in ("previous", "preceding", "prev", "rest"))
+
+    # 1. Native exported STL stock mesh (only for previous/preceding modes)
+    stl_path = context_data.get("stockPath")
+    if stl_path:
+        if is_previous_mode:
+            if not os.path.isfile(stl_path):
+                raise FileNotFoundError(
+                    f"Exported stock STL mesh file not found: '{stl_path}'."
+                )
+            try:
+                from geometry.solid_mesh import (
+                    load_stl_mesh,
+                    revolve_mesh_to_lathe_stock,
+                    SolidMeshStock3D,
+                )
+                from geometry.models import WorkpieceDefinition
+
+                try:
+                    raw_verts, raw_indices = load_stl_mesh(stl_path, is_inch=False)
+                except Exception as stl_err:
+                    raise RuntimeError(
+                        f"Failed to load stock from STL mesh '{stl_path}': {stl_err}"
+                    ) from stl_err
+
+                stl_min = raw_verts.min(axis=0)
+                stl_max = raw_verts.max(axis=0)
+                stl_extents = stl_max - stl_min
+
+                # Base stock unit determination (Phase 1 H2)
+                stock_unit_str = context_data.get("stockUnit")
+                if stock_unit_str:
+                    is_inch = str(stock_unit_str).lower() in ("in", "inch", "inches")
+                else:
+                    is_inch = (context_data.get("unit", 0) == 0)
+
+                # Cross-check against workpieceHint if captured
+                hint = context_data.get("workpieceHint")
+                if hint and isinstance(hint, dict) and "lower" in hint and "upper" in hint:
+                    hint_lower = hint["lower"]
+                    hint_upper = hint["upper"]
+                    hint_extents = np.array([
+                        abs(float(hint_upper.get("x", 0.0)) - float(hint_lower.get("x", 0.0))),
+                        abs(float(hint_upper.get("y", 0.0)) - float(hint_lower.get("y", 0.0))),
+                        abs(float(hint_upper.get("z", 0.0)) - float(hint_lower.get("z", 0.0))),
+                    ], dtype=np.float64)
+
+                    candidate_scales = [1.0, 25.4, 1.0 / 25.4]
+                    active_dims = (hint_extents > 1e-4) & (stl_extents > 1e-4)
+                    if np.any(active_dims):
+                        best_scale = None
+                        min_err = float("inf")
+                        for s in candidate_scales:
+                            scaled_stl = stl_extents[active_dims] * s
+                            target_hint = hint_extents[active_dims]
+                            rel_errors = np.abs(scaled_stl - target_hint) / np.maximum(target_hint, 1e-6)
+                            # In-process stock from a preceding setup may have 1-2 axes machined smaller
+                            # than workpieceHint while keeping at least one axis unmachined and never
+                            # exceeding workpieceHint by > 5%.
+                            if np.all(scaled_stl <= target_hint * 1.05):
+                                scale_err = float(np.min(rel_errors))
+                            else:
+                                scale_err = float(np.max(rel_errors))
+                            if scale_err < min_err:
+                                min_err = scale_err
+                                best_scale = s
+
+                        if min_err > 0.05:
+                            raise ValueError(
+                                f"STL bounding box extents {stl_extents.tolist()} do not match workpieceHint "
+                                f"{hint_extents.tolist()} within 5% for any candidate scale {candidate_scales} "
+                                f"(best match scale {best_scale} error: {min_err*100:.1f}%)."
+                            )
+
+                        if abs(best_scale - 25.4) < 1e-3:
+                            is_inch = True
+                        elif abs(best_scale - (1.0 / 25.4)) < 1e-3:
+                            is_inch = False
+                        elif abs(best_scale - 1.0) < 1e-3:
+                            is_inch = (context_data.get("unit", 0) == 0)
+
+                turning_mode = is_turning
+                if turning_mode is None:
+                    turning_mode = any(
+                        sec.get("type") == 1 or bool(sec.get("tool", {}).get("_isTurningTool", False))
+                        for sec in context_data.get("sections", [])
+                    )
+                fb_fixtures = getattr(fallback_workpiece, "fixtures", None) if fallback_workpiece else None
+                _dbg_ctx(f"extract_workpiece_from_context: loading stock from exported STL '{stl_path}' (turning={turning_mode}, inch={is_inch})")
+
+                vertices_mm = raw_verts * 25.4 if is_inch else raw_verts
+                if turning_mode:
+                    wp = revolve_mesh_to_lathe_stock(
+                        vertices_mm,
+                        raw_indices,
+                        max_radial_offset_mm=None,
+                        fixtures=fb_fixtures,
+                    )
+                else:
+                    stock = SolidMeshStock3D.from_mesh(vertices_mm, raw_indices)
+                    _dbg_ctx(
+                        f"extract_workpiece_from_context: created SolidMeshStock3D from '{stl_path}' "
+                        f"X=[{stock.x_min:.2f}, {stock.x_max:.2f}], Y=[{stock.y_min:.2f}, {stock.y_max:.2f}], Z=[{stock.z_min:.2f}, {stock.z_max:.2f}]"
+                    )
+                    wp = WorkpieceDefinition(stock=stock, fixtures=fb_fixtures or [])
+                wp.is_stl_derived = True
+                return wp
+            except (ValueError, FileNotFoundError, RuntimeError):
+                raise
+            except Exception as stl_err:
+                raise RuntimeError(
+                    f"Failed to load stock from STL mesh '{stl_path}': {stl_err}"
+                ) from stl_err
+        else:
+            _dbg_ctx(
+                f"extract_workpiece_from_context: ignoring stockPath '{stl_path}' "
+                f"because stockMode is '{stock_mode}' (not previous/preceding)"
+            )
+
+    if is_previous_mode:
+        return fallback_workpiece
     if any(k in stock_mode for k in ("solid", "body")):
         return fallback_workpiece
 

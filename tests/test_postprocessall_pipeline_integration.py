@@ -292,7 +292,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             total_machining_time_sec=120.0,
             total_volume_removed_mm3=15000.0,
             collisions=[col1, col2, col3],
-            promoted_vectors={},
+            promoted_events=set(),
             mrr_timeline=[],
             mrr_spikes=[],
             operation_names=["3D Adaptive Roughing1", "2D Contour3", "2D Contour1"],
@@ -344,7 +344,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             total_machining_time_sec=60.0,
             total_volume_removed_mm3=5000.0,
             collisions=[],
-            promoted_vectors={},
+            promoted_events=set(),
             mrr_timeline=[],
             mrr_spikes=[],
             operation_names=["Roughing"],
@@ -363,7 +363,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             total_machining_time_sec=60.0,
             total_volume_removed_mm3=5000.0,
             collisions=[],
-            promoted_vectors={},
+            promoted_events=set(),
             mrr_timeline=[],
             mrr_spikes=[s1, s2, s3, s4],
             operation_names=["Roughing", "Finishing"],
@@ -1247,7 +1247,6 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             VerificationReport,
             CollisionRecord,
             CollisionKind,
-            PromotedVectorRule,
             Vector3D,
         )
         from context_parser import apply_promotions_to_context
@@ -1274,7 +1273,6 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         }
 
         from geometry.models import VectorKey
-        key_safe = VectorKey.from_floats(0, Vector3D(10.0, 0.0, 5.0), Vector3D(5.0, 0.0, 5.0)).to_wrapper_str()
         key_collided = VectorKey.from_floats(0, Vector3D(0.0, 0.0, 0.0), Vector3D(-10.0, 0.0, 0.0)).to_wrapper_str()
 
         report = VerificationReport(
@@ -1289,27 +1287,29 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                     contact_point=Vector3D(0, 0, 0),
                     penetration_volume_mm3=10.0,
                     description="Holder collided with fixture",
+                    sec_idx=0,
+                    event_idx=1,
                 )
             ],
-            promoted_vectors={
-                key_safe: PromotedVectorRule(min_occur=1),
-                key_collided: PromotedVectorRule(min_occur=1),
-            },
+            promoted_events={(0, 0), (0, 1)},
             mrr_timeline=[],
             mrr_spikes=[],
         )
 
-        collision_vector_keys = {c.vector_key for c in report.collisions if c.vector_key}
-        safe_promoted_vectors = {
-            k: v for k, v in report.promoted_vectors.items()
-            if k not in collision_vector_keys
+        # Per-event collision filtering (Q2)
+        colliding_events = {
+            (c.sec_idx, c.event_idx)
+            for c in report.collisions
+            if c.sec_idx is not None and c.event_idx is not None
         }
+        safe_promoted_events = {
+            ev for ev in report.promoted_events
+            if ev not in colliding_events
+        }
+        self.assertIn((0, 0), safe_promoted_events)
+        self.assertNotIn((0, 1), safe_promoted_events)
 
-        # key_collided should be filtered out, key_safe retained
-        self.assertIn(key_safe, safe_promoted_vectors)
-        self.assertNotIn(key_collided, safe_promoted_vectors)
-
-        promoted_count = apply_promotions_to_context(ctx, safe_promoted_vectors)
+        promoted_count = apply_promotions_to_context(ctx, safe_promoted_events)
         self.assertEqual(promoted_count, 1)
         self.assertTrue(ctx["sections"][0]["events"][0].get("promote"))
         self.assertFalse(ctx["sections"][0]["events"][1].get("promote", False))
@@ -1399,14 +1399,15 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             self.assertEqual(mock_ext_param.value.value, ".nc")
 
     def test_w1_windows_post_binary_discovery(self):
-        """Verify find_autodesk_post_binary locates post.exe on Windows and selects newest by mtime."""
+        """Verify find_autodesk_post_binary respects AUTODESK_FUSION_ROOT and does NOT fall back to newest by mtime without root."""
         from pipeline import find_autodesk_post_binary
         from unittest.mock import patch
-        import time
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            v1_dir = os.path.join(tmp_dir, "Autodesk", "webdeploy", "production", "hash_v1", "Applications", "CAM360")
-            v2_dir = os.path.join(tmp_dir, "Autodesk", "webdeploy", "production", "hash_v2", "Applications", "CAM360")
+            v1_root = os.path.join(tmp_dir, "Autodesk", "webdeploy", "production", "hash_v1")
+            v2_root = os.path.join(tmp_dir, "Autodesk", "webdeploy", "production", "hash_v2")
+            v1_dir = os.path.join(v1_root, "Applications", "CAM360")
+            v2_dir = os.path.join(v2_root, "Applications", "CAM360")
             os.makedirs(v1_dir, exist_ok=True)
             os.makedirs(v2_dir, exist_ok=True)
 
@@ -1418,14 +1419,15 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             with open(post_v2, "w") as f:
                 f.write("v2")
 
-            # Set mtime so v2 is newer than v1
-            now = time.time()
-            os.utime(post_v1, (now - 100, now - 100))
-            os.utime(post_v2, (now, now))
-
-            with patch.dict(os.environ, {"LOCALAPPDATA": tmp_dir}):
+            # 1. With AUTODESK_FUSION_ROOT pointing to v1_root, finds post_v1
+            with patch.dict(os.environ, {"AUTODESK_FUSION_ROOT": v1_root}):
                 found = find_autodesk_post_binary()
-                self.assertEqual(found, post_v2)
+                self.assertEqual(os.path.abspath(found), os.path.abspath(post_v1))
+
+            # 2. With AUTODESK_POST_BINARY pointing to post_v2, finds post_v2
+            with patch.dict(os.environ, {"AUTODESK_POST_BINARY": post_v2}):
+                found = find_autodesk_post_binary()
+                self.assertEqual(os.path.abspath(found), os.path.abspath(post_v2))
 
     def test_w1b_invoking_fusion_takes_precedence_over_newer_mtime(self):
         """Verify find_autodesk_post_binary selects invoking Fusion build even if an unactivated update is newer."""
@@ -1529,24 +1531,21 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         PostProcessAll._dbg_global("Test log entry")
         self.assertTrue(os.path.isfile(PostProcessAll._LOG_PATH))
 
-        # Test _WriteDumperConfig and _ClearDumperConfig with simulated non-existent /tmp
-        orig_isdir = os.path.isdir
-        def fake_isdir(path):
-            if path == "/tmp":
-                return False
-            return orig_isdir(path)
-
-        with patch("os.path.isdir", side_effect=fake_isdir), \
-             tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
-            PostProcessAll._WriteDumperConfig(base_post_path=tmp_cps.name)
-            dumper_cfg_path = os.path.join(tempfile.gettempdir(), "universal_dumper_config.json")
-            self.assertTrue(os.path.isfile(dumper_cfg_path))
-            with open(dumper_cfg_path, "r", encoding="utf-8") as f:
+        # Test _WriteDumperConfig writes to per-run mkdtemp and sets DUMPER_CONFIG_PATH without touching /tmp or $TMPDIR
+        with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
+            cfg_path = PostProcessAll._WriteDumperConfig(base_post_path=tmp_cps.name)
+            self.assertTrue(os.path.isfile(cfg_path))
+            self.assertEqual(os.environ.get("DUMPER_CONFIG_PATH"), cfg_path)
+            # Verify NOT written to $TMPDIR or /tmp
+            self.assertFalse(os.path.isfile(os.path.join(tempfile.gettempdir(), "universal_dumper_config.json")))
+            self.assertFalse(os.path.isfile("/tmp/universal_dumper_config.json"))
+            with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             self.assertEqual(cfg.get("basePost"), os.path.abspath(tmp_cps.name))
 
             PostProcessAll._ClearDumperConfig()
-            self.assertFalse(os.path.isfile(dumper_cfg_path))
+            self.assertFalse(os.path.isfile(cfg_path))
+            self.assertNotIn("DUMPER_CONFIG_PATH", os.environ)
 
     def test_w8_sanitize_path_segment(self):
         """Verify _SanitizePathSegment strips invalid Windows/POSIX filesystem characters and handles reserved names."""
@@ -1991,7 +1990,27 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_prog = MagicMock()
             mock_prog.parameters.itemByName.return_value = MagicMock(value=MagicMock(value="tormach"))
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=MagicMock()), \
+            mock_op = MagicMock()
+            mock_op.isSuppressed = False
+            mock_op.hasToolpath = True
+            mock_op.isToolpathValid = True
+            p_tool = MagicMock()
+            p_tool.value.value = 1
+            mock_op.tool.parameters.itemByName.return_value = p_tool
+            mock_setup_prev.allOperations = [mock_op]
+
+            def fake_post_process(target_ops, post_input):
+                out_json = os.path.join(post_input.outputFolder, f"{post_input.programName}.json")
+                with open(out_json, "w", encoding="utf-8") as f:
+                    json.dump({"unit": 1, "stockMode": "previous-setup", "sections": []}, f)
+                return True
+
+            mock_cam = MagicMock()
+            mock_cam.postProcess.side_effect = fake_post_process
+            mock_app = MagicMock()
+            mock_app.activeDocument.products.itemByProductType.return_value = mock_cam
+
+            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
                  patch("PostProcessAll._ResolveBasePostPath", return_value=dummy_cps):
                 res = PostProcessAll._PostProcessUnifiedPipeline(
                     fname="Op2RestMachining",

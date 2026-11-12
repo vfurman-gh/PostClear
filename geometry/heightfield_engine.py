@@ -432,22 +432,28 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         # ---------------------------------------------------------------------
         # 1. Bounding Subgrid Extraction
         # ---------------------------------------------------------------------
-        # Max radius encompasses cutter and toolholder envelope
-        max_r = max(tool_r, holder_r)
+        # Phase 2 H2: Promotion clearance radius includes lateral margin and grid cell diagonal bound
+        cell_diag_half = self.grid.cell_size_mm * math.sqrt(2.0) / 2.0
+        clearance_r = tool_r + self.promote_margin_mm + cell_diag_half
+        # Max radius encompasses cutter, toolholder envelope, and promotion clearance radius
+        max_r = max(tool_r, holder_r, clearance_r)
         col_min, col_max, row_min, row_max = self.grid.get_subgrid_bounds(
             p1.x, p1.y, p2.x, p2.y, max_r
         )
 
         # If move is completely outside the padded grid bounds, return safe air move
         if col_max <= col_min or row_max <= row_min:
-            seen = self.record_vector_occurrence(v_key_str, is_air_move=True)
+            is_air_outside = not self._promotion_blocked(move)
+            self.record_event_evaluation(move, is_air_move=is_air_outside, collisions=[])
             return MoveEvaluation(
                 segment_id=move.segment_id,
                 vector_key=v_key_str,
-                is_air_move=True,
+                is_air_move=is_air_outside,
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
                 collisions=[],
+                sec_idx=move.metadata.get("sec_idx", move.sec_id) if move.metadata else move.sec_id,
+                event_idx=move.metadata.get("event_idx", move.segment_id) if move.metadata else move.segment_id,
             )
 
         sub_H = self.grid.H[row_min:row_max, col_min:col_max]
@@ -458,6 +464,10 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         mask_cutter, z_sweep_cutter, t_param, dist_cutter = self._sweep_subgrid(
             p1, p2, tool_r, corner_r, taper_deg, col_min, col_max, row_min, row_max
         )
+
+        meta_move = getattr(move, "metadata", None) or {}
+        sec_idx = meta_move.get("sec_idx", move.sec_id)
+        event_idx = meta_move.get("event_idx", move.segment_id)
 
         # ---------------------------------------------------------------------
         # 3. Holder & Shank Collision Checks
@@ -502,6 +512,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                     f"volume: {pen_vol:.2f} mm³)"
                 ),
                 op_id=move.op_id,
+                sec_idx=sec_idx,
+                event_idx=event_idx,
             )
             self.collisions.append(col)
             move_collisions.append(col)
@@ -523,6 +535,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                     f"Unfluted tool shank rubbed into raw stock (depth exceeded flute by {max_pen:.3f} mm)"
                 ),
                 op_id=move.op_id,
+                sec_idx=sec_idx,
+                event_idx=event_idx,
             )
             self.collisions.append(col)
             move_collisions.append(col)
@@ -549,6 +563,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                         f"volume: {pen_vol:.2f} mm³)"
                     ),
                     op_id=move.op_id,
+                    sec_idx=sec_idx,
+                    event_idx=event_idx,
                 )
                 self.collisions.append(col)
                 move_collisions.append(col)
@@ -561,6 +577,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
                 collisions=move_collisions,
+                sec_idx=sec_idx,
+                event_idx=event_idx,
             )
 
         # ---------------------------------------------------------------------
@@ -603,7 +621,9 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         dy = p2.y - p1.y
         dz = p2.z - p1.z
         is_pure_z_plus = (math.hypot(dx, dy) <= self.xy_tol_mm) and (dz > self.z_tol_mm)
-        clearance_z = meta.get("z_clearance_mm", self._sec_clearance_mm.get(sec_id))
+        clearance_z = meta.get("z_clearance_mm")
+        if clearance_z is None:
+            clearance_z = self._sec_clearance_mm.get(sec_id)
 
         is_retract_air = (not in_cycle) and is_pure_z_plus and (clearance_z is not None) and (p2.z >= (clearance_z - self.z_tol_mm))
 
@@ -619,16 +639,29 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                     holder_margin_clear = False
 
             # Check cutter clearance
+            # Phase 2 H2: clearance check uses clearance_r (lateral margin + cell diagonal discretization bound)
             cutter_margin_clear = True
-            if self.promote_margin_mm > 1e-4 and np.any(mask_cutter):
-                margin_cut_depth = sub_H[mask_cutter] - (z_sweep_cutter[mask_cutter] - self.promote_margin_mm)
-                if np.any(margin_cut_depth > 0.0):
-                    cutter_margin_clear = False
+            if self.promote_margin_mm > 1e-4:
+                mask_clearance = dist_cutter <= (clearance_r + 1e-5)
+                if np.any(mask_clearance):
+                    if L2 < 1e-10:
+                        z_tip_c = min(p1.z, p2.z)
+                    else:
+                        z_tip_c = p1.z + t_param * (p2.z - p1.z)
+                    z_effective = z_tip_c + evaluate_tool_bottom_profile(
+                        np.minimum(dist_cutter, tool_r), tool_r, corner_r, taper_deg
+                    )
+                    margin_cut_depth = sub_H[mask_clearance] - (z_effective[mask_clearance] - self.promote_margin_mm)
+                    if np.any(margin_cut_depth > 0.0):
+                        cutter_margin_clear = False
 
             if holder_margin_clear and cutter_margin_clear and self.has_valid_stock:
                 is_air_move = True
 
-        seen = self.record_vector_occurrence(v_key_str, is_air_move=is_air_move)
+        if self._promotion_blocked(move):
+            is_air_move = False
+
+        self.record_event_evaluation(move, is_air_move=is_air_move, collisions=move_collisions)
 
         return MoveEvaluation(
             segment_id=move.segment_id,
@@ -637,6 +670,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
             material_removed_mm3=vol_removed,
             instantaneous_mrr=mrr_rate,
             collisions=move_collisions,
+            sec_idx=sec_idx,
+            event_idx=event_idx,
         )
 
     def _step_arc(self, move: MotionSegment) -> MoveEvaluation:
@@ -687,6 +722,7 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
 
         mrr_rate = (tot_vol / max(1e-4, float(move.duration_sec))) * 60.0
 
+        meta_arc = getattr(move, "metadata", None) or {}
         return MoveEvaluation(
             segment_id=move.segment_id,
             vector_key=v_key_str,
@@ -694,6 +730,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
             material_removed_mm3=tot_vol,
             instantaneous_mrr=mrr_rate,
             collisions=all_cols,
+            sec_idx=meta_arc.get("sec_idx", move.sec_id),
+            event_idx=meta_arc.get("event_idx", move.segment_id),
         )
 
     def get_heightfield_snapshot(self) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:

@@ -16,8 +16,7 @@
  *   `getWorkpiece()`, `getProperty()`, `setProperty()`, `expandCyclePoint()`,
  *   `repositionToCycleClearance()`, and `linearize()` across merged multi-tool
  *   sections.
- * - Supports rapid promotion via either direct event annotation (`ev.promote = true`)
- *   or a `PROMOTED_MOVES_JSON` map (`"secId:x1,y1,z1->x2,y2,z2": {"minOccur": K}`).
+ * - Supports rapid promotion via direct event annotation (`ev.promote = true`).
  */
 
 description = "Universal Context & Event Replayer";
@@ -65,17 +64,6 @@ function toMat(m) {
 function toBox(b) {
   if (!b) return new BoundingBox(new Vector(0, 0, 0), new Vector(0, 0, 0));
   return new BoundingBox(toVec(b.lower), toVec(b.upper));
-}
-
-function normInt(val) {
-  var mmVal = (typeof unit !== "undefined" && unit == IN) ? (val * 25.4) : val;
-  return Math.round(mmVal * 10000);
-}
-
-function makeVectorKey(secId, sx, sy, sz, ex, ey, ez) {
-  return secId + ":" +
-    normInt(sx) + "," + normInt(sy) + "," + normInt(sz) + "->" +
-    normInt(ex) + "," + normInt(ey) + "," + normInt(ez);
 }
 
 function makeTool(t) {
@@ -287,22 +275,9 @@ function onSectionEnd() {}
 function onClose() {
   var jsonPath = getEnvironmentVariable("CONTEXT_JSON");
   var basePostPath = getEnvironmentVariable("BASE_POST");
-  var promotedJsonPath = "";
-  try {
-    promotedJsonPath = getEnvironmentVariable("PROMOTED_MOVES_JSON");
-  } catch (e) {}
 
   var data = JSON.parse(loadLargeText(jsonPath, "utf-8"));
   var vendorCode = loadLargeText(basePostPath, "utf-8");
-
-  var authorizedMap = null;
-  var hasPromotedMap = false;
-  if (promotedJsonPath && FileSystem.isFile(promotedJsonPath)) {
-    try {
-      authorizedMap = JSON.parse(loadLargeText(promotedJsonPath, "utf-8"));
-      hasPromotedMap = true;
-    } catch (e) {}
-  }
 
   var sections = [];
   for (var i = 0; i < data.sections.length; ++i) {
@@ -595,6 +570,23 @@ function onClose() {
     "  },\n" +
     "  setProperty: setProperty,\n" +
     "  applyPostProp: __applyPostProp,\n" +
+    "  getRapidMode: function() {\n" +
+    "    var hfm = (typeof highFeedMapping !== 'undefined') ? highFeedMapping : null;\n" +
+    "    var ug = null;\n" +
+    "    if (typeof getProperty === 'function') {\n" +
+    "      try {\n" +
+    "        var p = getProperty('useG0');\n" +
+    "        if (typeof p === 'boolean') ug = p;\n" +
+    "      } catch (e) {}\n" +
+    "    }\n" +
+    "    if (ug === null && typeof properties !== 'undefined' && properties && typeof properties.useG0 !== 'undefined') {\n" +
+    "      try {\n" +
+    "        var val = (typeof properties.useG0 === 'object' && properties.useG0 !== null) ? properties.useG0.value : properties.useG0;\n" +
+    "        if (typeof val === 'boolean') ug = val;\n" +
+    "      } catch (e) {}\n" +
+    "    }\n" +
+    "    return { highFeedMapping: hfm, useG0: ug };\n" +
+    "  },\n" +
     "  formatComment: (typeof formatComment === 'function') ? formatComment : null,\n" +
     "  writeComment: (typeof writeComment === 'function') ? writeComment : null,\n" +
     "  onOpen: (typeof onOpen === 'function') ? onOpen : null,\n" +
@@ -685,11 +677,65 @@ function onClose() {
 
   if (vendor.onOpen) vendor.onOpen();
 
+  function checkVendorDogLeg() {
+    var hfm = null;
+    var ug = null;
+    if (vendor && typeof vendor.getRapidMode === "function") {
+      try {
+        var rm = vendor.getRapidMode();
+        if (rm) {
+          hfm = rm.highFeedMapping;
+          ug = rm.useG0;
+        }
+      } catch (e) {}
+    }
+    if (hfm === null && typeof highFeedMapping !== "undefined") {
+      hfm = highFeedMapping;
+    }
+    if (ug === null && typeof getProperty === "function") {
+      try {
+        var p = getProperty("useG0");
+        if (typeof p === "boolean") ug = p;
+      } catch (e) {}
+    }
+    var isDogLeg = false;
+    if (hfm !== null && hfm !== 0) {
+      isDogLeg = true;
+    }
+    if (ug === false) {
+      isDogLeg = true;
+    }
+    return { isDogLeg: isDogLeg, highFeedMapping: hfm, useG0: ug };
+  }
+
+  function _logReplayerComment(msg) {
+    try {
+      if (vendor && typeof vendor.writeComment === "function") {
+        vendor.writeComment(msg);
+        return;
+      }
+    } catch (e) {}
+    try {
+      if (typeof writeComment === "function") {
+        writeComment(msg);
+        return;
+      }
+    } catch (e) {}
+    try {
+      if (typeof writeln === "function") {
+        writeln("(" + msg + ")");
+        return;
+      }
+    } catch (e) {}
+  }
+
+  var vendorDogLeg = checkVendorDogLeg();
+  var dogLegCommentLogged = false;
+
   for (var ci = 0; ci < data.comments.length; ++ci) {
     if (vendor.onComment) vendor.onComment(data.comments[ci]);
   }
 
-  var occurCounts = {};
   var restoredCount = 0;
   var inCycle = false;
 
@@ -778,24 +824,16 @@ function onClose() {
           curSync = !!ev.sync;
           vendor.setState({movement: ev.movement, radiusCompensation: ev.rc, spindleSpeed: ev.rpm});
           var shouldPromote = !!ev.promote;
-          if (!shouldPromote && !inCycle && authorizedMap) {
-            var vKey = makeVectorKey(si, ev.sx, ev.sy, ev.sz, ev.x, ev.y, ev.z);
-            var rule = authorizedMap[vKey];
-            if (!rule && rawSec.origSecId !== undefined) {
-              var localKey = makeVectorKey(rawSec.origSecId, ev.sx, ev.sy, ev.sz, ev.x, ev.y, ev.z);
-              rule = authorizedMap[localKey];
-              if (rule) vKey = localKey;
-            }
-            if (rule) {
-              var occ = (occurCounts[vKey] || 0) + 1;
-              occurCounts[vKey] = occ;
-              var minOcc = (typeof rule === "object" && rule !== null && rule.minOccur !== undefined) ? rule.minOccur : 1;
-              if (occ >= minOcc) {
-                shouldPromote = true;
-              }
+          if (shouldPromote && vendorDogLeg.isDogLeg) {
+            shouldPromote = false;
+            if (!dogLegCommentLogged) {
+              dogLegCommentLogged = true;
+              var reason = "Rapid promotion disabled: vendor post indicates dog-leg rapids (highFeedMapping=" +
+                vendorDogLeg.highFeedMapping + ", useG0=" + vendorDogLeg.useG0 + ")";
+              _logReplayerComment(reason);
             }
           }
-          if (shouldPromote && !inCycle) {
+          if (shouldPromote && !inCycle && !(ev.rc) && !curSync) {
             restoredCount += 1;
             _promoCommentSuffix = (typeof vendor.formatComment === "function")
               ? vendor.formatComment("Rapid restored")
@@ -850,7 +888,7 @@ function onClose() {
 
   if (vendor.onClose) vendor.onClose();
 
-  if (hasPromotedMap && vendor.writeComment) {
+  if (restoredCount > 0 && vendor.writeComment) {
     try {
       vendor.writeComment("UNIVERSAL WRAPPER: RESTORED " + restoredCount + " G0 RAPID MOVES");
     } catch (e) {}
