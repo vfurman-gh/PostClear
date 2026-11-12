@@ -2475,6 +2475,146 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             self.assertTrue(len(written_configs) >= 1)
             self.assertIsNone(written_configs[0].get("unit"), "Dumper config unit must be None for Document units")
 
+    def test_init_addin_is_idempotent_cleans_stale_control_and_definition(self):
+        """Calling InitAddIn() twice in a row cleans stale control before stale cmdDef without RuntimeError."""
+        import PostProcessAll
+
+        delete_order = []
+        created_defs = []
+        created_controls = []
+
+        class FakeCmdDef:
+            def __init__(self, def_id):
+                self.id = def_id
+                self.commandCreated = MagicMock()
+                self.deleteMe = MagicMock(side_effect=self._delete)
+
+            def _delete(self):
+                delete_order.append(("cmdDef", self))
+                cmd_defs_store.pop(self.id, None)
+
+        class FakeCmdControl:
+            def __init__(self, ctrl_id):
+                self.id = ctrl_id
+                self.isPromotedByDefault = False
+                self.isPromoted = False
+                self.deleteMe = MagicMock(side_effect=self._delete)
+
+            def _delete(self):
+                delete_order.append(("cmdControl", self))
+                controls_store.pop(self.id, None)
+
+        cmd_defs_store = {}
+        controls_store = {}
+
+        def add_button_def(def_id, name, tooltip, res_folder):
+            if def_id in cmd_defs_store:
+                raise RuntimeError("3 : a command definition with that id already exists")
+            d = FakeCmdDef(def_id)
+            cmd_defs_store[def_id] = d
+            created_defs.append(d)
+            return d
+
+        def add_command(cmd_def, target_id, is_before):
+            if cmd_def.id in controls_store:
+                raise RuntimeError("3 : a command control with that id already exists")
+            c = FakeCmdControl(cmd_def.id)
+            controls_store[cmd_def.id] = c
+            created_controls.append(c)
+            return c
+
+        mock_cmd_defs = MagicMock()
+        mock_cmd_defs.itemById.side_effect = lambda k: cmd_defs_store.get(k)
+        mock_cmd_defs.addButtonDefinition.side_effect = add_button_def
+
+        mock_controls = MagicMock()
+        mock_controls.itemById.side_effect = lambda k: controls_store.get(k)
+        mock_controls.addCommand.side_effect = add_command
+
+        mock_panel = MagicMock()
+        mock_panel.controls = mock_controls
+
+        mock_ws = MagicMock()
+        mock_ws.toolbarPanels.itemById.return_value = mock_panel
+
+        mock_ui = MagicMock()
+        mock_ui.commandDefinitions = mock_cmd_defs
+        mock_ui.workspaces.itemById.return_value = mock_ws
+        mock_ui.allToolbarPanels.itemById.return_value = mock_panel
+
+        mock_app = MagicMock()
+        mock_app.userInterface = mock_ui
+
+        saved_handlers = list(PostProcessAll.handlers)
+        try:
+            PostProcessAll.handlers.clear()
+            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app):
+                PostProcessAll.InitAddIn()
+                mock_ui.messageBox.assert_not_called()
+                self.assertEqual(len(created_defs), 1)
+                self.assertEqual(len(created_controls), 1)
+                self.assertEqual(len(PostProcessAll.handlers), 1)
+
+                # Call InitAddIn() again without stop() — must delete stale control then stale cmdDef.
+                PostProcessAll.InitAddIn()
+                mock_ui.messageBox.assert_not_called()
+
+            first_ctrl = created_controls[0]
+            first_def = created_defs[0]
+            first_ctrl.deleteMe.assert_called_once()
+            first_def.deleteMe.assert_called_once()
+            self.assertEqual(
+                delete_order,
+                [("cmdControl", first_ctrl), ("cmdDef", first_def)],
+            )
+            self.assertEqual(len(created_defs), 2)
+            self.assertEqual(len(created_controls), 2)
+            self.assertEqual(len(PostProcessAll.handlers), 1)
+        finally:
+            PostProcessAll.handlers[:] = saved_handlers
+
+    def test_stop_and_run_idempotent_reload(self):
+        """run() refreshes local modules via _EnsureLocalModulesLoaded(force=True) and stop() cleans up safely."""
+        import PostProcessAll
+
+        mock_control = MagicMock()
+        mock_def = MagicMock()
+        mock_palette = MagicMock()
+
+        mock_panel = MagicMock()
+        mock_panel.controls.itemById.return_value = mock_control
+
+        mock_ws = MagicMock()
+        mock_ws.toolbarPanels.itemById.return_value = mock_panel
+
+        mock_ui = MagicMock()
+        mock_ui.workspaces.itemById.return_value = mock_ws
+        mock_ui.allToolbarPanels.itemById.return_value = mock_panel
+        mock_ui.commandDefinitions.itemById.return_value = mock_def
+        mock_ui.palettes.itemById.return_value = mock_palette
+
+        mock_app = MagicMock()
+        mock_app.userInterface = mock_ui
+
+        saved_handlers = list(PostProcessAll.handlers)
+        saved_settings_mgr = PostProcessAll.settingsMgr
+        try:
+            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostProcessAll._EnsureLocalModulesLoaded") as mock_ensure:
+                PostProcessAll.run(None)
+                mock_ensure.assert_called_once_with(force=True)
+                mock_ui.messageBox.assert_not_called()
+                mock_control.deleteMe.assert_called_once()
+                mock_def.deleteMe.assert_called_once()
+
+                PostProcessAll.stop(None)
+                mock_ui.messageBox.assert_not_called()
+                mock_palette.deleteMe.assert_called_once()
+                self.assertEqual(len(PostProcessAll.handlers), 0)
+        finally:
+            PostProcessAll.handlers[:] = saved_handlers
+            PostProcessAll.settingsMgr = saved_settings_mgr
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -546,19 +546,17 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         engine = MillHeightfieldVerifier()
         engine.reset(self.workpiece)
 
-        # Baseline cutting samples with MRR = 50 mm3/min (50 samples)
-        for i in range(50):
+        # Op1: 30 baseline cutting samples at 50 mm3/min + 5 spikes (500, 900, 600, 800, 700)
+        for i in range(30):
             engine.current_time_sec = float(i)
             engine.record_mrr_sample(
                 segment_id=i,
                 duration_sec=1.0,
                 volume_removed_mm3=50.0 / 60.0,
-                op_id="Baseline",
+                op_id="Op1",
             )
-
-        # Op1: 5 spikes with rates 500, 600, 700, 800, 900 mm3/min (mean ~ 100, threshold ~ 250)
         for idx, rate in enumerate([500.0, 900.0, 600.0, 800.0, 700.0]):
-            engine.current_time_sec = 20.0 + float(idx * 2)
+            engine.current_time_sec = 40.0 + float(idx * 2)
             engine.record_mrr_sample(
                 segment_id=100 + idx,
                 duration_sec=1.0,
@@ -566,9 +564,17 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
                 op_id="Op1",
             )
 
-        # Op2: 4 spikes with rates 400, 1000, 450, 950 mm3/min
+        # Op2: 30 baseline cutting samples at 50 mm3/min + 4 spikes (400, 1000, 450, 950)
+        for i in range(30):
+            engine.current_time_sec = 60.0 + float(i)
+            engine.record_mrr_sample(
+                segment_id=150 + i,
+                duration_sec=1.0,
+                volume_removed_mm3=50.0 / 60.0,
+                op_id="Op2",
+            )
         for idx, rate in enumerate([400.0, 1000.0, 450.0, 950.0]):
-            engine.current_time_sec = 40.0 + float(idx * 2)
+            engine.current_time_sec = 100.0 + float(idx * 2)
             engine.record_mrr_sample(
                 segment_id=200 + idx,
                 duration_sec=1.0,
@@ -695,6 +701,152 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         eval_retract = verifier.step(retract_move)
         self.assertTrue(eval_retract.is_air_move)
         self.assertIn((0, 2), verifier.promoted_events)
+
+    def test_arc_mrr_aggregation_single_sample(self):
+        """Cutting arc move records 1 aggregated MRRSample without chordal dilution."""
+        self.verifier.reset(self.workpiece)
+        self.verifier.load_tool(self.tool)
+
+        arc_move = _make_segment(
+            seg_id=501,
+            motion=MotionKind.ARC_CCW,
+            start=Vector3D(10.0, 0.0, -1.5),
+            end=Vector3D(0.0, 10.0, -1.5),
+            is_arc=True,
+            arc_center=Vector3D(0.0, 0.0, -1.5),
+            duration_sec=1.5,
+            op_id="ArcOp",
+        )
+        res = self.verifier.step(arc_move)
+
+        self.assertGreater(res.material_removed_mm3, 0.0)
+        self.assertEqual(len(self.verifier.mrr_timeline), 1)
+        sample = self.verifier.mrr_timeline[0]
+        expected_mrr = (res.material_removed_mm3 / arc_move.duration_sec) * 60.0
+        self.assertAlmostEqual(sample.mrr_rate_mm3_per_min, expected_mrr, places=4)
+        self.assertAlmostEqual(res.instantaneous_mrr, expected_mrr, places=4)
+        self.assertAlmostEqual(sample.volume_removed_mm3, res.material_removed_mm3, places=4)
+        self.assertGreater(sample.depth_of_cut_mm, 0.0)
+        self.assertEqual(sample.op_id, "ArcOp")
+        self.assertNotIn((0, 501), self.verifier.promoted_events)
+
+    def test_time_weighted_mrr_immune_to_short_lead_in_segments(self):
+        """Short low-MRR micro-segments do not drag down time-weighted mean MRR."""
+        engine = MillHeightfieldVerifier()
+        engine.reset(self.workpiece)
+
+        t = 0.0
+        # 200 short (0.015 s) helical ramp / lead-in micro-segments at 50 mm3/min
+        for i in range(200):
+            t += 0.015
+            engine.current_time_sec = t
+            engine.record_mrr_sample(
+                segment_id=i,
+                duration_sec=0.015,
+                volume_removed_mm3=(50.0 / 60.0) * 0.015,
+                op_id="Pocket1",
+            )
+
+        # 10 long (1.5 s) steady-state cuts at 3000-4500 mm3/min
+        steady_rates = [3000.0, 3500.0, 4000.0, 4200.0, 4500.0, 3200.0, 3800.0, 4100.0, 4400.0, 3600.0]
+        for idx, rate in enumerate(steady_rates):
+            t += 1.5
+            engine.current_time_sec = t
+            engine.record_mrr_sample(
+                segment_id=300 + idx,
+                duration_sec=1.5,
+                volume_removed_mm3=(rate / 60.0) * 1.5,
+                op_id="Pocket1",
+            )
+
+        report_no_spike = engine.generate_report()
+        self.assertEqual(len(report_no_spike.mrr_spikes), 0)
+
+        # Add a genuine spike (> 2.5x the ~3438 mm3/min time-weighted mean)
+        t += 0.5
+        engine.current_time_sec = t
+        engine.record_mrr_sample(
+            segment_id=999,
+            duration_sec=0.5,
+            volume_removed_mm3=(12000.0 / 60.0) * 0.5,
+            op_id="Pocket1",
+        )
+
+        report_with_spike = engine.generate_report()
+        self.assertEqual(len(report_with_spike.mrr_spikes), 1)
+        self.assertEqual(report_with_spike.mrr_spikes[0].segment_id, 999)
+
+    def test_per_operation_mrr_isolation_constant_drilling(self):
+        """Constant-MRR drilling operation paired with a lighter operation reports 0 spikes."""
+        engine = MillHeightfieldVerifier()
+        engine.reset(self.workpiece)
+
+        t = 0.0
+        # Light finishing operation at 200 mm3/min
+        for i in range(50):
+            t += 1.0
+            engine.current_time_sec = t
+            engine.record_mrr_sample(
+                segment_id=i,
+                duration_sec=1.0,
+                volume_removed_mm3=200.0 / 60.0,
+                op_id="LightFinish",
+            )
+
+        # Constant-MRR drilling operation: 6 pecks all at 1772.73 mm3/min
+        for j in range(6):
+            t += 0.8
+            engine.current_time_sec = t
+            engine.record_mrr_sample(
+                segment_id=500 + j,
+                duration_sec=0.8,
+                volume_removed_mm3=(1772.73 / 60.0) * 0.8,
+                op_id="Drill7",
+            )
+
+        report = engine.generate_report()
+        drill_spikes = [s for s in report.mrr_spikes if s.op_id == "Drill7"]
+        self.assertEqual(len(drill_spikes), 0)
+        self.assertEqual(len(report.mrr_spikes), 0)
+
+    def test_arc_collision_deduplicated_to_single_record_per_kind(self):
+        """Arc move causing shank rub / holder strike records 1 CollisionRecord per kind, not per chordal step."""
+        short_stickout_tool = ToolAssembly(
+            tool_id=3,
+            name="10mm Short Stickout Endmill",
+            geometry=MillToolGeometry(
+                diameter=10.0,
+                corner_radius=0.0,
+                flute_length=15.0,
+                overall_length=22.0,
+                holder_diameter=30.0,
+                holder_length=40.0,
+            ),
+        )
+        self.verifier.reset(self.workpiece)
+        self.verifier.load_tool(short_stickout_tool)
+
+        # 90-degree CCW arc (9 chordal steps) at Z=-25.0:
+        # shank bottom (-10.0) and holder bottom (-3.0) are both below stock top (0.0).
+        arc_move = _make_segment(
+            seg_id=502,
+            motion=MotionKind.ARC_CCW,
+            start=Vector3D(10.0, 0.0, -25.0),
+            end=Vector3D(0.0, 10.0, -25.0),
+            is_arc=True,
+            arc_center=Vector3D(0.0, 0.0, -25.0),
+            duration_sec=1.5,
+            op_id="DeepArc",
+        )
+        res = self.verifier.step(arc_move)
+
+        shank_cols = [c for c in self.verifier.collisions if c.kind == CollisionKind.SHANK_RUB]
+        holder_cols = [c for c in self.verifier.collisions if c.kind == CollisionKind.HOLDER_STRIKE]
+        self.assertEqual(len(shank_cols), 1)
+        self.assertEqual(len(holder_cols), 1)
+        self.assertEqual(len(self.verifier.collisions), 2)
+        self.assertEqual(len(res.collisions), 2)
+        self.assertNotIn((0, 502), self.verifier.promoted_events)
 
 
 if __name__ == "__main__":

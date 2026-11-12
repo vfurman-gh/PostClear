@@ -182,23 +182,27 @@ class BaseVerificationEngine(IVerificationEngine):
         """
         Compile VerificationReport with strictly validated monotonic promotion rules,
         collating collisions, total volume removed, and statistical MRR spikes.
-        Top 3 spikes per operation are selected and sorted chronologically.
+        Top 3 spikes per operation are selected (relative to each operation's
+        time-weighted mean MRR) and sorted chronologically.
         """
-        non_zero_mrrs = [s.mrr_rate_mm3_per_min for s in self.mrr_timeline if s.mrr_rate_mm3_per_min > 1.0]
+        active_samples = [
+            s for s in self.mrr_timeline
+            if s.mrr_rate_mm3_per_min > 1.0 and s.duration_sec > 0.0
+        ]
         spikes: List[MRRSample] = []
-        if non_zero_mrrs:
-            mean_mrr = sum(non_zero_mrrs) / len(non_zero_mrrs)
-            threshold = mean_mrr * 2.5
-            candidate_spikes = [s for s in self.mrr_timeline if s.mrr_rate_mm3_per_min > threshold]
-
-            # Select top 3 spikes per operation (sorted descending by MRR rate)
-            spikes_by_op: Dict[str, List[MRRSample]] = {}
-            for s in candidate_spikes:
+        if active_samples:
+            samples_by_op: Dict[str, List[MRRSample]] = {}
+            for s in active_samples:
                 op_key = s.op_id if s.op_id else "General"
-                spikes_by_op.setdefault(op_key, []).append(s)
+                samples_by_op.setdefault(op_key, []).append(s)
 
             top_spikes: List[MRRSample] = []
-            for op_key, op_spikes in spikes_by_op.items():
+            for op_key, op_samples in samples_by_op.items():
+                op_dur = sum(s.duration_sec for s in op_samples)
+                op_vol = sum(s.volume_removed_mm3 for s in op_samples)
+                op_mean_mrr = (op_vol / op_dur) * 60.0 if op_dur > 0.0 else 0.0
+                threshold = op_mean_mrr * 2.5
+                op_spikes = [s for s in op_samples if s.mrr_rate_mm3_per_min > threshold]
                 sorted_op = sorted(op_spikes, key=lambda s: s.mrr_rate_mm3_per_min, reverse=True)[:3]
                 top_spikes.extend(sorted_op)
 

@@ -163,10 +163,57 @@ handlers = []
 # Global settingsMgr object
 settingsMgr = None
 
+def _CleanupCommandUI(ui) -> None:
+    """Safely remove any existing toolbar controls, command definition, and handlers."""
+    if not ui:
+        handlers.clear()
+        return
+
+    # Delete existing toolbar controls first, before deleting the command definition.
+    panels = []
+    try:
+        workspaces = getattr(ui, "workspaces", None)
+        cam_ws = workspaces.itemById(constCAMWorkspaceId) if workspaces else None
+        ws_panels = getattr(cam_ws, "toolbarPanels", None) if cam_ws else None
+        ws_panel = ws_panels.itemById(constCAMActionsPanelId) if ws_panels else None
+        if ws_panel is not None:
+            panels.append(ws_panel)
+    except Exception:
+        pass
+
+    try:
+        if hasattr(ui, "allToolbarPanels") and ui.allToolbarPanels:
+            all_panel = ui.allToolbarPanels.itemById(constCAMActionsPanelId)
+            if all_panel is not None and all_panel not in panels:
+                panels.append(all_panel)
+    except Exception:
+        pass
+
+    for panel in panels:
+        try:
+            controls = getattr(panel, "controls", None)
+            cmd_control = controls.itemById(constCmdDefId) if controls else None
+            if cmd_control:
+                cmd_control.deleteMe()
+        except Exception:
+            pass
+
+    try:
+        cmd_defs = getattr(ui, "commandDefinitions", None)
+        existing_cmd_def = cmd_defs.itemById(constCmdDefId) if cmd_defs else None
+        if existing_cmd_def:
+            existing_cmd_def.deleteMe()
+    except Exception:
+        pass
+
+    handlers.clear()
+
+
 def run(context):
     global settingsMgr
     ui = None
     try:
+        _EnsureLocalModulesLoaded(force=True)
         settingsMgr = SettingsManager()
         app = adsk.core.Application.get()
         ui  = app.userInterface
@@ -183,15 +230,8 @@ def stop(context):
         app = adsk.core.Application.get()
         ui  = app.userInterface
 
-        # Clean up the UI.
-        cmdDef = ui.commandDefinitions.itemById(constCmdDefId)
-        if cmdDef:
-            cmdDef.deleteMe()
-            
-        addinsPanel = ui.allToolbarPanels.itemById(constCAMActionsPanelId)
-        cmdControl = addinsPanel.controls.itemById(constCmdDefId)
-        if cmdControl:
-            cmdControl.deleteMe()
+        # Clean up the UI: delete controls first, then command definition, then palette.
+        _CleanupCommandUI(ui)
 
         if ui and hasattr(ui, "palettes") and ui.palettes:
             try:
@@ -284,6 +324,9 @@ def InitAddIn():
     try:
         app = adsk.core.Application.get()
         ui  = app.userInterface
+
+        # Ensure idempotent registration if a stale control or command definition exists.
+        _CleanupCommandUI(ui)
 
         # Create a button command definition.
         cmdDefs = ui.commandDefinitions

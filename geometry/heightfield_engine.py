@@ -424,7 +424,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         p1: Vector3D,
         p2: Vector3D,
         move: MotionSegment,
-        v_key_str: str,
+        v_key_str: str = "",
+        record_metrics: bool = True,
     ) -> MoveEvaluation:
         """Process a single linear kinematic move."""
         tool_r, corner_r, flute_len, overall_len, holder_r, holder_len, taper_deg = (
@@ -454,7 +455,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         # If move is completely outside the padded grid bounds, return safe air move
         if col_max <= col_min or row_max <= row_min:
             is_air_outside = not self._promotion_blocked(move)
-            self.record_event_evaluation(move, is_air_move=is_air_outside, collisions=[])
+            if record_metrics:
+                self.record_event_evaluation(move, is_air_move=is_air_outside, collisions=[])
             return MoveEvaluation(
                 segment_id=move.segment_id,
                 vector_key=v_key_str,
@@ -525,7 +527,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                 sec_idx=sec_idx,
                 event_idx=event_idx,
             )
-            self.collisions.append(col)
+            if record_metrics:
+                self.collisions.append(col)
             move_collisions.append(col)
 
         # Shank rub check: cutting deeper than flute length
@@ -548,7 +551,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                 sec_idx=sec_idx,
                 event_idx=event_idx,
             )
-            self.collisions.append(col)
+            if record_metrics:
+                self.collisions.append(col)
             move_collisions.append(col)
 
         # ---------------------------------------------------------------------
@@ -576,7 +580,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                     sec_idx=sec_idx,
                     event_idx=event_idx,
                 )
-                self.collisions.append(col)
+                if record_metrics:
+                    self.collisions.append(col)
                 move_collisions.append(col)
 
             # Rapid moves do not modify stock or get promoted
@@ -610,14 +615,18 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                 z_sweep_cutter[rapid_into_stock_mask]
             )
 
-            sample = self.record_mrr_sample(
-                segment_id=move.segment_id,
-                duration_sec=move.duration_sec,
-                volume_removed_mm3=vol_removed,
-                depth_of_cut_mm=doc_mm,
-                op_id=move.op_id,
-            )
-            mrr_rate = sample.mrr_rate_mm3_per_min
+            if record_metrics:
+                sample = self.record_mrr_sample(
+                    segment_id=move.segment_id,
+                    duration_sec=move.duration_sec,
+                    volume_removed_mm3=vol_removed,
+                    depth_of_cut_mm=doc_mm,
+                    op_id=move.op_id,
+                )
+                mrr_rate = sample.mrr_rate_mm3_per_min
+            else:
+                dur = max(1e-4, float(move.duration_sec))
+                mrr_rate = (vol_removed / dur) * 60.0
 
         # ---------------------------------------------------------------------
         # 6. Air Move & Rapid Promotion Check (for G1 feed moves)
@@ -671,7 +680,8 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         if self._promotion_blocked(move):
             is_air_move = False
 
-        self.record_event_evaluation(move, is_air_move=is_air_move, collisions=move_collisions)
+        if record_metrics:
+            self.record_event_evaluation(move, is_air_move=is_air_move, collisions=move_collisions)
 
         return MoveEvaluation(
             segment_id=move.segment_id,
@@ -682,6 +692,7 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
             collisions=move_collisions,
             sec_idx=sec_idx,
             event_idx=event_idx,
+            depth_of_cut_mm=doc_mm,
         )
 
     def _step_arc(self, move: MotionSegment) -> MoveEvaluation:
@@ -710,6 +721,7 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         steps = max(3, int(math.ceil(abs(delta) / max_angle_step)))
 
         tot_vol = 0.0
+        max_doc = 0.0
         all_cols: List[CollisionRecord] = []
         is_air_all = True
         v_key_str = move.vector_key.to_wrapper_str()
@@ -724,13 +736,34 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
             sub_p1 = Vector3D(c_x + r * math.cos(ang_a), c_y + r * math.sin(ang_a), p1.z + t_a * (p2.z - p1.z))
             sub_p2 = Vector3D(c_x + r * math.cos(ang_b), c_y + r * math.sin(ang_b), p1.z + t_b * (p2.z - p1.z))
 
-            sub_eval = self._step_linear(sub_p1, sub_p2, move, v_key_str)
+            sub_eval = self._step_linear(sub_p1, sub_p2, move, v_key_str, record_metrics=False)
             tot_vol += sub_eval.material_removed_mm3
+            max_doc = max(max_doc, sub_eval.depth_of_cut_mm)
             if not sub_eval.is_air_move:
                 is_air_all = False
             all_cols.extend(sub_eval.collisions)
 
-        mrr_rate = (tot_vol / max(1e-4, float(move.duration_sec))) * 60.0
+        if tot_vol > 0.0:
+            sample = self.record_mrr_sample(
+                segment_id=move.segment_id,
+                duration_sec=move.duration_sec,
+                volume_removed_mm3=tot_vol,
+                depth_of_cut_mm=max_doc,
+                op_id=move.op_id,
+            )
+            mrr_rate = sample.mrr_rate_mm3_per_min
+        else:
+            mrr_rate = 0.0
+
+        dedup_by_kind: Dict[CollisionKind, CollisionRecord] = {}
+        for col in all_cols:
+            existing = dedup_by_kind.get(col.kind)
+            if existing is None or col.penetration_volume_mm3 > existing.penetration_volume_mm3:
+                dedup_by_kind[col.kind] = col
+        dedup_cols = list(dedup_by_kind.values())
+        self.collisions.extend(dedup_cols)
+
+        self.record_event_evaluation(move, is_air_move=is_air_all, collisions=dedup_cols)
 
         meta_arc = getattr(move, "metadata", None) or {}
         return MoveEvaluation(
@@ -739,9 +772,10 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
             is_air_move=is_air_all,
             material_removed_mm3=tot_vol,
             instantaneous_mrr=mrr_rate,
-            collisions=all_cols,
+            collisions=dedup_cols,
             sec_idx=meta_arc.get("sec_idx", move.sec_id),
             event_idx=meta_arc.get("event_idx", move.segment_id),
+            depth_of_cut_mm=max_doc,
         )
 
     def get_heightfield_snapshot(self) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:

@@ -241,6 +241,7 @@ class MoveEvaluation:
     collisions: List[CollisionRecord] = field(default_factory=list)
     sec_idx: Optional[int] = None
     event_idx: Optional[int] = None
+    depth_of_cut_mm: float = 0.0
 
 
 @dataclass
