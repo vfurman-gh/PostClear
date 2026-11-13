@@ -2609,7 +2609,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
                  patch("PostProcessAll._EnsureLocalModulesLoaded") as mock_ensure:
                 PostProcessAll.run(None)
-                mock_ensure.assert_called_once_with(force=True)
+                mock_ensure.assert_called_once_with(force=True, allow_bootstrap=True)
                 mock_ui.messageBox.assert_not_called()
                 mock_control.deleteMe.assert_called_once()
                 mock_def.deleteMe.assert_called_once()

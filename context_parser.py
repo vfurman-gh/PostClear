@@ -608,6 +608,15 @@ def extract_workpiece_from_context(
                 raise FileNotFoundError(
                     f"Exported stock STL mesh file not found: '{stl_path}'."
                 )
+            if np is None:
+                try:
+                    import numpy as _np
+                    globals()["np"] = _np
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Loading in-process STL stock requires 'numpy', which is not installed "
+                        "(offline first-time setup failed). Connect to the internet and re-run Post Process All."
+                    ) from exc
             try:
                 from geometry.solid_mesh import (
                     load_stl_mesh,

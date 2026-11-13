@@ -1,92 +1,46 @@
-# Post Process All: Fusion CAM Batch Post Add-In
-### New in Version 2: All post processor options are available through `NC Programs`
+# Post Process All: Fusion CAM Batch Post & Verification Add-In
 
-### Introduction
-This add-in for Fusion will post process all CAM setups, or any
-selection of setups you choose, at once.
-Each setup is put in a file with the name of the setup. You can
-optionally use a special setup naming convention to put files in
-subfolders. You can also put sequence numbers on the names to maintain
-the order of operations.
+### Overview
+`Post Process All` is a Fusion 360 Manufacture workspace add-in (v3.0.0) that batch post-processes one or multiple `NC Program` entries with full In-Process Workpiece (IPW) simulation, collision detection, safe rapid (`G0`) restoration, and per-program verification reports and plots.
 
-Note that the setup name must be a valid file name. It couldn't,
-for example, be `1/4" end mill` because both the `"` and the `/` are
-special or illegal characters for file names.
-
-The add-in creates a new command in the `Manufacture` workspace next to
-the native Post Process command called Post Process All:
+You can invoke `Post Process All` from:
+- The **Manufacture** workspace toolbar (next to native **Post Process**) or **Actions** menu.
+- The **Right-Click Context Menu** on any `NC Program`, the `NC Programs` folder, or a `Setup` — placed immediately below Fusion's built-in **Post Process** item, pre-checking the corresponding NC Programs in the dialog.
 
 ![Post Process All](https://raw.githubusercontent.com/TimPaterson/Fusion360-Batch-Post/master/resources/Command/32x32.png)
 
-### First Run
+---
 
-`Post Process All` requires an `NC Program`. The `NC Program` is used to select
-the post processor and to choose the output foldeer for G-code files.
-If you don't have an `NC Program`, `Post Process All` will create one. If you've
-run `Post Process All` before on this design, it will keep the previous
-output folder. Otherwise, you should probably cancel `Post Process All` and set the
-output folder in the `NC Program`.
+### Installation (Windows & macOS)
 
-`Post Process All` will present this dialog:
+1. Download **`PostProcessAll-v3.0.0.zip`** from **Releases** and unzip the **`PostProcessAll`** folder anywhere you keep Fusion Add-Ins (for example `Documents/FusionAddIns/PostProcessAll`). Keep the folder named **`PostProcessAll`**.
+   - If cloning from GitHub instead, clone directly into a folder named `PostProcessAll`:
+     ```bash
+     git clone <repo-url> PostProcessAll
+     ```
+2. In Fusion 360, go to **Utilities → ADD-INS → Scripts and Add-Ins** (`Shift+S`), open the **Add-Ins** tab, click **`+`** next to *My Add-Ins*, and select the **`PostProcessAll`** folder.
+3. Ensure **Run on Startup** is checked and click **Run**.
+4. **Automatic Dependency Setup**: On first load (and automatically after any future Fusion 360 Python update), `PostProcessAll` uses Fusion's built-in Python to install `numpy`, `shapely`, and `matplotlib` into `PostProcessAll/packages/<abi>/` — no system Python or terminal commands required.
 
-![Dialog Image](https://raw.githubusercontent.com/TimPaterson/Fusion360-Batch-Post/master/ReadMeImages/DialogImage.PNG)
+#### Updating
+Replace the contents of your `PostProcessAll` folder with the new release (keeping your `PostProcessAll.settings` file if present), or run `git pull` if cloned from GitHub, then restart Fusion 360 or click **Stop** / **Run** in **Scripts and Add-Ins**.
 
-At the top you can choose which `NC Program` to use. You may have any 
-number of NC Programs, using them to easily switch between post processors, 
-output folders, or any options. Note that some settings are managed by
-`Post Process All` and will have no effect if you change them. These
-include `Name/number`, `File name`, and `Operations`. The browser may
-mark the `NC Program` with an error symbol, but this can be ignored.
+#### Uninstalling
+Open **Scripts and Add-Ins** (`Shift+S`) → **Add-Ins**, click **Stop** and remove `PostProcessAll` from *My Add-Ins*, then delete the `PostProcessAll` folder.
 
-Once `Post Process All` has been run, all settings will be saved in
-the design. New designs will also be given default settings.
+---
 
-### Subfolders
-You can put the output files into subfolders by using a colon (":") in
-the name. The part of the name to the left of the colon is the folder
-name; multiple colons result in nested subfolders.
+### Workflow & Features
 
-Here is an example of a design with three components. The name of the
-component appears first, then a colon and the name of a setup for
-that component:
+#### Multi-NC-Program Dialog & Naming
+- **NC Program Checklist**: Displays all document `NC Program` entries in a table with a left-aligned **Select All** header row, along with each program's target setup and resolved output filename. If no `NC Program` exists yet, one is created automatically.
+- **Right-Click Context Pre-Selection**: Right-clicking an `NC Program` pre-checks that program; right-clicking `NC Programs` pre-checks all programs; right-clicking a `Setup` pre-checks every `NC Program` referencing that setup.
+- **Output Naming (`nc_program_filename`)**: Every `NC Program` always outputs using its configured `nc_program_filename` parameter (falling back to the `NC Program` name, then the setup name). Duplicate target paths across selected programs are detected before execution starts.
+- **Subfolders (`:`)**: Use a colon (`:`) in `nc_program_filename` to organize output files into nested subfolders inside the NC Program's output folder (e.g., `Cover:Part1` writes `<OutputFolder>/Cover/Part1.nc`).
+- **Pre-Flight Prompts & Single Progress Dialog**: Runs empty/invalid toolpath checks and existing-file overwrite confirmations once across the entire batch before posting under a single progress bar, restoring original NC Program parameters on completion.
+- **Modeless Verification Toast**: Displays a compact floating notification with per-program verification status (`NC`, `Report`, `Plot`, `Folder` quick-open actions and `Dismiss`). Clean single- or multi-program runs auto-dismiss after 2 seconds unless interacted with; warnings or collision failures remain open until dismissed.
 
-![Setup Image](https://raw.githubusercontent.com/TimPaterson/Fusion360-Batch-Post/master/ReadMeImages/SetupImage.PNG)
-
-When you run the `Post Process All` command, it will create three
-subfolders in the output folder, named "Cover", "Block", and "Insulator".
-Within these subfolders will be five, three, and five G-code files
-respectively with names like "first long edge", "second long edge", etc.
-
-### Sequence Numbers
-A sequence number can be added to the front of each file name. This
-provides a reminder of the order of operations and will generally
-keep the files sorted in that order. Sequence numbers start at 1 for
-each folder.
-
-In the above example, when adding sequence numbers the files in
-the "Block" folder would have the names "1 first edge" and "2 second
-edge".
-
-### Fusion for Personal Use
-The free version of Fusion now has some limitations on G-code
-output: It will not support tool changes, and it slows down all
-moves to feed rate. `Post Process All` can work around the tool change
-limitation and can attempt to restore rapid moves.
-
-In the `Personal Use` section of the `Post Process All` dialog, you will find
-the option to break each setup into individual operations. This 
-is required if you have the free version of Fusion and there
-is a tool change in any setup. `Post Process All` will combine the G-code
-for each operation of a setup back into a single file for that
-setup, hiding this limitation. Since there is no example of a
-tool change in the G-code generated by Fusion, there is a
-box to type in any additional G-codes needed when a tool change 
-is made (such as turning off coolant, etc.).
-
-In addition, you can also select the option to restore rapid (G0) 
-moves. This analysis is experimental and should be reviewed 
-before use (comments are included where the G-code is changed).
-You are responsible for ensuring a tool crash does not occur.
+---
 
 ### Unified Toolpath Verification, Collision-Free Rapid Promotion & Diagnostics
 `Post Process All` includes a complete In-Process Workpiece (IPW) simulation and toolpath verifier for both **Milling** and **Turning** setups using a clean 2-pass architecture:
@@ -94,95 +48,24 @@ You are responsible for ensuring a tool crash does not occur.
 - **Full Stock Mode Support**:
   - **Parametric Stock**: Box, Cylinder, and Tube stock definitions (`FixedBoxStock`, `RelativeBoxStock`, `FixedCylinderStock`, `RelativeCylinderStock`, `FixedTubeStock`, `RelativeTubeStock`).
   - **From Solid (`SolidStock`)**: Extracts B-Rep and MeshBody stock geometry directly from Fusion, transforms vertices into the setup WCS, and builds an exact 3D heightfield or axisymmetric turning envelope.
-  - **From Preceding Setup (`PreviousSetupStock`)**: Automatically triggers Fusion CAM's native in-process stock STL export (`exportStock` via `universal_dumper_export_stock.cps`), validates unit scale against `workpieceHint`, and verifies toolpath/stock bounding-box alignment.
+  - **From Preceding Setup (`PreviousSetupStock`)**: Automatically triggers Fusion CAM's native in-process stock STL export, validates unit scale against `workpieceHint`, and verifies toolpath/stock bounding-box alignment.
 - **Unified Verification Simulation**:
   - **Milling (`geometry/heightfield_engine.py`)**: Vectorized 3D Heightfield grid simulation tracking material removal, gouges, shank rubs, holder strikes, and rapids into stock (with `MillClearanceVerifier` fallback when NumPy is unavailable).
   - **Turning (`geometry/lathe_engine.py`)**: Exact 2D axisymmetric IPW polygon simulation using `shapely`, tracking swept inserts and holders, fixture/chuck guard monitoring, and dynamic Constant Surface Speed (`G96` CSS) spindle RPM modeling clamped by `maximumSpindleSpeed`.
   - **Universal Collision Detection**: Detects `RAPID_INTO_STOCK`, `HOLDER_STRIKE`, `FIXTURE_COLLISION`, and `SHANK_RUB`, logging detailed diagnostics while continuing final NC code generation.
-- **Collision-Free Rapid Promotion**: When **Restore rapid moves** is enabled, verified air moves with zero material removal and safe cutter/holder clearances are promoted to `G0` using per-event `(sec_idx, event_idx)` addressing:
-  - Enforces a uniform caller-level **`1.5 mm` minimum travel length filter** (`DEFAULT_MIN_PROMOTE_LEN_MM = 1.5`) so tiny micro-segments are never promoted to `G0`.
+- **Collision-Free Rapid Promotion**: When **Restore rapid moves (G0)** is enabled, verified air moves with zero material removal and safe cutter/holder clearances are promoted to `G0` using per-event `(sec_idx, event_idx)` addressing:
+  - Enforces a uniform **`1.5 mm` minimum travel length filter** (`DEFAULT_MIN_PROMOTE_LEN_MM = 1.5`) so tiny micro-segments are never promoted to `G0`.
   - Automatically disables promotion when the target post processor uses dog-leg rapid mapping (`highFeedMapping != 0` or `useG0 = false`).
   - Blocks promotion inside canned cycles (`in_cycle`), during active cutter radius compensation (`rc != 0` or compensation transitions), on synchronized moves (`sync`), or on any event with a detected collision.
 - **Pass 2 (Single-Pass Vendor Replay)**: Emits final machine-dialect NC code by executing the user's unmodified vendor post processor (`universal_replayer.cps`) once across all merged sections, natively preserving tool changes and modal states.
-- **Diagnostics & High-Resolution Reports**: For each setup, generates a comprehensive markdown report (`<Setup>_report.md`) detailing operation metrics, stock/toolpath alignment bounds, MRR spikes, and collision breakdowns, accompanied by a high-resolution visual verification plot (`<Setup>.png`).
-- **Installing Verifier Dependencies**: Run `python install_packages.py` once to install required dependencies (`shapely`, `numpy`, `matplotlib`) for Windows (`win_amd64`), macOS (`arm64`/`x86_64`), or Linux.
+- **Diagnostics & High-Resolution Reports**: Generates per-setup markdown reports (`<Output>_report.md`) with per-operation MRR spike analysis, stock/toolpath alignment bounds, and collision breakdowns, plus verification plots (`<Output>.png`).
 
-### Rename Setups
-`Post Process All` can perform a search-and-replace on setup names.
-Like post processing, the search will apply to all setups unless you select specific setups
-and check the box `Only selected setups`. This is a great way to collect
-a group of setups into a subfolder, for example.
-
-A special case has been added to make it easy to insert text 
-(such as a folder name) at the beginning of a setup name. If the
-search string is empty, the text in the `Replace with this string` 
-field will be prepended to each setup name.
-
-The search-and-replace is executed immediately when you click the
-![image](https://raw.githubusercontent.com/TimPaterson/Fusion360-Batch-Post/master/resources/Rename/16x16.png)
-icon. You can then cancel 'Post Process All' if that's all you want to do.
-Review the changes to make sure everything looks right, and you can
-use Fusion's `Undo` command if necessary.
-
-### Installation
-To install, start by putting the `PostProcessAll.py` and 
-`PostProcessAll.manifest` files along with
-the `resources` subfolder into a folder on your machine. This can
-be a Git repository or just a copy of the files. (The `ReadMe.md`
-file and `ReadMeImages` folder are not required.) Using Git is
-recommended (newcomers see below) because it makes it easy to
-come back and get updates.
-
-In Fusion, go to the `Tools` tab in the `Design` workspace, or the
-`Utilities` tab in the `Manufacture` workspace. Select the
-`Scripts and Add-Ins` command, which will bring up the `Scripts and Add-Ins` dialog.
-Filter by `Add-Ins`, then click the `+` and select `Script or add-in from device` .
-You can now browse to the folder in which you placed the
-`Post Process All` add-in files.
-
-Once the folder is selected, you will be returned to the `Scripts and Add-Ins` dialog
-and find that `PostProcessAll` now appears in the list.
-Select it in the list, ensure `Run on Startup` is checked, and then
-click the switch in the `Run` column. The dialog closes immediately.
-If you open it again, it should something like this:
-
-![AddIn Image](https://raw.githubusercontent.com/TimPaterson/Fusion360-Batch-Post/master/ReadMeImages/FusionAddIn.PNG)
-
-To see the new command, go to the `Manufacture` workspace and select the
-`Milling` or `Turning`tab. The command appears on the toolbar next to
-the native Post Process command. It also appears in the Actions
-drop-down menu.
-
-**New to Git?** A nice Git GUI is [GitHub Desktop](https://desktop.github.com/download/). 
-You just click `Clone repository...` on the `File` menu, select the `URL` tab, 
-and paste in the address of this web page. That will
-bring in a copy of `Post Process All` that's ready to use. To update, click
-`Pull` on the `Repository` menu.
-
-### Issues
-If `Post Process All` fails, run it again. There seem to be occasional timing 
-issues that usually resolve themselves.
-
-The concatenation and modification of G-code has been only been lightly
-tested, and work is ongoing. Given that there are
-very specific assumptions about what the G-code input will look like,
-it would not be surprising to find problems come up. If you report a 
-problem on the Issues page, be sure to specify what post processor
-you are using and include the G-code files.
+---
 
 ### Compatibility
-Compatibility can be an issue if you have Fusion for Personal Use and
-therefore select the `Use individual operations` option. This requires
-parsing the G-code, which is dependent on the post processor you use.
+Here is a list of post processors that have been tested with `Post Process All`:
 
-Here is a list of the post processors that have been tested with `Post Process All`.
-The `Review OK?` column means a visual inspection of output, while
-`Tested` means it has been run on the CNC machine. The remaining entries
-are the suggested option settings for that post processor.
-This table is based on user feedback. Please add an issue for
-corrections or additions.
-
-| Post Processor | Review OK? | Tested | Tool change |  Numeric Name | File Ext. |
+| Post Processor | Review OK? | Tested | Tool change | Numeric Name | File Ext. |
 |----           | :----: | :----: |----    | :----: |---- |
 | centroid.cps  | Yes | Yes |                        | Yes | .nc  |
 | eding.cps     | Yes | No  | N10 M9:G28             | No  | .cnc |

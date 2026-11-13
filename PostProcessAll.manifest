@@ -4,9 +4,9 @@
 	"id":	"fec886de-a491-46e4-84c5-2bc0d4549040",
 	"author":	"Tim Paterson",
 	"description":	{
-		"":	"Post process all CAM setups, optionally putting G-code files in subfolders and prepending a sequence number."
+		"":	"Batch post-process CAM NC Programs with 3D/2D stock collision verification and safe G0 rapid restoration."
 	},
-	"version":	"2.1.5",
+	"version":	"3.0.0",
 	"runOnStartup":	true,
 	"supportedOS":	"windows|mac",
 	"editEnabled":	true

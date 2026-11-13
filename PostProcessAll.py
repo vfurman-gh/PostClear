@@ -234,7 +234,8 @@ def run(context):
     global settingsMgr
     ui = None
     try:
-        _EnsureLocalModulesLoaded(force=True)
+        is_app_startup = bool(isinstance(context, dict) and context.get("IsApplicationStartup"))
+        _EnsureLocalModulesLoaded(force=True, allow_bootstrap=(not is_app_startup))
         settingsMgr = SettingsManager()
         app = adsk.core.Application.get()
         ui  = app.userInterface
@@ -2295,39 +2296,125 @@ def _ExtractPostProperties(program=None) -> dict:
 
 
 _modules_loaded_session = False
+_deps_bootstrap_attempted = False
+_deps_bootstrap_warned_session = False
 
 
-def _EnsureLocalModulesLoaded(force=False):
+def _EnsureLocalModulesLoaded(force=False, allow_bootstrap=True, progress_cb=None):
     """Ensure Add-In directory and packages are on sys.path and reload local modules once per session."""
-    global _modules_loaded_session
+    global _modules_loaded_session, _deps_bootstrap_attempted, _deps_bootstrap_warned_session
+    import importlib
     import sys
+
     if constAddonDir not in sys.path:
         sys.path.insert(0, constAddonDir)
-    if sys.version_info >= (3, 14) and os.path.isdir(constPackagesDir) and constPackagesDir not in sys.path:
-        sys.path.insert(0, constPackagesDir)
 
     # Do not reload modules during automated test execution to preserve Enum and Class identities.
     # Note: vendored pyparsing.testing imports 'unittest' in production Fusion 360 when plotting,
-    # so check whether 'adsk' is a real C++ extension module on disk (__file__ is a string) vs a test mock.
+    # and Fusion's 'adsk' is a PEP 420 namespace package (adsk.__file__ is None while adsk.core.__file__ is a path).
     _adsk_mod = sys.modules.get("adsk")
+    _adsk_core = sys.modules.get("adsk.core") or getattr(_adsk_mod, "core", None)
+    _has_real_adsk = (
+        isinstance(getattr(_adsk_mod, "__file__", None), str)
+        or isinstance(getattr(_adsk_core, "__file__", None), str)
+    )
     _is_test_env = bool(
         os.environ.get("PYTEST_CURRENT_TEST")
-        or (
-            "unittest" in sys.modules
-            and not isinstance(getattr(_adsk_mod, "__file__", None), str)
-        )
+        or ("unittest" in sys.modules and not _has_real_adsk)
     )
+
+    dep_bootstrap = None
+    try:
+        if force and not _is_test_env and "dep_bootstrap" in sys.modules:
+            importlib.reload(sys.modules["dep_bootstrap"])
+        import dep_bootstrap as _dep_bs
+        dep_bootstrap = _dep_bs
+        dep_bootstrap.configure_packages_sys_path(constAddonDir)
+    except Exception as exc:
+        _dbg_global(f"_EnsureLocalModulesLoaded dep_bootstrap import/path note: {exc}")
+        if os.path.isdir(constPackagesDir) and constPackagesDir not in sys.path:
+            sys.path.insert(0, constPackagesDir)
+
     if _is_test_env:
         return
 
-    if _modules_loaded_session and not force:
+    did_bootstrap = False
+    if allow_bootstrap and (not _deps_bootstrap_attempted or force) and dep_bootstrap is not None:
+        try:
+            missing = dep_bootstrap.check_missing_runtime_packages()
+            if not missing:
+                _deps_bootstrap_attempted = True
+            else:
+                _dbg_global(f"_EnsureLocalModulesLoaded: missing runtime packages {missing}; bootstrapping...")
+                progress = None
+                ui = None
+                try:
+                    app = adsk.core.Application.get() if ("adsk" in sys.modules and hasattr(adsk, "core")) else None
+                    ui = getattr(app, "userInterface", None) if app else None
+                except Exception:
+                    ui = None
+                if progress_cb is not None:
+                    try:
+                        progress_cb(
+                            "First-time setup — installing verification libraries (numpy, shapely, matplotlib)...",
+                            0.02,
+                        )
+                        if "adsk" in sys.modules and hasattr(adsk, "doEvents"):
+                            adsk.doEvents()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        if ui and hasattr(ui, "createProgressDialog"):
+                            progress = ui.createProgressDialog()
+                            progress.isCancelButtonShown = False
+                            progress.show(
+                                "PostProcessAll",
+                                "PostProcessAll: First-time setup — installing verification libraries...",
+                                0,
+                                0,
+                            )
+                            if hasattr(adsk, "doEvents"):
+                                adsk.doEvents()
+                    except Exception:
+                        progress = None
+                ok = False
+                try:
+                    ok, target_dir, detail = dep_bootstrap.install_runtime_packages(constAddonDir)
+                    importlib.invalidate_caches()
+                    dep_bootstrap.configure_packages_sys_path(constAddonDir)
+                    if ok:
+                        did_bootstrap = True
+                        _deps_bootstrap_attempted = True
+                        _deps_bootstrap_warned_session = False
+                    _dbg_global(f"_EnsureLocalModulesLoaded bootstrap ok={ok} dir={target_dir}: {detail}")
+                finally:
+                    if progress is not None:
+                        try:
+                            progress.hide()
+                        except Exception:
+                            pass
+                if not ok and not _deps_bootstrap_warned_session and ui is not None and hasattr(ui, "messageBox"):
+                    _deps_bootstrap_warned_session = True
+                    try:
+                        ui.messageBox(
+                            "PostProcessAll could not download verification libraries (numpy, shapely, matplotlib) — please check your internet connection.\n\n"
+                            "Milling will use basic clearance verification (without plots); Turning verification requires these libraries. "
+                            "PostProcessAll will retry automatically on the next run once online."
+                        )
+                    except Exception:
+                        pass
+        except Exception as exc:
+            _dbg_global(f"_EnsureLocalModulesLoaded self-heal bootstrap error: {exc}")
+
+    if _modules_loaded_session and not force and not did_bootstrap:
         return
     _modules_loaded_session = True
 
-    import importlib
-    # Reload in strict topological dependency order starting with geometry.models
+    # Reload in strict topological dependency order starting with dep_bootstrap and geometry.models
     # so all downstream modules share identical Enum and dataclass type objects.
     ordered_mods = (
+        "dep_bootstrap",
         "geometry.models",
         "geometry.engine_interface",
         "geometry.stock_generator",
@@ -3484,7 +3571,7 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
     _dbg(f"_PostProcessUnifiedPipeline entered for {fname}, path={path}, is_turning={is_turning}")
 
     # 0. Ensure Add-In modules are on sys.path and reloaded in Fusion's persistent interpreter
-    _EnsureLocalModulesLoaded()
+    _EnsureLocalModulesLoaded(progress_cb=_notify_p)
 
     if program is None:
         try:

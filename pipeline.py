@@ -577,7 +577,13 @@ class PipelineOrchestrator:
             _notify(f"Pass 2: Simulating stock & collisions ({'turning' if is_turning else 'milling'})...", 0.50)
             if verifier is None:
                 if is_turning:
-                    from geometry.lathe_engine import Lathe2DIPWVerifier
+                    try:
+                        from geometry.lathe_engine import Lathe2DIPWVerifier
+                    except ImportError as exc:
+                        raise RuntimeError(
+                            "Turning 2D IPW verification requires 'shapely', which is not installed "
+                            "(offline first-time setup failed). Connect to the internet and re-run Post Process All."
+                        ) from exc
                     verifier = Lathe2DIPWVerifier(tool_scale_to_mm=1.0)
                 else:
                     try:

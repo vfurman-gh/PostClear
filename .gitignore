@@ -5,3 +5,4 @@ __pycache__/
 packages/
 .venv/
 Screenshot*.png
+dist/
