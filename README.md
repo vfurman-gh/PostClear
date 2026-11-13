@@ -17,18 +17,18 @@ As a bonus, PostClear generates high-resolution material removal rate (MRR) plot
 
 No separate Python installation or command-line setup is needed.
 
-1. **Download and extract:** Download `PostClear-v3.0.0.zip` from **Releases** and unzip the `PostClear` folder wherever you keep Fusion add-ins (for example, `Documents/FusionAddIns/PostClear`). Keep the folder named **PostClear**.
-   * *Git users:* Clone directly (creates the `PostClear` folder automatically):
+1. **Download and extract:** Download the latest release archive from [GitHub Releases](https://github.com/vfurman-gh/PostClear/releases) and unzip the PostClear folder wherever you keep Fusion add-ins (for example, `Documents/FusionAddIns/PostClear`). Keep the folder named `PostClear`.
+   * Git users: Clone directly (creates the `PostClear` folder automatically):
      ```bash
      git clone https://github.com/vfurman-gh/PostClear.git
      ```
-2. **Add to Fusion 360:** Open Fusion 360 and go to **Utilities → ADD-INS → Scripts and Add-Ins** (shortcut: **Shift+S**). Switch to the **Add-Ins** tab, click **`+`** next to *My Add-Ins*, and select your `PostClear` folder.
-3. **Enable and run:** Check **Run on Startup** and click **Run**.
+2. **Add to Fusion 360:** Open Fusion 360 and go to Utilities → ADD-INS → Scripts and Add-Ins (shortcut: Shift+S). Switch to the Add-Ins tab, click `+` next to My Add-Ins, and select your `PostClear` folder.
+3. **Enable and run:** Check Run on Startup and click Run.
 
 On first use, the add-in uses Fusion's built-in Python to download its verification libraries (NumPy, Shapely, and Matplotlib) into `PostClear/packages/`. This takes roughly 5–10 seconds once, and automatically refreshes itself whenever Autodesk updates Fusion's internal Python version.
 
-* **Update:** Replace the folder contents with the new release (keep `PostClear.settings` if present), or run `git pull`, then restart Fusion or Stop/Run the add-in in **Shift+S**.
-* **Uninstall:** Open **Scripts and Add-Ins** (**Shift+S**) → **Add-Ins**, click **Stop**, remove **PostClear** from *My Add-Ins*, and delete the folder.
+* **Update:** Replace the folder contents with the new release (keep `PostClear.settings` if present), or run `git pull`, then restart Fusion or Stop/Run the add-in in Scripts and Add-Ins.
+* **Uninstall:** Open Scripts and Add-Ins (Shift+S) → Add-Ins, click Stop, remove PostClear from My Add-Ins, and delete the folder.
 * **Offline first run:** Milling falls back to basic clearance checks without plots; connect to the internet once so full 3D/2D simulation and plotting libraries can download.
 
 ---
