@@ -121,7 +121,7 @@ from geometry.solid_mesh import (
     revolve_mesh_to_lathe_stock,
     transform_design_points_to_setup_wcs,
 )
-import PostProcessAll
+import PostClear
 
 
 class TestSolidMeshStock(unittest.TestCase):
@@ -542,10 +542,10 @@ class TestSolidMeshStock(unittest.TestCase):
             mock_report.mrr_spikes = []
             mock_report.summary_text = "Verification Success"
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll._ResolveBasePostPath", return_value=dummy_cps), \
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear._ResolveBasePostPath", return_value=dummy_cps), \
                  patch("pipeline.PipelineOrchestrator.run", return_value=(mock_report, "G0 X0 Y0")):
-                res = PostProcessAll._PostProcessUnifiedPipeline(
+                res = PostClear._PostProcessUnifiedPipeline(
                     fname="Op1SolidMilling",
                     setup=mock_setup,
                     setupFolder=tmp_dir,
@@ -695,8 +695,8 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
             )
         self.assertIn("uses 'From Previous Setup' stock", str(cm.exception))
 
-    def test_postprocessall_unified_pipeline_previous_setup_proceeds_to_pass_1(self):
-        import PostProcessAll
+    def test_postclear_unified_pipeline_previous_setup_proceeds_to_pass_1(self):
+        import PostClear
         import json
         mock_setup = MagicMock()
         mock_setup.name = "Op2PrecedingSetup"
@@ -748,10 +748,10 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
         mock_report.mrr_spikes = []
         mock_report.summary_text = "Verification Success"
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-             patch("PostProcessAll._ResolveBasePostPath", return_value=dummy_cps), \
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+             patch("PostClear._ResolveBasePostPath", return_value=dummy_cps), \
              patch("pipeline.PipelineOrchestrator.run", return_value=(mock_report, "G0 X0 Y0")):
-            res = PostProcessAll._PostProcessUnifiedPipeline(
+            res = PostClear._PostProcessUnifiedPipeline(
                 fname="Op2PrecedingSetup",
                 setup=mock_setup,
                 setupFolder=self.tmp_dir,
@@ -1022,7 +1022,7 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
                 os.environ["DUMPER_CONFIG_PATH"] = old_env
 
     def test_notify_post_process_result_propagates_skip_errors_in_details(self):
-        import PostProcessAll
+        import PostClear
         mock_ui = MagicMock()
         mock_ui.palettes = MagicMock()
 
@@ -1032,9 +1032,9 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
         ]
         skip_msg = "Failed on setup Setup2: PostProcess pipeline error: Setup 'Setup2' uses 'From Previous Setup' stock, but Fusion 360 did not produce a preceding stock mesh."
 
-        with patch("PostProcessAll._BuildNotificationHTML") as mock_build_html, \
-             patch("PostProcessAll.open", unittest.mock.mock_open(), create=True):
-            PostProcessAll._NotifyPostProcessResult(
+        with patch("PostClear._BuildNotificationHTML") as mock_build_html, \
+             patch("PostClear.open", unittest.mock.mock_open(), create=True):
+            PostClear._NotifyPostProcessResult(
                 ui=mock_ui,
                 cntFiles=1,
                 cntSkipped=1,
@@ -1051,7 +1051,7 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
             self.assertIn("From Previous Setup", details)
 
     def test_postprocesssetup_warns_when_preceding_stock_missing_and_cancels_on_no(self):
-        import PostProcessAll
+        import PostClear
         mock_ui = MagicMock()
         mock_ui.messageBox.return_value = adsk.core.DialogResults.DialogNo
 
@@ -1085,8 +1085,8 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
         mock_prog = MagicMock()
         mock_prog.parameters.itemByName.return_value = None
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app):
-            ret = PostProcessAll.PostProcessSetup(
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app):
+            ret = PostClear.PostProcessSetup(
                 fname="Setup2",
                 setup=s2,
                 setupFolder=self.tmp_dir,
@@ -1102,7 +1102,7 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
             self.assertEqual(ret, "Operation cancelled by user.")
 
     def test_postprocesssetup_warns_when_preceding_stock_missing_and_proceeds_on_yes(self):
-        import PostProcessAll
+        import PostClear
         mock_ui = MagicMock()
         mock_ui.messageBox.return_value = adsk.core.DialogResults.DialogYes
 
@@ -1133,9 +1133,9 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
         mock_prog = MagicMock()
         mock_prog.parameters.itemByName.return_value = None
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-             patch("PostProcessAll._PostProcessUnifiedPipeline", return_value=None) as mock_unified:
-            ret = PostProcessAll.PostProcessSetup(
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+             patch("PostClear._PostProcessUnifiedPipeline", return_value=None) as mock_unified:
+            ret = PostClear.PostProcessSetup(
                 fname="Setup2",
                 setup=s2,
                 setupFolder=self.tmp_dir,
@@ -1316,18 +1316,18 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
 
     def test_get_document_stock_unit_helper(self):
         """H2: _GetDocumentStockUnit detects 'mm' or 'in' from unitsManager."""
-        import PostProcessAll
+        import PostClear
         mock_doc = MagicMock()
         mock_doc.unitsManager.defaultLengthUnits = "in"
-        self.assertEqual(PostProcessAll._GetDocumentStockUnit(mock_doc), "in")
+        self.assertEqual(PostClear._GetDocumentStockUnit(mock_doc), "in")
 
         mock_doc.unitsManager.defaultLengthUnits = "mm"
-        self.assertEqual(PostProcessAll._GetDocumentStockUnit(mock_doc), "mm")
+        self.assertEqual(PostClear._GetDocumentStockUnit(mock_doc), "mm")
 
         mock_doc.unitsManager.defaultLengthUnits = "inches"
-        self.assertEqual(PostProcessAll._GetDocumentStockUnit(mock_doc), "in")
+        self.assertEqual(PostClear._GetDocumentStockUnit(mock_doc), "in")
 
-        self.assertEqual(PostProcessAll._GetDocumentStockUnit(None), "mm")
+        self.assertEqual(PostClear._GetDocumentStockUnit(None), "mm")
 
     def test_pipeline_stl_overlap_milling(self):
         """H4: Milling STL stock requires >= 50% toolpath bounding-box volume overlap."""
@@ -1559,7 +1559,7 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
         """Verify universal_dumper_export_stock.cps enables exportStock in post --interrogate safe mode."""
         import shutil
         import subprocess
-        import PostProcessAll
+        import PostClear
         from pipeline import find_autodesk_post_binary
 
         with open("universal_dumper.cps", "r", encoding="utf-8") as f:
@@ -1567,7 +1567,7 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
         self.assertIn("getConfigurationPath", cps_src)
         self.assertIn("export_stock", cps_src)
 
-        cfg_path = PostProcessAll._WriteDumperConfig(
+        cfg_path = PostClear._WriteDumperConfig(
             target_dir=self.tmp_dir,
             stock_mode="previous-setup",
             export_stock=True,

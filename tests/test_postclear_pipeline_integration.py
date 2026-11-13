@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test Suite: PostProcessAll.py Integration with Unified 2-Pass Pipeline.
+Test Suite: PostClear.py Integration with Unified 2-Pass Pipeline.
 
 Validates:
 1. Pass 1 context extraction via universal_dumper.cps with zero Post Library mutation.
@@ -105,7 +105,7 @@ if not hasattr(adsk.cam, "PostProcessInput"):
             return inst
     adsk.cam.PostProcessInput = MockPostProcessInput
 
-from PostProcessAll import verifyResults, _RecordVerifyResult
+from PostClear import verifyResults, _RecordVerifyResult
 
 
 class DummySetup:
@@ -116,7 +116,7 @@ class DummySetup:
         self.operationType = 1 if is_turning else 0
 
 
-class TestPostProcessAllPipelineIntegration(unittest.TestCase):
+class TestPostClearPipelineIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -131,7 +131,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_dumper_and_replayer_scripts_exist(self):
         """Verify constDumperScript and constReplayerScript point to existing .cps scripts."""
-        from PostProcessAll import constDumperScript, constReplayerScript
+        from PostClear import constDumperScript, constReplayerScript
         self.assertTrue(os.path.isfile(constDumperScript))
         self.assertTrue(os.path.isfile(constReplayerScript))
         self.assertTrue(constDumperScript.endswith("universal_dumper.cps"))
@@ -186,7 +186,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_record_verify_result_with_warning(self):
         """Verify _RecordVerifyResult records warnings and collision kinds properly."""
-        from PostProcessAll import _RecordVerifyResult, verifyResults
+        from PostClear import _RecordVerifyResult, verifyResults
         from geometry.models import CollisionRecord, CollisionKind, Vector3D
 
         setup = DummySetup(name="Collision Setup", is_turning=True)
@@ -216,7 +216,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_show_verify_results_does_not_popup_modal_dialog(self):
         """Verify ShowVerifyResults operates silently without modal dialog popups."""
-        from PostProcessAll import _RecordVerifyResult, ShowVerifyResults, verifyResults
+        from PostClear import _RecordVerifyResult, ShowVerifyResults, verifyResults
         from geometry.models import CollisionRecord, CollisionKind, Vector3D
 
         setup = DummySetup(name="Warning Setup", is_turning=False)
@@ -380,7 +380,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_non_modal_notifications_success_warning_and_failure(self):
         """Verify _NotifyPostProcessResult provides non-modal statusMessage & HTML toast without modal dialogs."""
-        from PostProcessAll import _NotifyPostProcessResult, constNotificationPaletteId
+        from PostClear import _NotifyPostProcessResult, constNotificationPaletteId
 
         created_palettes = {}
         class MockPalette:
@@ -496,8 +496,8 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
     def test_notification_event_handlers_and_action_urls(self):
         """Verify that action:// navigation links and HTML events properly route to file opening."""
         import urllib.parse
-        import PostProcessAll
-        from PostProcessAll import (
+        import PostClear
+        from PostClear import (
             _BuildNotificationHTML,
             _NotificationNavigationEventHandler,
             _NotificationHTMLEventHandler,
@@ -514,9 +514,9 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         self.assertIn('sendAction(event, \'open_file\'', html_out)
 
         opened_files = []
-        orig_open_file = PostProcessAll._OpenFile
+        orig_open_file = PostClear._OpenFile
         try:
-            PostProcessAll._OpenFile = lambda p: opened_files.append(p)
+            PostClear._OpenFile = lambda p: opened_files.append(p)
 
             # Test NavigationEventHandler
             nav_handler = _NotificationNavigationEventHandler(constNotificationPaletteId)
@@ -543,12 +543,12 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 html_handler.notify(mock_html_args)
                 self.assertIn(tf2.name, opened_files)
         finally:
-            PostProcessAll._OpenFile = orig_open_file
+            PostClear._OpenFile = orig_open_file
 
     def test_progress_dialog_advancement_and_auto_dismiss_timeout(self):
         """Verify progress updates advance percentages and notification auto-dismiss timer is 6 seconds."""
-        import PostProcessAll
-        from PostProcessAll import _BuildNotificationHTML
+        import PostClear
+        from PostClear import _BuildNotificationHTML
 
         # 1. Verify auto-dismiss timeout is 2 seconds (2000ms) on success, disabled on warning/error
         html = _BuildNotificationHTML("Done", "success", "OK", "", [])
@@ -579,12 +579,12 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_default_settings_and_manager_purged_del_options(self):
         """Verify delFiles and delFolder are eliminated from defaults and purged by SettingsManager."""
-        import PostProcessAll
+        import PostClear
 
-        self.assertNotIn("delFiles", PostProcessAll.defaultSettings)
-        self.assertNotIn("delFolder", PostProcessAll.defaultSettings)
+        self.assertNotIn("delFiles", PostClear.defaultSettings)
+        self.assertNotIn("delFolder", PostClear.defaultSettings)
 
-        mgr = PostProcessAll.SettingsManager()
+        mgr = PostClear.SettingsManager()
         legacy_dst = {
             "version": "1.0.0",
             "delFiles": True,
@@ -592,14 +592,14 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             "splitSetup": True,
             "restore_rapid": True,
         }
-        mgr.UpdateSettings(PostProcessAll.defaultSettings, legacy_dst)
+        mgr.UpdateSettings(PostClear.defaultSettings, legacy_dst)
         self.assertNotIn("delFiles", legacy_dst)
         self.assertNotIn("delFolder", legacy_dst)
         self.assertNotIn("splitSetup", legacy_dst)
 
     def test_perform_post_process_modal_overwrite_abort_on_no(self):
         """Verify modal prompt aborts before any progress dialog or posting if user selects No."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         class MockCamCollection(list):
@@ -656,7 +656,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
             def mock_msgbox(prompt, title, btn_type, icon_type):
                 msgbox_calls.append((prompt, title, btn_type, icon_type))
-                return PostProcessAll.adsk.core.DialogResults.DialogNo
+                return PostClear.adsk.core.DialogResults.DialogNo
 
             mock_ui = MagicMock()
             mock_ui.messageBox.side_effect = mock_msgbox
@@ -667,17 +667,17 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app.activeDocument = mock_doc
 
             post_setup_calls = []
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)):
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                PostProcessAll.PerformPostProcess(doc_settings, setups=[mock_setup])
+                doc_settings = dict(PostClear.defaultSettings)
+                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
 
             self.assertEqual(len(msgbox_calls), 1, "Must prompt user with modal messageBox")
             prompt, title, btn_type, icon_type = msgbox_calls[0]
             self.assertIn("Prog.nc", prompt)
             self.assertIn("already exists", prompt)
-            self.assertEqual(btn_type, PostProcessAll.adsk.core.MessageBoxButtonTypes.YesNoButtonType)
+            self.assertEqual(btn_type, PostClear.adsk.core.MessageBoxButtonTypes.YesNoButtonType)
             self.assertEqual(len(progress_created), 0, "Must NOT open progress dialog when aborted")
             self.assertEqual(len(post_setup_calls), 0, "Must NOT call PostProcessSetup when aborted")
 
@@ -687,7 +687,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_perform_post_process_modal_overwrite_proceed_on_yes(self):
         """Verify modal prompt proceeds with post-processing when user selects Yes."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         class MockCamCollection(list):
@@ -745,7 +745,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
             def mock_msgbox(prompt, title, btn_type, icon_type):
                 msgbox_calls.append((prompt, title, btn_type, icon_type))
-                return PostProcessAll.adsk.core.DialogResults.DialogYes
+                return PostClear.adsk.core.DialogResults.DialogYes
 
             mock_ui = MagicMock()
             mock_ui.messageBox.side_effect = mock_msgbox
@@ -756,19 +756,19 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app.activeDocument = mock_doc
 
             post_setup_calls = []
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)), \
-                 patch("PostProcessAll._NotifyPostProcessResult"):
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)), \
+                 patch("PostClear._NotifyPostProcessResult"):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                PostProcessAll.PerformPostProcess(doc_settings, setups=[mock_setup])
+                doc_settings = dict(PostClear.defaultSettings)
+                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
 
             self.assertEqual(len(msgbox_calls), 1)
             self.assertEqual(len(post_setup_calls), 1, "Must execute PostProcessSetup when confirmed with Yes")
 
     def test_perform_post_process_no_modal_prompt_when_file_not_existing(self):
         """Verify modal prompt is skipped when target output file does not already exist."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         class MockCamCollection(list):
@@ -829,19 +829,19 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app.activeDocument = mock_doc
 
             post_setup_calls = []
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)), \
-                 patch("PostProcessAll._NotifyPostProcessResult"):
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)), \
+                 patch("PostClear._NotifyPostProcessResult"):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                PostProcessAll.PerformPostProcess(doc_settings, setups=[mock_setup])
+                doc_settings = dict(PostClear.defaultSettings)
+                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
 
             self.assertEqual(len(msgbox_calls), 0, "No modal messageBox should be shown when file does not exist")
             self.assertEqual(len(post_setup_calls), 1, "Must proceed directly to PostProcessSetup")
 
     def test_perform_post_process_empty_toolpath_modal_abort_on_no(self):
         """Verify PerformPostProcess aborts without posting when user clicks No on empty toolpath prompt."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         class MockCamCollection(list):
@@ -895,7 +895,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             msgbox_calls = []
             mock_ui = MagicMock()
             mock_ui.messageBox.side_effect = lambda prompt, title, btn_type, icon_type: (
-                msgbox_calls.append((prompt, title, btn_type, icon_type)) or PostProcessAll.adsk.core.DialogResults.DialogNo
+                msgbox_calls.append((prompt, title, btn_type, icon_type)) or PostClear.adsk.core.DialogResults.DialogNo
             )
 
             mock_app = MagicMock()
@@ -903,23 +903,23 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app.activeDocument = mock_doc
 
             post_setup_calls = []
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)):
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                PostProcessAll.PerformPostProcess(doc_settings, setups=[mock_setup])
+                doc_settings = dict(PostClear.defaultSettings)
+                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
 
             self.assertEqual(len(msgbox_calls), 1, "Must prompt user with modal messageBox")
             prompt, title, btn_type, icon_type = msgbox_calls[0]
             self.assertIn("empty or invalid toolpaths", prompt)
             self.assertIn("OilLidSetup", prompt)
             self.assertIn("EmptyOp", prompt)
-            self.assertEqual(btn_type, PostProcessAll.adsk.core.MessageBoxButtonTypes.YesNoButtonType)
+            self.assertEqual(btn_type, PostClear.adsk.core.MessageBoxButtonTypes.YesNoButtonType)
             self.assertEqual(len(post_setup_calls), 0, "Must NOT call PostProcessSetup when aborted on No")
 
     def test_perform_post_process_empty_toolpath_modal_proceed_on_yes(self):
         """Verify PerformPostProcess posts ONLY valid operations when user clicks Yes on empty toolpath prompt."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         class MockCamCollection(list):
@@ -976,7 +976,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
             mock_ui = MagicMock()
             mock_ui.messageBox.side_effect = lambda prompt, title, btn_type, icon_type: (
-                msgbox_calls.append((prompt, title, btn_type, icon_type)) or PostProcessAll.adsk.core.DialogResults.DialogYes
+                msgbox_calls.append((prompt, title, btn_type, icon_type)) or PostClear.adsk.core.DialogResults.DialogYes
             )
             mock_ui.createProgressDialog.return_value = mock_progress
 
@@ -985,12 +985,12 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app.activeDocument = mock_doc
 
             post_setup_calls = []
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append((args, kwargs))), \
-                 patch("PostProcessAll._NotifyPostProcessResult"):
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append((args, kwargs))), \
+                 patch("PostClear._NotifyPostProcessResult"):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                PostProcessAll.PerformPostProcess(doc_settings, setups=[mock_setup])
+                doc_settings = dict(PostClear.defaultSettings)
+                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
 
             self.assertEqual(len(msgbox_calls), 1)
             self.assertEqual(len(post_setup_calls), 1, "Must proceed to PostProcessSetup on Yes")
@@ -1003,7 +1003,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_perform_post_process_multiple_setups_returns_error(self):
         """Verify PerformPostProcess aborts with an error when multiple setups are detected."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         mock_op1 = MagicMock()
@@ -1044,13 +1044,13 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_app.activeDocument = mock_doc
 
         post_setup_calls = []
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-             patch("PostProcessAll.GetNcProgram", return_value=mock_prog), \
-             patch("PostProcessAll.GetNcProgramSetupsAndOperations", return_value=([mock_setup1, mock_setup2], {mock_setup1: [mock_op1], mock_setup2: [mock_op2]})), \
-             patch("PostProcessAll.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)):
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+             patch("PostClear.GetNcProgram", return_value=mock_prog), \
+             patch("PostClear.GetNcProgramSetupsAndOperations", return_value=([mock_setup1, mock_setup2], {mock_setup1: [mock_op1], mock_setup2: [mock_op2]})), \
+             patch("PostClear.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)):
 
-            doc_settings = dict(PostProcessAll.defaultSettings)
-            res = PostProcessAll.PerformPostProcess(doc_settings, setups=[mock_setup1, mock_setup2])
+            doc_settings = dict(PostClear.defaultSettings)
+            res = PostClear.PerformPostProcess(doc_settings, setups=[mock_setup1, mock_setup2])
 
         self.assertIsNotNone(res, "PerformPostProcess must return an error string when multiple setups are detected")
         self.assertIn("Multiple setups detected", res)
@@ -1063,7 +1063,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_postprocess_setup_requires_target_operations_and_rejects_empty(self):
         """Verify PostProcessSetup requires target_operations and fails fast without UI prompts."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         mock_setup = MagicMock(name="Setup 1")
@@ -1071,16 +1071,16 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_ui = MagicMock()
         mock_app = MagicMock(userInterface=mock_ui)
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
              tempfile.TemporaryDirectory() as tmp_dir:
             # 1. Empty target_operations returns error string
-            res_empty = PostProcessAll.PostProcessSetup(
+            res_empty = PostClear.PostProcessSetup(
                 "Setup 1", mock_setup, tmp_dir, {}, mock_prog, target_operations=[]
             )
             self.assertEqual(res_empty, "No active operations specified to post process.")
 
             # 2. None target_operations returns error string
-            res_none = PostProcessAll.PostProcessSetup(
+            res_none = PostClear.PostProcessSetup(
                 "Setup 1", mock_setup, tmp_dir, {}, mock_prog, target_operations=None
             )
             self.assertEqual(res_none, "No active operations specified to post process.")
@@ -1090,7 +1090,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_post_process_setup_non_destructive_writeability_check(self):
         """Verify PostProcessSetup does not destroy/truncate existing file during initial write check."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1121,11 +1121,11 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app.activeDocument = mock_doc
             mock_app.userInterface = MagicMock()
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll._PostProcessUnifiedPipeline", return_value=None):
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear._PostProcessUnifiedPipeline", return_value=None):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                res = PostProcessAll.PostProcessSetup(
+                doc_settings = dict(PostClear.defaultSettings)
+                res = PostClear.PostProcessSetup(
                     file_name, mock_setup, tmp_dir, doc_settings, mock_program,
                     target_operations=[mock_op]
                 )
@@ -1138,7 +1138,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_pass1_direct_post_process_input_execution(self):
         """Verify Pass 1 uses direct cam.postProcess with PostProcessInput and zero Post Library sync."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1190,12 +1190,12 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                     f.write("G0 X0\nM30\n")
                 return MagicMock(returncode=0, stdout="", stderr="")
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")), \
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")), \
                  patch("pipeline.subprocess.run", side_effect=fake_subprocess_run):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                res = PostProcessAll._PostProcessUnifiedPipeline(
+                doc_settings = dict(PostClear.defaultSettings)
+                res = PostClear._PostProcessUnifiedPipeline(
                     fname="test_out",
                     setup=mock_setup,
                     setupFolder=tmp_dir,
@@ -1212,7 +1212,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             target_ops, post_in = post_calls[0]
             self.assertEqual(target_ops, mock_op)
             self.assertEqual(post_in.programName, "batch_0")
-            self.assertEqual(post_in.postConfiguration, PostProcessAll.constDumperScript)
+            self.assertEqual(post_in.postConfiguration, PostClear.constDumperScript)
             self.assertFalse(post_in.isOpenInEditor)
 
             # Verify universal_dumper.cps was NOT copied to local post library
@@ -1222,7 +1222,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_s1_s2_extract_workpiece_missing_stock_returns_none(self):
         """Verify _ExtractWorkpieceFromSetup and extract_workpiece_from_context return None when stock is absent."""
-        import PostProcessAll
+        import PostClear
         from context_parser import extract_workpiece_from_context
 
         # Mock setup with no stock parameters
@@ -1235,7 +1235,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             stockSolids = None
             models = None
 
-        self.assertIsNone(PostProcessAll._ExtractWorkpieceFromSetup(EmptySetup()))
+        self.assertIsNone(PostClear._ExtractWorkpieceFromSetup(EmptySetup()))
 
         # Context with zero/negative volume
         ctx_empty_milling = {
@@ -1320,17 +1320,17 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_b1_verify_checkbox_removed_and_verification_always_runs(self):
         """Verify that verifyGcode is removed from defaultSettings and obsolete settings cleaned up."""
-        import PostProcessAll
-        self.assertNotIn("verifyGcode", PostProcessAll.defaultSettings)
+        import PostClear
+        self.assertNotIn("verifyGcode", PostClear.defaultSettings)
 
-        mgr = PostProcessAll.SettingsManager()
+        mgr = PostClear.SettingsManager()
         dst = {"version": 16, "verifyGcode": True, "restore_rapid": True}
-        mgr.UpdateSettings(PostProcessAll.defaultSettings, dst)
+        mgr.UpdateSettings(PostClear.defaultSettings, dst)
         self.assertNotIn("verifyGcode", dst)
 
     def test_b2_progress_cancellation_aborts_pipeline(self):
         """Verify that returning False from progress_cb immediately aborts the pipeline."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         mock_setup = MagicMock()
@@ -1343,12 +1343,12 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
         cancelled_cb = lambda msg, frac: False
 
-        with patch("PostProcessAll._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")):
-            status = PostProcessAll._PostProcessUnifiedPipeline(
+        with patch("PostClear._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")):
+            status = PostClear._PostProcessUnifiedPipeline(
                 fname="test_cancel",
                 setup=mock_setup,
                 setupFolder="/tmp",
-                docSettings=dict(PostProcessAll.defaultSettings),
+                docSettings=dict(PostClear.defaultSettings),
                 program=mock_prog,
                 path="/tmp/test_cancel.nc",
                 fileExt=".nc",
@@ -1358,7 +1358,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_b4_nc_program_nc_extension_not_mutated(self):
         """Verify that PostProcessSetup does not mutate nc_program_nc_extension."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         mock_ext_value = MagicMock(value=".nc")
@@ -1387,14 +1387,14 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_setup.operationType = 0
         mock_setup.allOperations = [mock_op]
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-             patch("PostProcessAll._PostProcessUnifiedPipeline", return_value=None), \
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+             patch("PostClear._PostProcessUnifiedPipeline", return_value=None), \
              tempfile.TemporaryDirectory() as tmp_dir:
-            res = PostProcessAll.PostProcessSetup(
+            res = PostClear.PostProcessSetup(
                 fname="test_ext",
                 setup=mock_setup,
                 setupFolder=tmp_dir,
-                docSettings=dict(PostProcessAll.defaultSettings),
+                docSettings=dict(PostClear.defaultSettings),
                 program=mock_prog,
                 target_operations=[mock_op],
             )
@@ -1526,18 +1526,35 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
     def test_w2_temporary_directory_logging_and_sidecar(self):
         """Verify debug logging and sidecar configs use platform tempfile dir and tolerate missing /tmp."""
         import json
-        import PostProcessAll
+        import PostClear
         from unittest.mock import patch
 
-        self.assertTrue(PostProcessAll._LOG_PATH.startswith(tempfile.gettempdir()))
+        self.assertTrue(PostClear._LOG_PATH.startswith(tempfile.gettempdir()))
 
-        # Test _dbg_global writes to _LOG_PATH without throwing
-        PostProcessAll._dbg_global("Test log entry")
-        self.assertTrue(os.path.isfile(PostProcessAll._LOG_PATH))
+        # Test _dbg_global is gated by _debug_log_enabled and writes cleanly to scoped temp _LOG_PATH when enabled
+        saved_log_path = PostClear._LOG_PATH
+        saved_dbg_enabled = PostClear._debug_log_enabled
+        try:
+            with tempfile.TemporaryDirectory() as log_tmpdir:
+                scoped_log = os.path.join(log_tmpdir, "postclear_debug.log")
+                PostClear._LOG_PATH = scoped_log
+
+                PostClear._SetDebugLogEnabled(False)
+                PostClear._dbg_global("Suppressed log entry")
+                self.assertFalse(os.path.exists(scoped_log))
+
+                PostClear._SetDebugLogEnabled(True)
+                PostClear._dbg_global("Test log entry")
+                self.assertTrue(os.path.isfile(scoped_log))
+                with open(scoped_log, "r", encoding="utf-8") as f:
+                    self.assertIn("Test log entry", f.read())
+        finally:
+            PostClear._LOG_PATH = saved_log_path
+            PostClear._SetDebugLogEnabled(saved_dbg_enabled)
 
         # Test _WriteDumperConfig writes to per-run mkdtemp and sets DUMPER_CONFIG_PATH without touching /tmp or $TMPDIR
         with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
-            cfg_path = PostProcessAll._WriteDumperConfig(base_post_path=tmp_cps.name)
+            cfg_path = PostClear._WriteDumperConfig(base_post_path=tmp_cps.name)
             self.assertTrue(os.path.isfile(cfg_path))
             self.assertEqual(os.environ.get("DUMPER_CONFIG_PATH"), cfg_path)
             # Verify NOT written to $TMPDIR or /tmp
@@ -1547,28 +1564,28 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 cfg = json.load(f)
             self.assertEqual(cfg.get("basePost"), os.path.abspath(tmp_cps.name))
 
-            PostProcessAll._ClearDumperConfig()
+            PostClear._ClearDumperConfig()
             self.assertFalse(os.path.isfile(cfg_path))
             self.assertNotIn("DUMPER_CONFIG_PATH", os.environ)
 
     def test_w8_sanitize_path_segment(self):
         """Verify _SanitizePathSegment strips invalid Windows/POSIX filesystem characters and handles reserved names."""
-        import PostProcessAll
+        import PostClear
 
-        self.assertEqual(PostProcessAll._SanitizePathSegment("normal_folder"), "normal_folder")
-        self.assertEqual(PostProcessAll._SanitizePathSegment("Setup:Op1"), "Setup_Op1")
-        self.assertEqual(PostProcessAll._SanitizePathSegment("Bad<Folder>Name?*"), "Bad_Folder_Name")
-        self.assertEqual(PostProcessAll._SanitizePathSegment("TrailingDot."), "TrailingDot")
-        self.assertEqual(PostProcessAll._SanitizePathSegment("TrailingSpace   "), "TrailingSpace")
-        self.assertEqual(PostProcessAll._SanitizePathSegment("CON"), "_CON")
-        self.assertEqual(PostProcessAll._SanitizePathSegment("nul.txt"), "_nul.txt")
-        self.assertEqual(PostProcessAll._SanitizePathSegment("aux"), "_aux")
-        self.assertEqual(PostProcessAll._SanitizePathSegment(""), "unnamed")
-        self.assertEqual(PostProcessAll._SanitizePathSegment("   ...   "), "unnamed")
+        self.assertEqual(PostClear._SanitizePathSegment("normal_folder"), "normal_folder")
+        self.assertEqual(PostClear._SanitizePathSegment("Setup:Op1"), "Setup_Op1")
+        self.assertEqual(PostClear._SanitizePathSegment("Bad<Folder>Name?*"), "Bad_Folder_Name")
+        self.assertEqual(PostClear._SanitizePathSegment("TrailingDot."), "TrailingDot")
+        self.assertEqual(PostClear._SanitizePathSegment("TrailingSpace   "), "TrailingSpace")
+        self.assertEqual(PostClear._SanitizePathSegment("CON"), "_CON")
+        self.assertEqual(PostClear._SanitizePathSegment("nul.txt"), "_nul.txt")
+        self.assertEqual(PostClear._SanitizePathSegment("aux"), "_aux")
+        self.assertEqual(PostClear._SanitizePathSegment(""), "unnamed")
+        self.assertEqual(PostClear._SanitizePathSegment("   ...   "), "unnamed")
 
     def test_b9_recursive_output_folder_creation(self):
         """Verify PerformPostProcess creates nested output directory structure with parents=True."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1585,13 +1602,13 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app = MagicMock()
             mock_app.activeDocument = mock_doc
             mock_app.userInterface = None
-            mock_docSettings = dict(PostProcessAll.defaultSettings)
+            mock_docSettings = dict(PostClear.defaultSettings)
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll.GetNcProgram", return_value=mock_program), \
-                 patch("PostProcessAll.GetNcProgramSetupsAndOperations", return_value=([], {})), \
-                 patch("PostProcessAll.settingsMgr", MagicMock()):
-                res = PostProcessAll.PerformPostProcess(
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear.GetNcProgram", return_value=mock_program), \
+                 patch("PostClear.GetNcProgramSetupsAndOperations", return_value=([], {})), \
+                 patch("PostClear.settingsMgr", MagicMock()):
+                res = PostClear.PerformPostProcess(
                     mock_docSettings,
                     setups=[],
                 )
@@ -1616,13 +1633,13 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
     def test_a5_isolated_dumper_config_and_pipeline_unification(self):
         """Verify _WriteDumperConfig isolates config to target_dir and _ClearDumperConfig cleans env vars."""
         import json
-        import PostProcessAll
+        import PostClear
         with tempfile.TemporaryDirectory() as target_dir:
             base_post = os.path.join(target_dir, "fake.cps")
             with open(base_post, "w") as f:
                 f.write("// post")
             cnc_path = os.path.join(target_dir, "fake.cnc")
-            PostProcessAll._WriteDumperConfig(
+            PostClear._WriteDumperConfig(
                 base_post_path=base_post,
                 target_cnc_path=cnc_path,
                 post_properties={"prop1": "val1"},
@@ -1642,7 +1659,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             # Test cleanup
             os.environ["BASE_POST"] = os.path.abspath(base_post)
             os.environ["TARGET_INTERMEDIATE_CNC"] = os.path.abspath(cnc_path)
-            PostProcessAll._ClearDumperConfig(target_dir=target_dir)
+            PostClear._ClearDumperConfig(target_dir=target_dir)
 
             self.assertFalse(os.path.isfile(cfg_file))
             self.assertNotIn("DUMPER_CONFIG_PATH", os.environ)
@@ -1665,7 +1682,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_s4_s5_stock_extraction_units_and_wcs_centering(self):
         """Verify parameter unit parsing (S5) and bbox WCS axis centering check (S4)."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock
 
         # 1. Parameter expression with 'in', 'mm', 'cm', 'ft'
@@ -1688,7 +1705,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_setup.stockSolids.count = 0
         mock_setup.models.count = 0
 
-        wp = PostProcessAll._ExtractWorkpieceFromSetup(mock_setup)
+        wp = PostClear._ExtractWorkpieceFromSetup(mock_setup)
         self.assertIsNotNone(wp)
         self.assertAlmostEqual(wp.stock.outer_radius, 25.4, places=2)  # 2.0 in diameter -> 1.0 in radius = 25.4 mm
         self.assertAlmostEqual(wp.stock.z_max - wp.stock.z_min, 100.0, places=2)
@@ -1704,22 +1721,22 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_setup_offcenter.stockSolids.item.return_value = mock_body
         mock_setup_offcenter.models.count = 0
 
-        wp_off = PostProcessAll._ExtractWorkpieceFromSetup(mock_setup_offcenter)
+        wp_off = PostClear._ExtractWorkpieceFromSetup(mock_setup_offcenter)
         self.assertIsNone(wp_off)
 
 
     def test_b11_notification_placement(self):
         """Verify _NotifyPostProcessResult computes lower-right bounds from window query."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         mock_app = MagicMock()
         mock_ui = MagicMock()
         mock_ui.palettes.itemById.return_value = None
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
              patch("subprocess.check_output", return_value=b"0, 33, 1470, 923"):
-            PostProcessAll._NotifyPostProcessResult(
+            PostClear._NotifyPostProcessResult(
                 ui=mock_ui,
                 cntFiles=1,
                 cntSkipped=0,
@@ -1736,7 +1753,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_a2_post_capabilities_parsing_and_compatibility(self):
         """Verify _GetPostCapabilities parses .cps capabilities and filters correctly."""
-        import PostProcessAll
+        import PostClear
         with tempfile.TemporaryDirectory() as tmp_dir:
             turning_cps = os.path.join(tmp_dir, "custom_lathe.cps")
             with open(turning_cps, "w", encoding="utf-8") as f:
@@ -1750,36 +1767,31 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             with open(millturn_cps, "w", encoding="utf-8") as f:
                 f.write('description = "Custom MillTurn";\ncapabilities = CAPABILITY_MILLING | CAPABILITY_TURNING;\n')
 
-            self.assertTrue(PostProcessAll._IsPostCompatible(turning_cps, is_turning=True))
-            self.assertFalse(PostProcessAll._IsPostCompatible(turning_cps, is_turning=False))
+            self.assertTrue(PostClear._IsPostCompatible(turning_cps, is_turning=True))
+            self.assertFalse(PostClear._IsPostCompatible(turning_cps, is_turning=False))
 
-            self.assertFalse(PostProcessAll._IsPostCompatible(milling_cps, is_turning=True))
-            self.assertTrue(PostProcessAll._IsPostCompatible(milling_cps, is_turning=False))
+            self.assertFalse(PostClear._IsPostCompatible(milling_cps, is_turning=True))
+            self.assertTrue(PostClear._IsPostCompatible(milling_cps, is_turning=False))
 
-            self.assertTrue(PostProcessAll._IsPostCompatible(millturn_cps, is_turning=True))
-            self.assertTrue(PostProcessAll._IsPostCompatible(millturn_cps, is_turning=False))
+            self.assertTrue(PostClear._IsPostCompatible(millturn_cps, is_turning=True))
+            self.assertTrue(PostClear._IsPostCompatible(millturn_cps, is_turning=False))
 
 
-    def test_path_helpers_extension_and_folder_resolution(self):
-        """Verify _NormalizeFileExtension and _ResolveSetupFolderAndFilename."""
-        import PostProcessAll
+    def test_path_helpers_extension_and_sanitization(self):
+        """Verify _NormalizeFileExtension and _SanitizePathSegment."""
+        import PostClear
         # Extension normalization
-        self.assertEqual(PostProcessAll._NormalizeFileExtension(".nc"), ".nc")
-        self.assertEqual(PostProcessAll._NormalizeFileExtension("nc"), ".nc")
-        self.assertEqual(PostProcessAll._NormalizeFileExtension("json"), ".cnc")
-        self.assertEqual(PostProcessAll._NormalizeFileExtension(".json"), ".cnc")
-        self.assertEqual(PostProcessAll._NormalizeFileExtension(""), ".cnc")
-        self.assertEqual(PostProcessAll._NormalizeFileExtension(None), ".cnc")
+        self.assertEqual(PostClear._NormalizeFileExtension(".nc"), ".nc")
+        self.assertEqual(PostClear._NormalizeFileExtension("nc"), ".nc")
+        self.assertEqual(PostClear._NormalizeFileExtension("json"), ".cnc")
+        self.assertEqual(PostClear._NormalizeFileExtension(".json"), ".cnc")
+        self.assertEqual(PostClear._NormalizeFileExtension(""), ".cnc")
+        self.assertEqual(PostClear._NormalizeFileExtension(None), ".cnc")
 
-        # Setup folder & filename splitting
-        out_root = "/base/output"
-        folder, fname = PostProcessAll._ResolveSetupFolderAndFilename(out_root, "SimpleSetup")
-        self.assertEqual(folder, out_root)
-        self.assertEqual(fname, "SimpleSetup")
-
-        folder, fname = PostProcessAll._ResolveSetupFolderAndFilename(out_root, "SubFolder:NestedFolder:PartSetup")
-        self.assertEqual(folder, os.path.join(out_root, "SubFolder", "NestedFolder"))
-        self.assertEqual(fname, "PartSetup")
+        # Filename sanitization (colons and invalid path characters are sanitized, not split into subfolders)
+        self.assertEqual(PostClear._SanitizePathSegment("SimpleSetup"), "SimpleSetup")
+        self.assertEqual(PostClear._SanitizePathSegment("SubFolder:PartSetup"), "SubFolder_PartSetup")
+        self.assertFalse(hasattr(PostClear, "_ResolveSetupFolderAndFilename"))
 
     def test_b7_unit_handling_consistency(self):
         """Verify B7: Unit handling is consistent across context_parser and pipeline."""
@@ -1860,7 +1872,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         """Verify that missing stock raises an explicit error and reports failure to the user."""
         import json
         from pipeline import PipelineOrchestrator
-        import PostProcessAll
+        import PostClear
         from unittest.mock import MagicMock, patch
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1874,8 +1886,8 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
 
             orchestrator = PipelineOrchestrator(
-                dumper_cps=PostProcessAll.constDumperScript,
-                replayer_cps=PostProcessAll.constReplayerScript,
+                dumper_cps=PostClear.constDumperScript,
+                replayer_cps=PostClear.constReplayerScript,
             )
 
             with self.assertRaises(ValueError) as ctx:
@@ -1916,9 +1928,9 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_prog.parameters.itemByName.return_value = MagicMock(value=MagicMock(value="tormach"))
 
             out_file = os.path.join(tmp_dir, "output.nc")
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll._ResolveBasePostPath", return_value=dummy_cps):
-                res = PostProcessAll._PostProcessUnifiedPipeline(
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear._ResolveBasePostPath", return_value=dummy_cps):
+                res = PostClear._PostProcessUnifiedPipeline(
                     fname="SetupWithoutStock",
                     setup=mock_setup,
                     setupFolder=tmp_dir,
@@ -1934,7 +1946,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
     def test_unsupported_previous_setup_and_solid_stock_modes_return_explicit_error(self):
         """Verify that 'From Previous Setup' and 'From Solid' stock modes report explicit errors to user."""
         import json
-        import PostProcessAll
+        import PostClear
         from context_parser import extract_workpiece_from_context
         from pipeline import PipelineOrchestrator
         from unittest.mock import MagicMock, patch
@@ -1966,8 +1978,8 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
 
             orchestrator = PipelineOrchestrator(
-                dumper_cps=PostProcessAll.constDumperScript,
-                replayer_cps=PostProcessAll.constReplayerScript,
+                dumper_cps=PostClear.constDumperScript,
+                replayer_cps=PostClear.constReplayerScript,
             )
             with self.assertRaises(ValueError) as err_ctx:
                 orchestrator.run(
@@ -1986,10 +1998,10 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_setup_prev.models.count = 0
 
             # _GetSetupStockMode correctly resolves to "previous-setup"
-            self.assertEqual(PostProcessAll._GetSetupStockMode(mock_setup_prev), "previous-setup")
+            self.assertEqual(PostClear._GetSetupStockMode(mock_setup_prev), "previous-setup")
 
             # _ExtractWorkpieceFromSetup returns None
-            self.assertIsNone(PostProcessAll._ExtractWorkpieceFromSetup(mock_setup_prev))
+            self.assertIsNone(PostClear._ExtractWorkpieceFromSetup(mock_setup_prev))
 
             mock_prog = MagicMock()
             mock_prog.parameters.itemByName.return_value = MagicMock(value=MagicMock(value="tormach"))
@@ -2014,9 +2026,9 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app = MagicMock()
             mock_app.activeDocument.products.itemByProductType.return_value = mock_cam
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll._ResolveBasePostPath", return_value=dummy_cps):
-                res = PostProcessAll._PostProcessUnifiedPipeline(
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear._ResolveBasePostPath", return_value=dummy_cps):
+                res = PostClear._PostProcessUnifiedPipeline(
                     fname="Op2RestMachining",
                     setup=mock_setup_prev,
                     setupFolder=tmp_dir,
@@ -2036,12 +2048,12 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_setup_solid.stockSolids.count = 1
             mock_setup_solid.models.count = 0
 
-            self.assertEqual(PostProcessAll._GetSetupStockMode(mock_setup_solid), "solid")
-            self.assertIsNone(PostProcessAll._ExtractWorkpieceFromSetup(mock_setup_solid))
+            self.assertEqual(PostClear._GetSetupStockMode(mock_setup_solid), "solid")
+            self.assertIsNone(PostClear._ExtractWorkpieceFromSetup(mock_setup_solid))
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=MagicMock()), \
-                 patch("PostProcessAll._ResolveBasePostPath", return_value=dummy_cps):
-                res = PostProcessAll._PostProcessUnifiedPipeline(
+            with patch("PostClear.adsk.core.Application.get", return_value=MagicMock()), \
+                 patch("PostClear._ResolveBasePostPath", return_value=dummy_cps):
+                res = PostClear._PostProcessUnifiedPipeline(
                     fname="OpSolid",
                     setup=mock_setup_solid,
                     setupFolder=tmp_dir,
@@ -2058,7 +2070,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_setup_box.name = "OpBoxWithStaleSolids"
             mock_setup_box.stockMode = adsk.cam.SetupStockModes.FixedBoxStock
             mock_setup_box.stockSolids.count = 5  # stale solid selection
-            self.assertEqual(PostProcessAll._GetSetupStockMode(mock_setup_box), "fixed-box")
+            self.assertEqual(PostClear._GetSetupStockMode(mock_setup_box), "fixed-box")
 
             # 6. Verify all SetupStockModes enum mappings in _GetSetupStockMode
             expected_modes = {
@@ -2074,11 +2086,11 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             for enum_val, expected_str in expected_modes.items():
                 s = MagicMock()
                 s.stockMode = enum_val
-                self.assertEqual(PostProcessAll._GetSetupStockMode(s), expected_str)
+                self.assertEqual(PostClear._GetSetupStockMode(s), expected_str)
 
     def test_nc_program_unit_resolution(self):
         """Verify _GetNCProgramOutputUnits resolves PostOutputUnitOptions for all supported input types."""
-        import PostProcessAll
+        import PostClear
         mm_enum = adsk.cam.PostOutputUnitOptions.MillimetersOutput
         in_enum = adsk.cam.PostOutputUnitOptions.InchesOutput
         doc_enum = adsk.cam.PostOutputUnitOptions.DocumentUnitsOutput
@@ -2089,45 +2101,45 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_param = MagicMock()
             mock_param.value.value = mm_str
             mock_prog.parameters.itemByName.side_effect = lambda k: mock_param if k == "nc_program_unit" else None
-            self.assertEqual(PostProcessAll._GetNCProgramOutputUnits(mock_prog), mm_enum)
+            self.assertEqual(PostClear._GetNCProgramOutputUnits(mock_prog), mm_enum)
 
         for in_str in ("Inches", "inches", "in", "IN"):
             mock_prog = MagicMock()
             mock_param = MagicMock()
             mock_param.value.value = in_str
             mock_prog.parameters.itemByName.side_effect = lambda k: mock_param if k == "nc_program_unit" else None
-            self.assertEqual(PostProcessAll._GetNCProgramOutputUnits(mock_prog), in_enum)
+            self.assertEqual(PostClear._GetNCProgramOutputUnits(mock_prog), in_enum)
 
         for doc_str in ("Document units", "document units", "doc"):
             mock_prog = MagicMock()
             mock_param = MagicMock()
             mock_param.value.value = doc_str
             mock_prog.parameters.itemByName.side_effect = lambda k: mock_param if k == "nc_program_unit" else None
-            self.assertEqual(PostProcessAll._GetNCProgramOutputUnits(mock_prog), doc_enum)
+            self.assertEqual(PostClear._GetNCProgramOutputUnits(mock_prog), doc_enum)
 
         # 2. outputUnits property directly on program
         mock_prog_prop = MagicMock(spec=["outputUnits"])
         mock_prog_prop.outputUnits = mm_enum
-        self.assertEqual(PostProcessAll._GetNCProgramOutputUnits(mock_prog_prop), mm_enum)
+        self.assertEqual(PostClear._GetNCProgramOutputUnits(mock_prog_prop), mm_enum)
         mock_prog_prop.outputUnits = "Millimeters"
-        self.assertEqual(PostProcessAll._GetNCProgramOutputUnits(mock_prog_prop), mm_enum)
+        self.assertEqual(PostClear._GetNCProgramOutputUnits(mock_prog_prop), mm_enum)
 
         # 3. postParameters fallback
         mock_prog_post = MagicMock(spec=["postParameters"])
         mock_post_param = MagicMock()
         mock_post_param.value.value = "Millimeters"
         mock_prog_post.postParameters.itemByName.side_effect = lambda k: mock_post_param if k == "nc_program_unit" else None
-        self.assertEqual(PostProcessAll._GetNCProgramOutputUnits(mock_prog_post), mm_enum)
+        self.assertEqual(PostClear._GetNCProgramOutputUnits(mock_prog_post), mm_enum)
 
         # 4. docSettings fallback
-        self.assertEqual(PostProcessAll._GetNCProgramOutputUnits(None, {"outputUnits": "Millimeters"}), mm_enum)
-        self.assertEqual(PostProcessAll._GetNCProgramOutputUnits(None, {"nc_program_unit": "Inches"}), in_enum)
+        self.assertEqual(PostClear._GetNCProgramOutputUnits(None, {"outputUnits": "Millimeters"}), mm_enum)
+        self.assertEqual(PostClear._GetNCProgramOutputUnits(None, {"nc_program_unit": "Inches"}), in_enum)
 
         # 5. Default fallback to DocumentUnitsOutput
-        self.assertEqual(PostProcessAll._GetNCProgramOutputUnits(None, {}), doc_enum)
+        self.assertEqual(PostClear._GetNCProgramOutputUnits(None, {}), doc_enum)
     def test_pipeline_nc_program_mm_unit_override(self):
         """Verify that NCProgram specifying mm output overrides Document units and passes MillimetersOutput to PostProcessInput."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import patch, MagicMock
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2201,7 +2213,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app.activeDocument = mock_doc
 
             written_configs = []
-            orig_write_cfg = PostProcessAll._WriteDumperConfig
+            orig_write_cfg = PostClear._WriteDumperConfig
             def intercepted_write_dumper_config(*args, **kwargs):
                 written_configs.append(dict(kwargs))
                 return orig_write_cfg(*args, **kwargs)
@@ -2213,13 +2225,13 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                         f.write("G21\nG0 X50.0 Z2.0\nM30\n")
                 return MagicMock(returncode=0, stdout="", stderr="")
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")), \
-                 patch("PostProcessAll._WriteDumperConfig", side_effect=intercepted_write_dumper_config), \
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")), \
+                 patch("PostClear._WriteDumperConfig", side_effect=intercepted_write_dumper_config), \
                  patch("pipeline.subprocess.run", side_effect=fake_subprocess_run):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                res = PostProcessAll._PostProcessUnifiedPipeline(
+                doc_settings = dict(PostClear.defaultSettings)
+                res = PostClear._PostProcessUnifiedPipeline(
                     fname="Spinner setup",
                     setup=mock_setup,
                     setupFolder=tmp_dir,
@@ -2252,7 +2264,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_pipeline_nc_program_inches_unit_override(self):
         """Verify that NCProgram specifying Inches output overrides Document units and passes InchesOutput (1) to PostProcessInput."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import patch, MagicMock
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2325,7 +2337,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app.activeDocument = mock_doc
 
             written_configs = []
-            orig_write_cfg = PostProcessAll._WriteDumperConfig
+            orig_write_cfg = PostClear._WriteDumperConfig
             def intercepted_write_dumper_config(*args, **kwargs):
                 written_configs.append(dict(kwargs))
                 return orig_write_cfg(*args, **kwargs)
@@ -2336,13 +2348,13 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                     f.write("G20\nG0 X2.0 Z0.1\nM30\n")
                 return MagicMock(returncode=0, stdout="", stderr="")
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")), \
-                 patch("PostProcessAll._WriteDumperConfig", side_effect=intercepted_write_dumper_config), \
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")), \
+                 patch("PostClear._WriteDumperConfig", side_effect=intercepted_write_dumper_config), \
                  patch("pipeline.subprocess.run", side_effect=fake_subprocess_run):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                res = PostProcessAll._PostProcessUnifiedPipeline(
+                doc_settings = dict(PostClear.defaultSettings)
+                res = PostClear._PostProcessUnifiedPipeline(
                     fname="InchSetup",
                     setup=mock_setup,
                     setupFolder=tmp_dir,
@@ -2375,7 +2387,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_pipeline_nc_program_document_units_fallback(self):
         """Verify that NCProgram with Document units leaves units as DocumentUnitsOutput (0)."""
-        import PostProcessAll
+        import PostClear
         from unittest.mock import patch, MagicMock
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2437,7 +2449,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app.activeDocument = mock_doc
 
             written_configs = []
-            orig_write_cfg = PostProcessAll._WriteDumperConfig
+            orig_write_cfg = PostClear._WriteDumperConfig
             def intercepted_write_dumper_config(*args, **kwargs):
                 written_configs.append(dict(kwargs))
                 return orig_write_cfg(*args, **kwargs)
@@ -2448,13 +2460,13 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                     f.write("G0 X0\nM30\n")
                 return MagicMock(returncode=0, stdout="", stderr="")
 
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")), \
-                 patch("PostProcessAll._WriteDumperConfig", side_effect=intercepted_write_dumper_config), \
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear._ResolveBasePostPath", return_value=os.path.abspath("centroid_turning.cps")), \
+                 patch("PostClear._WriteDumperConfig", side_effect=intercepted_write_dumper_config), \
                  patch("pipeline.subprocess.run", side_effect=fake_subprocess_run):
 
-                doc_settings = dict(PostProcessAll.defaultSettings)
-                res = PostProcessAll._PostProcessUnifiedPipeline(
+                doc_settings = dict(PostClear.defaultSettings)
+                res = PostClear._PostProcessUnifiedPipeline(
                     fname="DocSetup",
                     setup=mock_setup,
                     setupFolder=tmp_dir,
@@ -2481,7 +2493,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_init_addin_is_idempotent_cleans_stale_control_and_definition(self):
         """Calling InitAddIn() twice in a row cleans stale control before stale cmdDef without RuntimeError."""
-        import PostProcessAll
+        import PostClear
 
         delete_order = []
         created_defs = []
@@ -2549,20 +2561,20 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_app = MagicMock()
         mock_app.userInterface = mock_ui
 
-        saved_handlers = list(PostProcessAll.handlers)
-        saved_mm_handler = PostProcessAll._marking_menu_handler
+        saved_handlers = list(PostClear.handlers)
+        saved_mm_handler = PostClear._marking_menu_handler
         try:
-            PostProcessAll.handlers.clear()
-            PostProcessAll._marking_menu_handler = None
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app):
-                PostProcessAll.InitAddIn()
+            PostClear.handlers.clear()
+            PostClear._marking_menu_handler = None
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app):
+                PostClear.InitAddIn()
                 mock_ui.messageBox.assert_not_called()
                 self.assertEqual(len(created_defs), 1)
                 self.assertEqual(len(created_controls), 1)
-                self.assertEqual(len(PostProcessAll.handlers), 2)
+                self.assertEqual(len(PostClear.handlers), 2)
 
                 # Call InitAddIn() again without stop() — must delete stale control then stale cmdDef.
-                PostProcessAll.InitAddIn()
+                PostClear.InitAddIn()
                 mock_ui.messageBox.assert_not_called()
 
             first_ctrl = created_controls[0]
@@ -2575,14 +2587,14 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             )
             self.assertEqual(len(created_defs), 2)
             self.assertEqual(len(created_controls), 2)
-            self.assertEqual(len(PostProcessAll.handlers), 2)
+            self.assertEqual(len(PostClear.handlers), 2)
         finally:
-            PostProcessAll.handlers[:] = saved_handlers
-            PostProcessAll._marking_menu_handler = saved_mm_handler
+            PostClear.handlers[:] = saved_handlers
+            PostClear._marking_menu_handler = saved_mm_handler
 
     def test_stop_and_run_idempotent_reload(self):
         """run() refreshes local modules via _EnsureLocalModulesLoaded(force=True) and stop() cleans up safely."""
-        import PostProcessAll
+        import PostClear
 
         mock_control = MagicMock()
         mock_def = MagicMock()
@@ -2603,44 +2615,53 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_app = MagicMock()
         mock_app.userInterface = mock_ui
 
-        saved_handlers = list(PostProcessAll.handlers)
-        saved_settings_mgr = PostProcessAll.settingsMgr
+        saved_handlers = list(PostClear.handlers)
+        saved_settings_mgr = PostClear.settingsMgr
         try:
-            with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostProcessAll._EnsureLocalModulesLoaded") as mock_ensure:
-                PostProcessAll.run(None)
+            with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+                 patch("PostClear._EnsureLocalModulesLoaded") as mock_ensure:
+                PostClear.run(None)
                 mock_ensure.assert_called_once_with(force=True, allow_bootstrap=True)
                 mock_ui.messageBox.assert_not_called()
                 mock_control.deleteMe.assert_called_once()
                 mock_def.deleteMe.assert_called_once()
 
-                PostProcessAll.stop(None)
+                PostClear.stop(None)
                 mock_ui.messageBox.assert_not_called()
                 mock_palette.deleteMe.assert_called_once()
-                self.assertEqual(len(PostProcessAll.handlers), 0)
+                self.assertEqual(len(PostClear.handlers), 0)
         finally:
-            PostProcessAll.handlers[:] = saved_handlers
-            PostProcessAll.settingsMgr = saved_settings_mgr
+            PostClear.handlers[:] = saved_handlers
+            PostClear.settingsMgr = saved_settings_mgr
 
 
     def test_v17_settings_migration_and_selected_nc_programs(self):
-        """SettingsManager v17 migrates legacy ncProgram -> ncPrograms and resolves multi-selection."""
-        import PostProcessAll
+        """SettingsManager v18 migrates legacy ncProgram -> ncPrograms, defaults debug_log=False, and resolves multi-selection."""
+        import PostClear
 
-        self.assertEqual(PostProcessAll.version, 17)
-        self.assertIn("ncPrograms", PostProcessAll.defaultSettings)
-        self.assertEqual(PostProcessAll.defaultSettings["ncPrograms"], [])
+        self.assertEqual(PostClear.version, 18)
+        self.assertIn("ncPrograms", PostClear.defaultSettings)
+        self.assertEqual(PostClear.defaultSettings["ncPrograms"], [])
+        self.assertIn("debug_log", PostClear.defaultSettings)
+        self.assertIs(PostClear.defaultSettings["debug_log"], False)
 
-        mgr = PostProcessAll.SettingsManager()
+        mgr = PostClear.SettingsManager()
         legacy = {
             "version": 16,
             "ncProgram": "ProgB",
             "output": "/tmp/out",
         }
-        mgr.UpdateSettings(PostProcessAll.defaultSettings, legacy)
-        self.assertEqual(legacy["version"], 17)
+        mgr.UpdateSettings(PostClear.defaultSettings, legacy)
+        self.assertEqual(legacy["version"], 18)
         self.assertEqual(legacy["ncPrograms"], ["ProgB"])
         self.assertEqual(legacy["ncProgram"], "ProgB")
+        self.assertIs(legacy["debug_log"], False)
+
+        # Explicitly enabled debug_log is preserved across migration
+        explicit_true = {"version": 17, "ncPrograms": ["ProgA"], "debug_log": True}
+        mgr.UpdateSettings(PostClear.defaultSettings, explicit_true)
+        self.assertEqual(explicit_true["version"], 18)
+        self.assertIs(explicit_true["debug_log"], True)
 
         prog_a = MagicMock()
         prog_a.name = "ProgA"
@@ -2651,16 +2672,16 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         cam = MagicMock()
         cam.ncPrograms = MockCamCollection([prog_a, prog_b, prog_c])
 
-        selected = PostProcessAll.GetSelectedNcPrograms(cam, {"ncPrograms": ["ProgC", "ProgA"]})
+        selected = PostClear.GetSelectedNcPrograms(cam, {"ncPrograms": ["ProgC", "ProgA"]})
         self.assertEqual([p.name for p in selected], ["ProgC", "ProgA"])
 
         # Fallback to legacy single ncProgram when ncPrograms is empty
-        fallback = PostProcessAll.GetSelectedNcPrograms(cam, {"ncPrograms": [], "ncProgram": "ProgB"})
+        fallback = PostClear.GetSelectedNcPrograms(cam, {"ncPrograms": [], "ncProgram": "ProgB"})
         self.assertEqual([p.name for p in fallback], ["ProgB"])
 
     def test_multi_nc_program_command_dialog_validation_and_execute(self):
         """Verify TableCommandInput checklist, select-all sync, validation, and execute persistence."""
-        import PostProcessAll
+        import PostClear
 
         prog_a = MagicMock()
         prog_a.name = "ProgA"
@@ -2747,22 +2768,22 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_app.activeDocument.products.itemByProductType.return_value = cam
         mock_app.activeDocument.attributes = MagicMock()
 
-        doc_settings = dict(PostProcessAll.defaultSettings)
+        doc_settings = dict(PostClear.defaultSettings)
         doc_settings["ncPrograms"] = ["ProgA"]
         doc_settings["ncProgram"] = "ProgA"
 
-        saved_handlers = list(PostProcessAll.handlers)
-        saved_settings_mgr = PostProcessAll.settingsMgr
+        saved_handlers = list(PostClear.handlers)
+        saved_settings_mgr = PostClear.settingsMgr
         try:
             mock_mgr = MagicMock()
             mock_mgr.GetSettings.return_value = doc_settings
-            PostProcessAll.settingsMgr = mock_mgr
+            PostClear.settingsMgr = mock_mgr
 
-            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app):
-                with patch.object(PostProcessAll.adsk.core, "CommandCreatedEventArgs", MagicMock(cast=lambda a: MagicMock(command=mock_cmd)), create=True), \
-                     patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam), \
-                     patch("PostProcessAll.GetNcProgramSetupsAndOperations", return_value=([MagicMock(name="Setup 1")], {})):
-                    PostProcessAll.CommandEventHandler().notify(MagicMock())
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app):
+                with patch.object(PostClear.adsk.core, "CommandCreatedEventArgs", MagicMock(cast=lambda a: MagicMock(command=mock_cmd)), create=True), \
+                     patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                     patch("PostClear.GetNcProgramSetupsAndOperations", return_value=([MagicMock(name="Setup 1")], {})):
+                    PostClear.CommandEventHandler().notify(MagicMock())
 
                 self.assertIn("ncProgramsTable", input_store)
                 self.assertIn("ncprog_select_all", input_store)
@@ -2778,10 +2799,10 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 self.assertFalse(input_store["ncprog_select_all"].value)
 
                 # InputChangedHandler: Select All -> True checks all rows
-                changed_handler = PostProcessAll.CommandInputChangedHandler(doc_settings)
+                changed_handler = PostClear.CommandInputChangedHandler(doc_settings)
                 input_store["ncprog_select_all"].value = True
                 with patch.object(
-                    PostProcessAll.adsk.core,
+                    PostClear.adsk.core,
                     "InputChangedEventArgs",
                     MagicMock(cast=lambda a: MagicMock(input=input_store["ncprog_select_all"], inputs=mock_inputs)),
                     create=True,
@@ -2794,10 +2815,10 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 # Validation with 0 checked disables OK and shows error
                 input_store["ncprog_chk_0"].value = False
                 input_store["ncprog_chk_1"].value = False
-                val_handler = PostProcessAll.CommandValidateInputsHandler()
+                val_handler = PostClear.CommandValidateInputsHandler()
                 val_args = MagicMock(inputs=mock_inputs, areInputsValid=True)
                 with patch.object(
-                    PostProcessAll.adsk.core,
+                    PostClear.adsk.core,
                     "ValidateInputsEventArgs",
                     MagicMock(cast=lambda a: val_args),
                     create=True,
@@ -2813,7 +2834,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                     areInputsValid=True,
                 )
                 with patch.object(
-                    PostProcessAll.adsk.core,
+                    PostClear.adsk.core,
                     "ValidateInputsEventArgs",
                     MagicMock(cast=lambda a: val_args_nested),
                     create=True,
@@ -2826,7 +2847,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 input_store["ncprog_chk_1"].value = True
                 val_args2 = MagicMock(inputs=mock_inputs, areInputsValid=False)
                 with patch.object(
-                    PostProcessAll.adsk.core,
+                    PostClear.adsk.core,
                     "ValidateInputsEventArgs",
                     MagicMock(cast=lambda a: val_args2),
                     create=True,
@@ -2835,29 +2856,29 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 self.assertTrue(val_args2.areInputsValid)
                 self.assertFalse(input_store["error"].isVisible)
 
-                exec_handler = PostProcessAll.CommandExecuteHandler(doc_settings)
+                exec_handler = PostClear.CommandExecuteHandler(doc_settings)
                 exec_cmd = MagicMock(commandInputs=mock_inputs)
                 with patch.object(
-                    PostProcessAll.adsk.core,
+                    PostClear.adsk.core,
                     "CommandEventArgs",
                     MagicMock(cast=lambda a: MagicMock(command=exec_cmd)),
                     create=True,
                 ), \
-                     patch.object(PostProcessAll.adsk.core, "GroupCommandInput", MagicMock(classType=lambda: "Group"), create=True), \
-                     patch.object(PostProcessAll.adsk.core, "DropDownCommandInput", MagicMock(classType=lambda: "DropDown"), create=True), \
-                     patch("PostProcessAll.PerformPostProcess") as mock_perform:
+                     patch.object(PostClear.adsk.core, "GroupCommandInput", MagicMock(classType=lambda: "Group"), create=True), \
+                     patch.object(PostClear.adsk.core, "DropDownCommandInput", MagicMock(classType=lambda: "DropDown"), create=True), \
+                     patch("PostClear.PerformPostProcess") as mock_perform:
                     exec_handler.notify(MagicMock())
 
             self.assertEqual(doc_settings["ncPrograms"], ["ProgB"])
             self.assertEqual(doc_settings["ncProgram"], "ProgB")
             mock_perform.assert_called_once_with(doc_settings)
         finally:
-            PostProcessAll.handlers[:] = saved_handlers
-            PostProcessAll.settingsMgr = saved_settings_mgr
+            PostClear.handlers[:] = saved_handlers
+            PostClear.settingsMgr = saved_settings_mgr
 
     def test_resolve_nc_program_output_filename_and_duplicate_path_collision(self):
         """Verify nc_program_filename is always used and duplicate resolved paths abort PerformPostProcess."""
-        import PostProcessAll
+        import PostClear
 
         setup = MagicMock()
         setup.name = "Setup 1"
@@ -2880,10 +2901,10 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         p2 = _make_prog("Program Two", "sub:Part2.nc")
         p_blank = _make_prog("Program Three", "   ")
 
-        self.assertEqual(PostProcessAll._ResolveNcProgramOutputFilename(p1, setup, ".nc"), "SharedName")
-        self.assertEqual(PostProcessAll._ResolveNcProgramOutputFilename(p2, setup, ".nc"), "sub:Part2")
-        self.assertEqual(PostProcessAll._ResolveNcProgramOutputFilename(p_blank, setup, ".nc"), "Program Three")
-        self.assertEqual(PostProcessAll._ResolveNcProgramOutputFilename(MagicMock(name=None, parameters=None), setup, ".nc"), "Setup 1")
+        self.assertEqual(PostClear._ResolveNcProgramOutputFilename(p1, setup, ".nc"), "SharedName")
+        self.assertEqual(PostClear._ResolveNcProgramOutputFilename(p2, setup, ".nc"), "sub:Part2")
+        self.assertEqual(PostClear._ResolveNcProgramOutputFilename(p_blank, setup, ".nc"), "Program Three")
+        self.assertEqual(PostClear._ResolveNcProgramOutputFilename(MagicMock(name=None, parameters=None), setup, ".nc"), "Setup 1")
 
         # Duplicate output target collision across 2 selected programs
         p_dup1 = _make_prog("NC1", "SameOut")
@@ -2904,7 +2925,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_app.activeDocument.attributes.itemByName.return_value = None
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            doc_settings = dict(PostProcessAll.defaultSettings)
+            doc_settings = dict(PostClear.defaultSettings)
             doc_settings["output"] = tmp_dir
             doc_settings["ncPrograms"] = ["NC1", "NC2"]
 
@@ -2912,11 +2933,11 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 ops = [op1] if program is p_dup1 else [op2]
                 return [setup], {setup.name: ops}
 
-            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
-                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam), \
-                 patch("PostProcessAll.GetNcProgramSetupsAndOperations", side_effect=_get_prog_setups_ops), \
-                 patch("PostProcessAll.PostProcessSetup") as mock_pps:
-                PostProcessAll.PerformPostProcess(doc_settings)
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                 patch("PostClear.GetNcProgramSetupsAndOperations", side_effect=_get_prog_setups_ops), \
+                 patch("PostClear.PostProcessSetup") as mock_pps:
+                PostClear.PerformPostProcess(doc_settings)
 
             mock_pps.assert_not_called()
             mock_ui.createProgressDialog.assert_not_called()
@@ -2927,7 +2948,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_perform_post_process_multi_nc_program_batch_single_prompts_and_restore(self):
         """Batching 2 NC Programs uses single overwrite prompt, single progress dialog, and restores params."""
-        import PostProcessAll
+        import PostClear
 
         op1 = MagicMock(name="Op1", hasToolpath=True, isSuppressed=False)
         op2 = MagicMock(name="Op2", hasToolpath=True, isSuppressed=False)
@@ -2970,7 +2991,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
             def _msgbox(prompt, title="", btn=None, icon=None):
                 msgbox_calls.append((prompt, title, btn, icon))
-                return PostProcessAll.adsk.core.DialogResults.DialogYes
+                return PostClear.adsk.core.DialogResults.DialogYes
 
             mock_progress = MagicMock()
             mock_progress.wasCancelled = False
@@ -2988,7 +3009,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 with open(os.path.join(tmp_dir, fn), "w", encoding="utf8") as f:
                     f.write("OLD")
 
-            doc_settings = dict(PostProcessAll.defaultSettings)
+            doc_settings = dict(PostClear.defaultSettings)
             doc_settings["output"] = tmp_dir
             doc_settings["ncPrograms"] = ["NC1", "NC2"]
 
@@ -3001,7 +3022,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
             def _fake_pps(fname_arg, setup_arg, setup_folder_arg, settings_arg, program_arg, **kwargs):
                 pps_calls.append((setup_arg.name, program_arg.name, fname_arg))
-                PostProcessAll._RecordVerifyResult(
+                PostClear._RecordVerifyResult(
                     setup=setup_arg,
                     nc_program=program_arg.name,
                     cncPath=os.path.join(setup_folder_arg, f"{fname_arg}.nc"),
@@ -3011,12 +3032,12 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 )
                 return None
 
-            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
-                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam), \
-                 patch("PostProcessAll.GetNcProgramSetupsAndOperations", side_effect=_get_prog_setups_ops), \
-                 patch("PostProcessAll.PostProcessSetup", side_effect=_fake_pps), \
-                 patch("PostProcessAll._NotifyPostProcessResult") as mock_notify:
-                PostProcessAll.PerformPostProcess(doc_settings)
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                 patch("PostClear.GetNcProgramSetupsAndOperations", side_effect=_get_prog_setups_ops), \
+                 patch("PostClear.PostProcessSetup", side_effect=_fake_pps), \
+                 patch("PostClear._NotifyPostProcessResult") as mock_notify:
+                PostClear.PerformPostProcess(doc_settings)
 
             self.assertEqual(len(msgbox_calls), 1, "Must show only ONE aggregated overwrite prompt for both programs")
             self.assertIn("FirstPart.nc", msgbox_calls[0][0])
@@ -3024,9 +3045,9 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_ui.createProgressDialog.assert_called_once()
             self.assertEqual(pps_calls, [("Setup 1", "NC1", "FirstPart"), ("Setup 2", "NC2", "SecondPart")])
             # Verify nc_program recorded in verifyResults
-            self.assertEqual(len(PostProcessAll.verifyResults), 2)
-            self.assertEqual(PostProcessAll.verifyResults[0]["nc_program"], "NC1")
-            self.assertEqual(PostProcessAll.verifyResults[1]["nc_program"], "NC2")
+            self.assertEqual(len(PostClear.verifyResults), 2)
+            self.assertEqual(PostClear.verifyResults[0]["nc_program"], "NC1")
+            self.assertEqual(PostClear.verifyResults[1]["nc_program"], "NC2")
             # Original nc_program_filename values preserved
             self.assertEqual(fv1.value, "FirstPart")
             self.assertEqual(fv2.value, "SecondPart")
@@ -3035,7 +3056,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_reworked_notification_html_scaling_and_non_dismissing_actions(self):
         """Verify open_file/open_folder keep palette open, 2s auto-dismiss + click-cancel on success, and multi-program row layout."""
-        import PostProcessAll
+        import PostClear
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             nc1 = os.path.join(tmp_dir, "Part1.nc")
@@ -3054,22 +3075,22 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             mock_app = MagicMock()
             mock_app.userInterface = mock_ui
 
-            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
-                 patch("PostProcessAll.os.path.exists", return_value=True), \
-                 patch("PostProcessAll.subprocess.Popen") as mock_popen, \
-                 patch("PostProcessAll.sys.platform", "darwin"):
-                PostProcessAll._HandleNotificationAction(PostProcessAll.constNotificationPaletteId, "open_file", nc1)
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch("PostClear.os.path.exists", return_value=True), \
+                 patch("PostClear.subprocess.Popen") as mock_popen, \
+                 patch("PostClear.sys.platform", "darwin"):
+                PostClear._HandleNotificationAction(PostClear.constNotificationPaletteId, "open_file", nc1)
                 self.assertTrue(mock_palette.isVisible, "open_file must NOT hide notification palette")
                 mock_popen.assert_called_once()
 
-                PostProcessAll._HandleNotificationAction(PostProcessAll.constNotificationPaletteId, "open_folder", tmp_dir)
+                PostClear._HandleNotificationAction(PostClear.constNotificationPaletteId, "open_folder", tmp_dir)
                 self.assertTrue(mock_palette.isVisible, "open_folder must NOT hide notification palette")
 
-                PostProcessAll._HandleNotificationAction(PostProcessAll.constNotificationPaletteId, "dismiss", "")
+                PostClear._HandleNotificationAction(PostClear.constNotificationPaletteId, "dismiss", "")
                 self.assertFalse(mock_palette.isVisible, "dismiss must hide notification palette")
 
                 mock_palette.isVisible = True
-                PostProcessAll._HandleNotificationAction(PostProcessAll.constNotificationPaletteId, "close", "")
+                PostClear._HandleNotificationAction(PostClear.constNotificationPaletteId, "close", "")
                 self.assertFalse(mock_palette.isVisible, "close must hide notification palette")
 
             # 2. _NotifyPostProcessResult with 3 programs -> scaled height & isResizable=True & per-row buttons
@@ -3095,7 +3116,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 {"nc_program": "NC2", "setup": "Setup 2", "cnc": nc2, "report": None, "png": None, "status": "success", "summary": "Clean"},
                 {"nc_program": "NC3", "setup": "Setup 3", "cnc": nc1, "report": None, "png": None, "status": "success", "summary": "Clean"},
             ]
-            PostProcessAll._NotifyPostProcessResult(mock_ui2, 3, 0, [], tmp_dir, verifyResults=[], program_outcomes=outcomes)
+            PostClear._NotifyPostProcessResult(mock_ui2, 3, 0, [], tmp_dir, verifyResults=[], program_outcomes=outcomes)
 
             self.assertEqual(len(created_palettes), 1)
             _, html_out, is_resiz, pal_w, pal_h = created_palettes[0]
@@ -3112,7 +3133,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             outcomes_err = [
                 {"nc_program": "NC1", "setup": "Setup 1", "cnc": nc1, "report": rep1, "png": None, "status": "error", "summary": "Holder collision"},
             ]
-            PostProcessAll._NotifyPostProcessResult(mock_ui2, 1, 0, [], tmp_dir, verifyResults=[], is_fatal=True, program_outcomes=outcomes_err)
+            PostClear._NotifyPostProcessResult(mock_ui2, 1, 0, [], tmp_dir, verifyResults=[], is_fatal=True, program_outcomes=outcomes_err)
             _, err_html_out, err_resiz, _, err_h = created_palettes[0]
             self.assertFalse(err_resiz)
             self.assertEqual(err_h, 220)
@@ -3121,7 +3142,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
     def test_marking_menu_context_injection_preselection_and_cleanup(self):
         """Verify MarkingMenuHandler adds only constCmdDefId on CAM context, preselects NCPrograms, ignores non-CAM, and cleans up."""
-        import PostProcessAll
+        import PostClear
 
         prog_a = MagicMock()
         prog_a.name = "ProgA"
@@ -3155,43 +3176,43 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         iron_nc_ctrl = MagicMock()
         iron_nc_ctrl.id = "IronNCProgramPostProcess"
         iron_post_ctrl = MagicMock()
-        iron_post_ctrl.id = PostProcessAll.constPostProcessControlId  # "IronPostProcess"
+        iron_post_ctrl.id = PostClear.constPostProcessControlId  # "IronPostProcess"
         custom_post_ctrl = MagicMock()
         custom_post_ctrl.id = "CustomCamPostBtn"
         custom_post_ctrl.commandDefinition = MagicMock()
         custom_post_ctrl.commandDefinition.name = "Post Process"
         stale_self_ctrl = MagicMock()
-        stale_self_ctrl.id = PostProcessAll.constCmdDefId
+        stale_self_ctrl.id = PostClear.constCmdDefId
 
         mock_controls = _make_controls([iron_nc_ctrl, stale_self_ctrl])
         mock_linear_menu = MagicMock(controls=mock_controls)
 
         mock_ui = MagicMock()
-        mock_ui.activeWorkspace.id = PostProcessAll.constCAMWorkspaceId
+        mock_ui.activeWorkspace.id = PostClear.constCAMWorkspaceId
         mock_ui.commandDefinitions.itemById.return_value = cmd_def
 
         mock_app = MagicMock()
         mock_app.userInterface = mock_ui
         mock_app.activeDocument.products.itemByProductType.return_value = cam
-        mock_app.activeProduct.productType = PostProcessAll.constCAMProductId
+        mock_app.activeProduct.productType = PostClear.constCAMProductId
 
-        saved_pending = PostProcessAll._pending_context_selection
+        saved_pending = PostClear._pending_context_selection
         try:
             # 1. Right-click on NCProgram ProgB with IronNCProgramPostProcess -> deletes stale self & anchors after IronNCProgramPostProcess
-            PostProcessAll._pending_context_selection = None
-            handler = PostProcessAll.MarkingMenuHandler()
+            PostClear._pending_context_selection = None
+            handler = PostClear.MarkingMenuHandler()
             ev_args = MagicMock(
                 selectedEntities=[prog_b],
                 linearMarkingMenu=mock_linear_menu,
             )
-            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
-                 patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_args), create=True), \
-                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam):
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostClear.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_args), create=True), \
+                 patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam):
                 handler.notify(MagicMock())
 
             stale_self_ctrl.deleteMe.assert_called_once()
             mock_controls.addCommand.assert_called_once_with(cmd_def, "IronNCProgramPostProcess", False)
-            pre = PostProcessAll._ResolvePreselectedNcProgramNames(cam, mock_ui)
+            pre = PostClear._ResolvePreselectedNcProgramNames(cam, mock_ui)
             self.assertEqual(pre, ["ProgB"])
 
             # 2. Right-click on "NC Programs" folder node with custom "Post Process" command name -> anchors after CustomCamPostBtn & preselects ALL
@@ -3201,45 +3222,317 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             nc_folder.name = "NC Programs"
             nc_folder.objectType = "adsk::cam::CAMFolder"
             ev_folder = MagicMock(selectedEntities=[nc_folder], linearMarkingMenu=mock_linear_custom)
-            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
-                 patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_folder), create=True), \
-                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam):
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostClear.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_folder), create=True), \
+                 patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam):
                 handler.notify(MagicMock())
             mock_controls_custom.addCommand.assert_called_once_with(cmd_def, "CustomCamPostBtn", False)
-            self.assertEqual(PostProcessAll._ResolvePreselectedNcProgramNames(cam, mock_ui), ["ProgA", "ProgB"])
+            self.assertEqual(PostClear._ResolvePreselectedNcProgramNames(cam, mock_ui), ["ProgA", "ProgB"])
 
             # 3. Right-click on Setup with IronPostProcess -> anchors after IronPostProcess & preselects matching NC Program
             mock_controls_setup = _make_controls([iron_post_ctrl])
             mock_linear_setup = MagicMock(controls=mock_controls_setup)
             ev_setup = MagicMock(selectedEntities=[setup1], linearMarkingMenu=mock_linear_setup)
-            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
-                 patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_setup), create=True), \
-                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam), \
-                 patch("PostProcessAll.GetNcProgramSetupsAndOperations", side_effect=lambda c, s, program=None: ([setup1], []) if program is prog_a else ([], [])):
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostClear.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_setup), create=True), \
+                 patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                 patch("PostClear.GetNcProgramSetupsAndOperations", side_effect=lambda c, s, program=None: ([setup1], []) if program is prog_a else ([], [])):
                 handler.notify(MagicMock())
-            mock_controls_setup.addCommand.assert_called_once_with(cmd_def, PostProcessAll.constPostProcessControlId, False)
-            self.assertEqual(PostProcessAll._ResolvePreselectedNcProgramNames(cam, mock_ui), ["ProgA"])
+            mock_controls_setup.addCommand.assert_called_once_with(cmd_def, PostClear.constPostProcessControlId, False)
+            self.assertEqual(PostClear._ResolvePreselectedNcProgramNames(cam, mock_ui), ["ProgA"])
 
             # 4. Non-CAM entity (e.g., BRepBody) -> ignored cleanly, no addCommand call
             mock_controls.addCommand.reset_mock()
             brep = MagicMock()
             brep.objectType = "adsk::fusion::BRepBody"
             ev_non_cam = MagicMock(selectedEntities=[brep], linearMarkingMenu=mock_linear_menu)
-            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
-                 patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_non_cam), create=True), \
-                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam):
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostClear.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_non_cam), create=True), \
+                 patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam):
                 handler.notify(MagicMock())
             mock_controls.addCommand.assert_not_called()
 
             # 5. Cleanup detaches _marking_menu_handler from ui.markingMenuDisplaying
-            PostProcessAll._marking_menu_handler = handler
-            PostProcessAll._CleanupCommandUI(mock_ui)
+            PostClear._marking_menu_handler = handler
+            PostClear._CleanupCommandUI(mock_ui)
             mock_ui.markingMenuDisplaying.remove.assert_called_once_with(handler)
-            self.assertIsNone(PostProcessAll._marking_menu_handler)
-            self.assertIsNone(PostProcessAll._pending_context_selection)
+            self.assertIsNone(PostClear._marking_menu_handler)
+            self.assertIsNone(PostClear._pending_context_selection)
         finally:
-            PostProcessAll._pending_context_selection = saved_pending
-            PostProcessAll._marking_menu_handler = None
+            PostClear._pending_context_selection = saved_pending
+            PostClear._marking_menu_handler = None
+
+    def test_optional_debug_log_gating_dialog_and_diagnostic_header(self):
+        """Verify debug_log checkbox, GroupCommandInput lookup, silent default, and full diagnostic header when enabled."""
+        import PostClear
+        from geometry import solid_mesh
+
+        saved_log_path = PostClear._LOG_PATH
+        saved_enabled = PostClear._debug_log_enabled
+        saved_handlers = list(PostClear.handlers)
+        saved_settings_mgr = PostClear.settingsMgr
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_log = os.path.join(tmpdir, "postclear_debug.log")
+            PostClear._LOG_PATH = temp_log
+            try:
+                # 1. Default False -> _dbg_global, solid_mesh._dbg, and context_parser._dbg_ctx do NOT create log file
+                import context_parser
+                PostClear._SetDebugLogEnabled(False)
+                PostClear._dbg_global("should-not-write-1")
+                solid_mesh._dbg("should-not-write-solid")
+                context_parser.extract_workpiece_from_context({"stockMode": "default"})
+                self.assertFalse(os.path.exists(temp_log))
+
+                # 2. Dialog creation adds debug_log checkbox (default False) inside groupPersonal.children,
+                # CommandInputChangedHandler updates docSettings["debug_log"], and CommandExecuteHandler
+                # finds debug_log even if root inputs.itemById only resolves groupPersonal (not nested children)
+                prog_a = MagicMock()
+                prog_a.name = "ProgA"
+                prog_a.parameters = MagicMock()
+                prog_a.parameters.itemByName.side_effect = lambda k: {
+                    "nc_program_filename": MagicMock(value=MagicMock(value="PartA")),
+                }.get(k)
+                cam = MagicMock()
+                cam.ncPrograms = MockCamCollection([prog_a])
+
+                root_store = {}
+                group_store = {}
+
+                def _make_inp(store, inp_id, **extra):
+                    m = MagicMock()
+                    m.id = inp_id
+                    for k, v in extra.items():
+                        setattr(m, k, v)
+                    store[inp_id] = m
+                    return m
+
+                def _make_group(inp_id, _name):
+                    grp = _make_inp(root_store, inp_id, isExpanded=True, objectType="Group")
+                    children = MagicMock()
+                    children.addBoolValueInput.side_effect = lambda bid, nm, chk, res, val: _make_inp(
+                        group_store, bid, name=nm, value=val, objectType="Bool"
+                    )
+                    children.itemById.side_effect = lambda k: group_store.get(k)
+                    grp.children = children
+                    return grp
+
+                def _make_table(inp_id, *_a):
+                    tbl = _make_inp(root_store, inp_id, rowCount=0)
+                    cells = {}
+                    tbl.addCommandInput.side_effect = lambda inp, r, c: (
+                        cells.__setitem__((r, c), inp),
+                        setattr(tbl, "rowCount", max(tbl.rowCount, r + 1)),
+                    )
+                    tbl.getInputAtPosition.side_effect = lambda r, c: cells.get((r, c))
+                    return tbl
+
+                mock_inputs = MagicMock()
+                mock_inputs.addBoolValueInput.side_effect = lambda bid, nm, *_a: _make_inp(
+                    root_store, bid, name=nm, value=(bool(_a[-1]) if _a else False), objectType="Bool"
+                )
+                mock_inputs.addStringValueInput.side_effect = lambda sid, _nm, val: _make_inp(
+                    root_store, sid, value=val, objectType="String"
+                )
+                mock_inputs.addTextBoxCommandInput.side_effect = lambda tid, *_a: _make_inp(
+                    root_store, tid, text="", objectType="TextBox"
+                )
+                mock_inputs.addTableCommandInput.side_effect = _make_table
+                mock_inputs.addGroupCommandInput.side_effect = _make_group
+                # Root itemById intentionally does NOT expose group_store items to verify _FindCommandInputById fallback!
+                mock_inputs.itemById.side_effect = lambda k: root_store.get(k)
+
+                mock_cmd = MagicMock(commandInputs=mock_inputs)
+                mock_app = MagicMock()
+                mock_app.version = "2.0.20999"
+                mock_app.productName = "Autodesk Fusion"
+                mock_app.currentUser = MagicMock(email="secret-pii@example.com")
+                mock_doc = MagicMock()
+                mock_doc.name = "TestBracket"
+                mock_doc.unitsManager.defaultLengthUnits = "in"
+                mock_doc.products.itemByProductType.return_value = cam
+                mock_app.activeDocument = mock_doc
+
+                doc_settings = dict(PostClear.defaultSettings)
+                doc_settings["ncPrograms"] = ["ProgA"]
+                doc_settings["ncProgram"] = "ProgA"
+
+                mock_mgr = MagicMock()
+                mock_mgr.GetSettings.return_value = doc_settings
+                PostClear.settingsMgr = mock_mgr
+
+                with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                     patch.object(PostClear.adsk.core, "CommandCreatedEventArgs", MagicMock(cast=lambda a: MagicMock(command=mock_cmd)), create=True), \
+                     patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                     patch("PostClear.GetNcProgramSetupsAndOperations", return_value=([MagicMock(name="Setup 1")], {})):
+                    PostClear.CommandEventHandler().notify(MagicMock())
+
+                self.assertIn("debug_log", group_store)
+                self.assertEqual(group_store["debug_log"].name, "Produce debug log")
+                self.assertFalse(group_store["debug_log"].value)
+
+                # CommandInputChangedHandler toggles debug_log and updates doc_settings
+                changed_handler = PostClear.CommandInputChangedHandler(doc_settings)
+                group_store["debug_log"].value = True
+                with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                     patch.object(
+                        PostClear.adsk.core,
+                        "InputChangedEventArgs",
+                        MagicMock(cast=lambda a: MagicMock(input=group_store["debug_log"], inputs=mock_inputs)),
+                        create=True,
+                     ), patch.object(PostClear.adsk.core, "GroupCommandInput", MagicMock(classType=lambda: "Group"), create=True), \
+                        patch.object(PostClear.adsk.core, "DropDownCommandInput", MagicMock(classType=lambda: "DropDown"), create=True):
+                    changed_handler.notify(MagicMock())
+                self.assertTrue(doc_settings["debug_log"])
+
+                # Clicking "Save as default" persists debug_log=True via settingsMgr.SaveDefault
+                with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                     patch.object(
+                        PostClear.adsk.core,
+                        "InputChangedEventArgs",
+                        MagicMock(cast=lambda a: MagicMock(input=root_store["save"], inputs=mock_inputs)),
+                        create=True,
+                     ):
+                    changed_handler.notify(MagicMock())
+                mock_mgr.SaveDefault.assert_called_once()
+                self.assertIs(mock_mgr.SaveDefault.call_args[0][0]["debug_log"], True)
+
+                # Prepare minimal milling dump for pipeline._dbg_pipe gating check
+                import json as _json
+                from geometry.models import BoxStock3D, MillToolGeometry, ToolAssembly, WorkpieceDefinition
+                from pipeline import PipelineOrchestrator
+
+                pipe_dump = os.path.join(tmpdir, "pipe_ctx.json")
+                with open(pipe_dump, "w", encoding="utf-8") as f:
+                    _json.dump(
+                        {
+                            "unit": 0,
+                            "stock": {"minX": -1.0, "minY": -1.0, "minZ": -1.0, "maxX": 1.0, "maxY": 1.0, "maxZ": 0.0},
+                            "sections": [
+                                {
+                                    "id": 0,
+                                    "type": 0,
+                                    "unit": 0,
+                                    "operationName": "Face1",
+                                    "zClearance": 0.5,
+                                    "tool": {"number": 1, "diameter": 0.5, "fluteLength": 1.0, "bodyLength": 1.5, "isMill": True},
+                                    "events": [
+                                        {"idx": 0, "type": "linear", "motion": "rapid", "x": 0.0, "y": 0.0, "z": 0.6},
+                                        {"idx": 1, "type": "linear", "motion": "feed", "x": 0.5, "y": 0.0, "z": -0.1, "feed": 20.0},
+                                    ],
+                                }
+                            ],
+                        },
+                        f,
+                    )
+                pipe_wp = WorkpieceDefinition(stock=BoxStock3D(x_min=-25.4, x_max=25.4, y_min=-25.4, y_max=25.4, z_min=-25.4, z_max=0.0))
+                pipe_tool = ToolAssembly(
+                    tool_id=1,
+                    name="T1",
+                    geometry=MillToolGeometry(diameter=12.7, corner_radius=0.0, flute_length=25.4, overall_length=38.1),
+                )
+                pipe_orch = PipelineOrchestrator()
+                pipe_base_post = os.path.join(os.path.dirname(PostClear.__file__), "universal_replayer.cps")
+                pipe_out_nc = os.path.join(tmpdir, "pipe_out.nc")
+
+                # 3. Execute with debug_log=False -> silent, PerformPostProcess & pipeline._dbg_pipe do NOT create temp_log
+                group_store["debug_log"].value = False
+                exec_handler = PostClear.CommandExecuteHandler(doc_settings)
+                with patch.object(
+                    PostClear.adsk.core,
+                    "CommandEventArgs",
+                    MagicMock(cast=lambda a: MagicMock(command=mock_cmd)),
+                    create=True,
+                ), \
+                     patch.object(PostClear.adsk.core, "GroupCommandInput", MagicMock(classType=lambda: "Group"), create=True), \
+                     patch.object(PostClear.adsk.core, "DropDownCommandInput", MagicMock(classType=lambda: "DropDown"), create=True), \
+                     patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                     patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                     patch("PostClear.GetSelectedNcPrograms", return_value=[]):
+                    exec_handler.notify(MagicMock())
+                self.assertFalse(doc_settings["debug_log"])
+                with patch.object(pipe_orch, "replay_combined_context", return_value="M30\n"):
+                    pipe_orch.run(
+                        context_dump_paths=[pipe_dump],
+                        base_post_path=pipe_base_post,
+                        workpiece=pipe_wp,
+                        tools_by_op={"Face1": pipe_tool},
+                        final_cnc_path=pipe_out_nc,
+                        is_turning=False,
+                    )
+                self.assertFalse(os.path.exists(temp_log))
+
+                # 4. Execute with debug_log=True -> PerformPostProcess writes rich diagnostic banner + traces
+                group_store["debug_log"].value = True
+                with patch.object(
+                    PostClear.adsk.core,
+                    "CommandEventArgs",
+                    MagicMock(cast=lambda a: MagicMock(command=mock_cmd)),
+                    create=True,
+                ), \
+                     patch.object(PostClear.adsk.core, "GroupCommandInput", MagicMock(classType=lambda: "Group"), create=True), \
+                     patch.object(PostClear.adsk.core, "DropDownCommandInput", MagicMock(classType=lambda: "DropDown"), create=True), \
+                     patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                     patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                     patch("PostClear.GetSelectedNcPrograms", return_value=[]):
+                    exec_handler.notify(MagicMock())
+
+                # Simulate downstream module logging while enabled (solid_mesh._dbg, context_parser._dbg_ctx, pipeline._dbg_pipe)
+                solid_mesh._dbg("mesh-helper-trace")
+                context_parser.extract_workpiece_from_context({"stockMode": "default"})
+                with patch.object(pipe_orch, "replay_combined_context", return_value="M30\n"):
+                    pipe_orch.run(
+                        context_dump_paths=[pipe_dump],
+                        base_post_path=pipe_base_post,
+                        workpiece=pipe_wp,
+                        tools_by_op={"Face1": pipe_tool},
+                        final_cnc_path=pipe_out_nc,
+                        is_turning=False,
+                    )
+
+                self.assertTrue(os.path.isfile(temp_log))
+                with open(temp_log, "r", encoding="utf-8") as f:
+                    log_text = f.read()
+
+                self.assertIn("=== PostClear Diagnostic Log ===", log_text)
+                self.assertIn("Add-In: version=3.0.0", log_text)
+                self.assertIn("Fusion 360: version=2.0.20999", log_text)
+                self.assertIn("product=Autodesk Fusion", log_text)
+                self.assertIn("doc='TestBracket', units=in", log_text)
+                self.assertIn(f"executable={sys.executable}", log_text)
+                self.assertIn("OS/Platform:", log_text)
+                self.assertIn("Dependencies: abi=", log_text)
+                self.assertIn("numpy=", log_text)
+                self.assertIn("shapely=", log_text)
+                self.assertIn("matplotlib=", log_text)
+                self.assertIn("selected_nc_programs=['ProgA']", log_text)
+                self.assertIn("restore_rapid=True", log_text)
+                self.assertIn("mesh-helper-trace", log_text)
+                self.assertIn("extract_workpiece_from_context:", log_text)
+                self.assertIn("PipelineOrchestrator.run: workpiece stock=", log_text)
+                self.assertNotIn("secret-pii@example.com", log_text)
+
+                # Verify SWIG property RuntimeError does not drop diagnostic banner
+                class _SwigErrorObj:
+                    @property
+                    def version(self):
+                        raise RuntimeError("2 : InternalValidationError")
+                    @property
+                    def setups(self):
+                        raise RuntimeError("2 : InternalValidationError")
+                header_swig = PostClear._FormatDiagnosticHeader(
+                    app=_SwigErrorObj(),
+                    doc=mock_doc,
+                    cam=_SwigErrorObj(),
+                    docSettings=doc_settings,
+                )
+                self.assertIn("Fusion 360: version=unknown", header_swig)
+                self.assertIn("cam_setups=unknown", header_swig)
+            finally:
+                PostClear._LOG_PATH = saved_log_path
+                PostClear._SetDebugLogEnabled(saved_enabled)
+                PostClear.handlers[:] = saved_handlers
+                PostClear.settingsMgr = saved_settings_mgr
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ else:
     if not hasattr(adsk.cam, "CAMPattern"):
         adsk.cam.CAMPattern = type("CAMPattern", (adsk.cam.CAMFolder,), {})
 
-from PostProcessAll import (
+from PostClear import (
     GetNcProgramSetupsAndOperations,
     GetNcProgram,
 )
@@ -287,7 +287,7 @@ class TestNCProgramSelection(unittest.TestCase):
 
     def test_batch_partitioning_respects_target_operations(self):
         """Verify single-tool batching only includes the specified target_operations."""
-        from PostProcessAll import _extract_cam_collection
+        from PostClear import _extract_cam_collection
 
         # Setup 1 has 3 ops: op1_1 (T1), op1_2 (T1), op1_3 (T2)
         # Pass target_operations containing only op1_2 and op1_3
@@ -321,7 +321,7 @@ class TestNCProgramSelection(unittest.TestCase):
 
     def test_unhashable_setup_as_dict_key(self):
         """Verify that SetupOperationsMap and SetupListDefaultDict never raise TypeError with unhashable Setup."""
-        from PostProcessAll import SetupOperationsMap, SetupListDefaultDict, _lookup_setup_ops
+        from PostClear import SetupOperationsMap, SetupListDefaultDict, _lookup_setup_ops
 
         # Verify MockSetup is indeed unhashable
         with self.assertRaises(TypeError):
@@ -344,14 +344,14 @@ class TestNCProgramSelection(unittest.TestCase):
 
     def test_is_folder_cam_object_recognizes_campattern(self):
         """Verify _is_folder_cam_object recognizes CAMPattern by class, inheritance, and objectType."""
-        from PostProcessAll import _is_folder_cam_object
+        from PostClear import _is_folder_cam_object
 
         pattern = MockPattern("CircularPattern1", [self.op1_1], parent=self.setup1)
         self.assertTrue(_is_folder_cam_object(pattern))
 
     def test_ncprogram_selection_with_campattern_folder(self):
         """Verify that an NCProgram selecting a CAMPattern extracts the operations inside it."""
-        from PostProcessAll import GetNcProgramSetupsAndOperations
+        from PostClear import GetNcProgramSetupsAndOperations
 
         pattern = MockPattern("CircularPattern1", [self.op1_1, self.op1_2], parent=self.setup1)
         # Setup has 3 ops, pattern contains 2 ops
@@ -366,7 +366,7 @@ class TestNCProgramSelection(unittest.TestCase):
 
     def test_check_operation_toolpath_status(self):
         """Verify _check_operation_toolpath_status correctly detects suppressed, empty, and invalid operations."""
-        from PostProcessAll import _check_operation_toolpath_status
+        from PostClear import _check_operation_toolpath_status
 
         # Suppressed op is not flagged
         suppressed_op = MockOperation("SuppressedOp", 701, is_suppressed=True, has_toolpath=False)
@@ -403,7 +403,7 @@ class TestNCProgramSelection(unittest.TestCase):
 
     def test_ncprogram_detects_empty_and_invalid_toolpaths(self):
         """Verify GetNcProgramSetupsAndOperations collects empty/invalid ops and excludes them from valid ops."""
-        from PostProcessAll import GetNcProgramSetupsAndOperations
+        from PostClear import GetNcProgramSetupsAndOperations
 
         valid_op = MockOperation("Op1_Valid", 801)
         empty_op = MockOperation("Op2_Empty", 802, has_toolpath=False)

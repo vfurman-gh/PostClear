@@ -72,7 +72,7 @@ from geometry.models import (
     WorkpieceDefinition,
 )
 from pipeline import PipelineOrchestrator
-import PostProcessAll
+import PostClear
 
 
 class MockGrid:
@@ -371,8 +371,8 @@ class TestBatch6RemainingItems(unittest.TestCase):
         mock_prog = MagicMock()
         mock_prog.parameters.itemByName.return_value = None
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app):
-            ret = PostProcessAll.PostProcessSetup(
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app):
+            ret = PostClear.PostProcessSetup(
                 fname="Setup3",
                 setup=s3,
                 setupFolder=self.tmp_dir,
@@ -422,9 +422,9 @@ class TestBatch6RemainingItems(unittest.TestCase):
         mock_prog = MagicMock()
         mock_prog.parameters.itemByName.return_value = None
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-             patch("PostProcessAll._PostProcessUnifiedPipeline", return_value=None):
-            ret = PostProcessAll.PostProcessSetup(
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+             patch("PostClear._PostProcessUnifiedPipeline", return_value=None):
+            ret = PostClear.PostProcessSetup(
                 fname="Setup3",
                 setup=s3,
                 setupFolder=self.tmp_dir,
@@ -461,8 +461,8 @@ class TestBatch6RemainingItems(unittest.TestCase):
         mock_prog = MagicMock()
         mock_prog.parameters.itemByName.return_value = None
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app):
-            ret = PostProcessAll.PostProcessSetup(
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app):
+            ret = PostClear.PostProcessSetup(
                 fname="Setup2",
                 setup=s2,
                 setupFolder=self.tmp_dir,
@@ -500,9 +500,9 @@ class TestBatch6RemainingItems(unittest.TestCase):
         mock_cb = MagicMock()
         mock_cb.progress_dialog = mock_progress
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app), \
-             patch("PostProcessAll._PostProcessUnifiedPipeline", return_value=None):
-            PostProcessAll.PostProcessSetup(
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
+             patch("PostClear._PostProcessUnifiedPipeline", return_value=None):
+            PostClear.PostProcessSetup(
                 fname="Setup2",
                 setup=s2,
                 setupFolder=self.tmp_dir,
@@ -587,7 +587,7 @@ class TestBatch6RemainingItems(unittest.TestCase):
             with patch("pipeline.merge_context_dumps", return_value=ctx), \
                  patch("pipeline.parse_context_dump", return_value=[]), \
                  patch("pipeline.extract_tools_from_context", return_value={}), \
-                 patch("PostProcessAll._dbg_global") as mock_dbg:
+                 patch("PostClear._dbg_global") as mock_dbg:
                 try:
                     orchestrator.run(
                         context_dump_paths=[dump_p],
@@ -655,9 +655,9 @@ class TestBatch6RemainingItems(unittest.TestCase):
         mock_ui.palettes = MagicMock()
 
         long_skip = "Setup error details:\n" + ("A" * 1500)
-        with patch("PostProcessAll._BuildNotificationHTML") as mock_html_builder, \
+        with patch("PostClear._BuildNotificationHTML") as mock_html_builder, \
              patch("builtins.open", MagicMock()):
-            PostProcessAll._NotifyPostProcessResult(
+            PostClear._NotifyPostProcessResult(
                 ui=mock_ui,
                 cntFiles=1,
                 cntSkipped=1,
@@ -685,8 +685,8 @@ class TestBatch6RemainingItems(unittest.TestCase):
         mock_doc.products.itemByProductType.return_value = mock_cam
         mock_app = MagicMock(activeDocument=mock_doc, userInterface=MagicMock())
 
-        with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app):
-            ret = PostProcessAll.PostProcessSetup(
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app):
+            ret = PostClear.PostProcessSetup(
                 fname="Setup1",
                 setup=mock_setup,
                 setupFolder=self.tmp_dir,
@@ -714,7 +714,7 @@ class TestBatch6RemainingItems(unittest.TestCase):
 
         try:
             with self.assertRaises(ZeroDivisionError):
-                with PostProcessAll._ScopedEnv(updates):
+                with PostClear._ScopedEnv(updates):
                     self.assertEqual(os.environ.get("BASE_POST"), "/tmp/new_base.cps")
                     self.assertNotIn("TARGET_INTERMEDIATE_CNC", os.environ)
                     self.assertEqual(os.environ.get("DUMPER_CONFIG_PATH"), "/tmp/new_cfg.json")
@@ -764,7 +764,7 @@ class TestBatch6RemainingItems(unittest.TestCase):
             f.write("X" * 200)
 
         # Cap at 100 bytes
-        PostProcessAll._RotateLogIfNeeded(log_path=test_log, max_bytes=100)
+        PostClear._RotateLogIfNeeded(log_path=test_log, max_bytes=100)
 
         self.assertFalse(os.path.isfile(test_log))
         self.assertTrue(os.path.isfile(test_rot))
@@ -778,7 +778,7 @@ class TestBatch6RemainingItems(unittest.TestCase):
         """Touched repository files contain only LF newlines and no CRLF or CRCRLF."""
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         touched = [
-            "PostProcessAll.py",
+            "PostClear.py",
             "pipeline.py",
             "geometry/models.py",
             "geometry/solid_mesh.py",

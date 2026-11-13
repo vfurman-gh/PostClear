@@ -34,9 +34,9 @@ from geometry.models import (
 
 
 def _dbg(msg: str) -> None:
-    """Internal debug logging helper that forwards to PostProcessAll._dbg_global if available."""
+    """Internal debug logging helper that forwards to PostClear._dbg_global if available."""
     try:
-        from PostProcessAll import _dbg_global
+        from PostClear import _dbg_global
         _dbg_global(msg)
     except Exception:
         pass

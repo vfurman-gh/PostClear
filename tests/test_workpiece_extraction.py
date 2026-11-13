@@ -117,7 +117,7 @@ class TestWorkpieceExtraction(unittest.TestCase):
 
         setup = MockSetup(stock_params)
 
-        from PostProcessAll import _ExtractWorkpieceFromSetup
+        from PostClear import _ExtractWorkpieceFromSetup
 
         wp = _ExtractWorkpieceFromSetup(setup)
         self.assertIsNotNone(wp)
@@ -129,7 +129,7 @@ class TestWorkpieceExtraction(unittest.TestCase):
 
     def test_03_resolve_base_post_path(self):
         """Prove _ResolveBasePostPath safely returns existing vendor post for both turning and milling."""
-        from PostProcessAll import _ResolveBasePostPath
+        from PostClear import _ResolveBasePostPath
 
         # When program is None, no fallback guessing is performed; returns empty string
         self.assertEqual(_ResolveBasePostPath(None), "")
@@ -160,7 +160,7 @@ class TestWorkpieceExtraction(unittest.TestCase):
             with open(milling_cps, "w", encoding="utf-8") as f:
                 f.write('capabilities = CAPABILITY_MILLING;\ndescription = "Tormach PathPilot";\n')
 
-            with unittest.mock.patch("PostProcessAll._GetPostSearchDirs", return_value=[tmp_dir]):
+            with unittest.mock.patch("PostClear._GetPostSearchDirs", return_value=[tmp_dir]):
                 resolved_turn = _ResolveBasePostPath(MockTurningProg(), is_turning=True)
                 self.assertTrue(os.path.isfile(resolved_turn))
                 self.assertTrue(resolved_turn.endswith("centroid_turning.cps"))

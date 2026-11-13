@@ -24,7 +24,7 @@ By separating **Pass 1: Per-Batch Context Extraction (`universal_dumper.cps`)** 
 
 ### 1.2 Seven Core Architectural Invariants
 1. **Single Pathway (Zero G-Code Parsing)**: Never parse machine G-code (`parse_cnc_file` is permanently removed). All geometric verification operates strictly on exact floating-point coordinates captured from the Fusion Post Kernel via [`universal_dumper.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_dumper.cps).
-2. **Per-Batch Context Extraction**: Operations in a setup are partitioned into single-tool batches (`[(tool_num, [op1, ...]), ...]`). Each single-tool batch is posted individually through [`universal_dumper.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_dumper.cps) (or staged [`universal_dumper_export_stock.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/PostProcessAll.py#L2713-L2720) for Batch 0 of `"From Preceding Setup"` setups so `post --interrogate` Safe Mode enables native STL stock export).
+2. **Per-Batch Context Extraction**: Operations in a setup are partitioned into single-tool batches (`[(tool_num, [op1, ...]), ...]`). Each single-tool batch is posted individually through [`universal_dumper.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/universal_dumper.cps) (or staged [`universal_dumper_export_stock.cps`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/PostClear.py) for Batch 0 of `"From Preceding Setup"` setups so `post --interrogate` Safe Mode enables native STL stock export).
 3. **Dialect-Independent Multi-Operation Merging**: [`merge_context_dumps()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L31-L132) in [`context_parser.py`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py) merges the per-batch JSON context dumps into a single unified multi-section context document, re-indexing `id` (`0..N-1`), `batchIdx`, and `batchSectionIdx`, and propagating `stockPath`, `stockMode`, `stockUnit`, `workpieceHint`, and `rapidMode`.
 4. **Unified Continuous IPW Verification**: [`parse_context_dump()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/context_parser.py#L135-L475) extracts a single continuous `List[MotionSegment]` across all tools and operations. [`MillHeightfieldVerifier.verify_toolpath()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/heightfield_engine.py#L243-L738) (for 3D Milling) or [`Lathe2DIPWVerifier.verify_toolpath()`](file:///Users/vadimf/Documents/Fusion360-Batch-Post-master/geometry/lathe_engine.py#L130-L457) (for 2D Turning) is invoked **once** on the complete setup so that in-process workpiece (IPW) stock removal carries over accurately across all tools and operations.
 5. **Per-Event Rapid Promotion with Uniform Caller Length & Safety Filtering**:
@@ -39,7 +39,7 @@ By separating **Pass 1: Per-Batch Context Extraction (`universal_dumper.cps`)** 
 
 ```mermaid
 flowchart TD
-    subgraph Fusion["Pass 1: Fusion 360 Add-In (PostProcessAll.py)"]
+    subgraph Fusion["Pass 1: Fusion 360 Add-In (PostClear.py)"]
         Setup["Active Turning / Milling Setup"] --> ExtractModel["_ExtractWorkpieceFromSetup()\n(Box / Cylinder / Tube / From Solid)"]
         Setup --> Partition["Partition into Single-Tool Batches\nBatch 0 (T1), Batch 1 (T2), ..."]
         Partition --> Dump0["Post Batch 0 with universal_dumper(_export_stock).cps\n(DUMPER_CONFIG_PATH + BASE_POST + TARGET_INTERMEDIATE_CNC)"]

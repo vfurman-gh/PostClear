@@ -514,7 +514,7 @@ class PipelineOrchestrator:
 
             def _dbg_pipe(msg: str) -> None:
                 try:
-                    from PostProcessAll import _dbg_global
+                    from PostClear import _dbg_global
                     _dbg_global(msg)
                 except Exception:
                     pass
@@ -582,7 +582,7 @@ class PipelineOrchestrator:
                     except ImportError as exc:
                         raise RuntimeError(
                             "Turning 2D IPW verification requires 'shapely', which is not installed "
-                            "(offline first-time setup failed). Connect to the internet and re-run Post Process All."
+                            "(offline first-time setup failed). Connect to the internet and re-run Post Clear."
                         ) from exc
                     verifier = Lathe2DIPWVerifier(tool_scale_to_mm=1.0)
                 else:

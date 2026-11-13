@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Standalone cross-platform release packager for PostProcessAll.
+"""Standalone cross-platform release packager for PostClear.
 
-Creates dist/PostProcessAll-v<version>.zip (or PostProcessAll-v<version>-<abi>.zip
+Creates dist/PostClear-v<version>.zip (or PostClear-v<version>-<abi>.zip
 with --bundle-wheels) containing clean runtime source files under top-level
-PostProcessAll/ without any installer scripts or dev-only directories.
+PostClear/ without any installer scripts or dev-only directories.
 """
 
 import argparse
@@ -24,11 +24,11 @@ if REPO_ROOT not in sys.path:
 import dep_bootstrap
 
 
-ADDIN_NAME = "PostProcessAll"
+ADDIN_NAME = "PostClear"
 
 RUNTIME_TOP_FILES = (
-    "PostProcessAll.py",
-    "PostProcessAll.manifest",
+    "PostClear.py",
+    "PostClear.manifest",
     "dep_bootstrap.py",
     "context_parser.py",
     "pipeline.py",
@@ -43,7 +43,7 @@ LF_TEXT_EXTS = (".py", ".cps", ".manifest", ".md", ".txt")
 
 
 def _read_manifest_version(source_dir: str) -> str:
-    manifest_path = os.path.join(source_dir, "PostProcessAll.manifest")
+    manifest_path = os.path.join(source_dir, "PostClear.manifest")
     if os.path.isfile(manifest_path):
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
@@ -129,7 +129,7 @@ def build_release(
 
     version = _read_manifest_version(source_dir)
     abi_tag = _abi_from_platform_tag(platform_tag, python_version) if bundle_wheels else None
-    zip_name = f"PostProcessAll-v{version}-{abi_tag}.zip" if abi_tag else f"PostProcessAll-v{version}.zip"
+    zip_name = f"{ADDIN_NAME}-v{version}-{abi_tag}.zip" if abi_tag else f"{ADDIN_NAME}-v{version}.zip"
     zip_path = os.path.join(dist_dir, zip_name)
 
     with tempfile.TemporaryDirectory() as tmp_stage:
@@ -175,7 +175,7 @@ def build_release(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build PostProcessAll release archive")
+    parser = argparse.ArgumentParser(description="Build PostClear release archive")
     parser.add_argument("--output-dir", default=None, help="Output directory (defaults to dist/)")
     parser.add_argument("--bundle-wheels", action="store_true", help="Bundle binary wheels into packages/<abi>/")
     parser.add_argument("--platform-tag", default=None, help="pip --platform tag for --bundle-wheels")

@@ -1,6 +1,6 @@
 """Cross-platform Fusion 360 Python & runtime dependency bootstrap utilities.
 
-Pure Python standard library module shared by PostProcessAll.py, install_addin.py,
+Pure Python standard library module shared by PostClear.py
 and scripts/build_release.py across macOS and Windows.
 """
 

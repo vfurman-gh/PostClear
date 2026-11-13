@@ -585,7 +585,7 @@ def extract_workpiece_from_context(
 
     def _dbg_ctx(msg: str) -> None:
         try:
-            from PostProcessAll import _dbg_global
+            from PostClear import _dbg_global
             _dbg_global(msg)
         except Exception:
             pass
@@ -615,7 +615,7 @@ def extract_workpiece_from_context(
                 except ImportError as exc:
                     raise RuntimeError(
                         "Loading in-process STL stock requires 'numpy', which is not installed "
-                        "(offline first-time setup failed). Connect to the internet and re-run Post Process All."
+                        "(offline first-time setup failed). Connect to the internet and re-run Post Clear."
                     ) from exc
             try:
                 from geometry.solid_mesh import (

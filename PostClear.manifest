@@ -1,0 +1,13 @@
+{
+	"autodeskProduct":	"Fusion360",
+	"type":	"addin",
+	"id":	"ea91b6b2-8167-4e1a-a898-bc539d96f8de",
+	"author":	"Vadim Furman, agy",
+	"description":	{
+		"":	"Batch post-process CAM NC Programs with 3D/2D stock collision verification and safe G0 rapid restoration."
+	},
+	"version":	"3.0.0",
+	"runOnStartup":	true,
+	"supportedOS":	"windows|mac",
+	"editEnabled":	true
+}

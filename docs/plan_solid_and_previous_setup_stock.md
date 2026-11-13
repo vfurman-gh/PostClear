@@ -93,7 +93,7 @@ a test for this.
 - Replaced `_GetSetupStockMode` with typed enum check on `setup.stockMode` (`adsk.cam.SetupStockModes`).
 - Eliminated `stockSolids`-count heuristic so setups with stale solid collections retain correct box/cylinder classification.
 - Removed `getParameter("job:stockMode")` fallback probe from `universal_dumper.cps`; stock mode is passed cleanly via sidecar configuration.
-- Added comprehensive unit tests in `tests/test_postprocessall_pipeline_integration.py`.
+- Added comprehensive unit tests in `tests/test_postclear_pipeline_integration.py`.
 
 ### Phase 1 — "From Solid" (ACTIVE TARGET)
 - Read `setup.stockSolids` (BRep or Mesh). Tessellate BRep bodies with
@@ -112,7 +112,7 @@ a test for this.
 #### Implementation Summary:
 1. **Native CAM Post Engine Stock Export (`exportStock = true`)**:
    - When Fusion 360's post engine interrogates a `.cps` post processor that declares `"exportStock": true` (used by CAMplete/Vericut integrations), `Iron::PostProcess::exportSetupMeshData` automatically exports the setup's exact simulated in-process stock mesh as an STL file in the post output directory and passes its path via the global parameter `autodeskcam:stock-path`.
-   - Because `post --interrogate` runs in Safe Mode (where `getEnvironmentVariable` and `FileSystem.isFile` are disabled), `_PostProcessUnifiedPipeline` in `PostProcessAll.py` stages `universal_dumper_export_stock.cps` for `batch_0` of any `PreviousSetupStock` setup. `universal_dumper.cps` inspects `getConfigurationPath()` (which is allowed in Safe Mode) and sets `"exportStock": true` only for `batch_0`.
+   - Because `post --interrogate` runs in Safe Mode (where `getEnvironmentVariable` and `FileSystem.isFile` are disabled), `_PostProcessUnifiedPipeline` in `PostClear.py` stages `universal_dumper_export_stock.cps` for `batch_0` of any `PreviousSetupStock` setup. `universal_dumper.cps` inspects `getConfigurationPath()` (which is allowed in Safe Mode) and sets `"exportStock": true` only for `batch_0`.
 2. **Preceding Setup Validation (`PostProcessSetup`)**:
    - Walks all earlier non-suppressed setups (`all_setups[:s_idx]`) in browser order, verifying that preceding operations have valid toolpaths before posting.
 3. **STL Parsing, Unit Cross-Check (H2) & Alignment Verification (H4)**:

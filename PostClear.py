@@ -1,5 +1,5 @@
-#Author-Tim Paterson
-#Description-Post process all CAM setups, using the setup name as the output file name.
+#Author-Vadim Furman, agy
+#Description-Batch post-process CAM NC Programs with 3D/2D stock collision verification and safe G0 rapid restoration.
 
 import collections
 import contextlib
@@ -13,6 +13,7 @@ import json
 import math
 import os
 import pathlib
+import platform
 import re
 import shutil
 import subprocess
@@ -49,7 +50,7 @@ if not hasattr(adsk.cam, "PostOutputUnitOptions"):
 
 # Version number of settings as saved in documents and settings file
 # update this whenever settings content changes
-version = 17
+version = 18
 
 # Initial default values of settings
 defaultSettings = {
@@ -58,13 +59,14 @@ defaultSettings = {
     "ncPrograms": [],
     "output" : "",
     "restore_rapid" : True,
+    "debug_log" : False,
     # Groups are expanded or not
     "groupPersonal" : True
 }
 
 # Constants
-constCmdName = "Post Process All"
-constCmdDefId = "PatersonTech_PostProcessAll"
+constCmdName = "Post Clear"
+constCmdDefId = "PostClear_Cmd"
 constCAMWorkspaceId = "CAMEnvironment"
 constCAMActionsPanelId = "CAMActionPanel"
 constPostProcessControlId = "IronPostProcess"
@@ -73,14 +75,22 @@ constAttrGroup = constCmdDefId
 constAttrName = "settings"
 constAttrCompressedName = "CompressedName"
 constSettingsFileExt = ".settings"
-constNcProgramName = "PostProcessAll NC Program"
+constNcProgramName = "PostClear NC Program"
 constAddonDir = os.path.dirname(os.path.abspath(__file__))
 constDumperScript = os.path.join(constAddonDir, "universal_dumper.cps")
 constReplayerScript = os.path.join(constAddonDir, "universal_replayer.cps")
 constPackagesDir = os.path.join(constAddonDir, "packages")
 
-_LOG_PATH = os.path.join(tempfile.gettempdir(), "postprocess_debug.log")
+_LOG_PATH = os.path.join(tempfile.gettempdir(), "postclear_debug.log")
 _MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB capped debug log
+_debug_log_enabled = False
+
+
+def _SetDebugLogEnabled(enabled: bool) -> None:
+    """Enable or disable diagnostic file logging to _LOG_PATH."""
+    global _debug_log_enabled
+    _debug_log_enabled = bool(enabled)
+
 
 def _RotateLogIfNeeded(log_path: str = _LOG_PATH, max_bytes: int = _MAX_LOG_SIZE_BYTES) -> None:
     """Rotate log file to .1 if size exceeds max_bytes."""
@@ -93,13 +103,152 @@ def _RotateLogIfNeeded(log_path: str = _LOG_PATH, max_bytes: int = _MAX_LOG_SIZE
     except Exception:
         pass
 
+
 def _dbg_global(msg):
+    if not _debug_log_enabled:
+        return
     try:
         _RotateLogIfNeeded(_LOG_PATH)
         t = time.strftime('%H:%M:%S')
         with open(_LOG_PATH, "a", encoding="utf8") as f:
             f.write(f"[{t}] {msg}\n")
             f.flush()
+    except Exception:
+        pass
+
+
+def _ReadAddinManifestVersion() -> str:
+    """Read the add-in version string from PostClear.manifest."""
+    manifest_path = os.path.join(constAddonDir, "PostClear.manifest")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ver = data.get("version")
+        if isinstance(ver, str) and ver.strip():
+            return ver.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _GetPackageVersionSafe(pkg_name: str) -> str:
+    """Return installed version string for pkg_name without failing if absent."""
+    try:
+        import importlib.metadata as _ilm
+        return str(_ilm.version(pkg_name))
+    except Exception:
+        pass
+    mod = sys.modules.get(pkg_name)
+    if mod is not None:
+        ver = getattr(mod, "__version__", None)
+        if isinstance(ver, str) and ver.strip():
+            return ver.strip()
+        return "loaded"
+    return "not installed"
+
+
+def _safe_getattr(obj, attr: str, default=None):
+    """Safely read an attribute even if Fusion SWIG C++ properties raise RuntimeError."""
+    if obj is None:
+        return default
+    try:
+        return getattr(obj, attr, default)
+    except Exception:
+        return default
+
+
+def _FormatDiagnosticHeader(app=None, doc=None, cam=None, docSettings=None, setups=None) -> str:
+    """Build a non-PII diagnostic banner covering Fusion, Python, OS, ABI/deps, and run config."""
+    try:
+        timestamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z %Z").strip()
+    except Exception:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    addin_ver = _ReadAddinManifestVersion()
+    raw_fusion_ver = _safe_getattr(app, "version")
+    fusion_ver = str(raw_fusion_ver).strip() if isinstance(raw_fusion_ver, (str, int, float)) and str(raw_fusion_ver).strip() else "unknown"
+    raw_prod_name = _safe_getattr(app, "productName")
+    prod_name = raw_prod_name.strip() if isinstance(raw_prod_name, str) and raw_prod_name.strip() else None
+
+    raw_doc_name = _safe_getattr(doc, "name")
+    doc_name = raw_doc_name.strip() if isinstance(raw_doc_name, str) and raw_doc_name.strip() else "unknown"
+    doc_unit = _GetDocumentStockUnit(doc) if doc is not None else "unknown"
+
+    py_ver = " ".join(sys.version.split())
+    py_impl = platform.python_implementation()
+    os_plat = platform.platform()
+    os_sys = f"{platform.system()} {platform.release()}".strip()
+    os_arch = platform.machine() or "unknown"
+    cpu_cnt = os.cpu_count()
+
+    abi_tag = "unknown"
+    abi_pkg_dir = constPackagesDir
+    abi_pkg_exists = False
+    abi_pkg_on_path = False
+    try:
+        import dep_bootstrap as _dep_bs
+        abi_tag = _dep_bs.get_abi_tag()
+        abi_pkg_dir = _dep_bs.get_abi_packages_dir(constAddonDir)
+        abi_pkg_exists = os.path.isdir(abi_pkg_dir)
+        abi_pkg_on_path = abi_pkg_dir in sys.path
+    except Exception:
+        pass
+
+    pkg_versions = ", ".join(
+        f"{pkg}={_GetPackageVersionSafe(pkg)}"
+        for pkg in ("numpy", "shapely", "matplotlib")
+    )
+
+    cfg = docSettings if isinstance(docSettings, dict) else {}
+    sel_progs = cfg.get("ncPrograms")
+    if not isinstance(sel_progs, list):
+        legacy_p = cfg.get("ncProgram")
+        sel_progs = [legacy_p] if isinstance(legacy_p, str) and legacy_p else []
+    restore_rapid = bool(cfg.get("restore_rapid", True))
+    dbg_enabled = bool(cfg.get("debug_log", False))
+
+    cam_setups_obj = _safe_getattr(cam, "setups")
+    cam_progs_obj = _safe_getattr(cam, "ncPrograms")
+    total_setups = _safe_getattr(cam_setups_obj, "count")
+    total_progs = _safe_getattr(cam_progs_obj, "count")
+    setups_str = str(total_setups) if isinstance(total_setups, int) else "unknown"
+    progs_str = str(total_progs) if isinstance(total_progs, int) else "unknown"
+
+    fusion_line = f"Fusion 360: version={fusion_ver}"
+    if prod_name:
+        fusion_line += f", product={prod_name}"
+
+    lines = [
+        "=== PostClear Diagnostic Log ===",
+        f"Timestamp: {timestamp}",
+        f"Add-In: version={addin_ver}, schema={version}, dir={constAddonDir}, log={_LOG_PATH}",
+        f"{fusion_line}, doc='{doc_name}', units={doc_unit}",
+        f"Python: {py_impl} {py_ver} | executable={sys.executable} | prefix={sys.prefix}",
+        f"OS/Platform: {os_plat} ({os_sys}) | arch={os_arch} | cpus={cpu_cnt}",
+        f"Dependencies: abi={abi_tag}, abi_dir={abi_pkg_dir} (exists={abi_pkg_exists}, on_sys_path={abi_pkg_on_path}), {pkg_versions}",
+        (
+            f"Invocation: selected_nc_programs={sel_progs}, restore_rapid={restore_rapid}, "
+            f"debug_log={dbg_enabled}, cam_setups={setups_str}, cam_nc_programs={progs_str}, "
+            f"incoming_setups={len(setups) if setups else 0}"
+        ),
+        "=====================================",
+    ]
+    return "\n".join(lines)
+
+
+def _LogInvocationDiagnostics(app=None, doc=None, cam=None, docSettings=None, setups=None) -> None:
+    """Write the invocation diagnostic banner to _LOG_PATH when debug logging is enabled."""
+    if not _debug_log_enabled:
+        return
+    try:
+        banner = _FormatDiagnosticHeader(
+            app=app,
+            doc=doc,
+            cam=cam,
+            docSettings=docSettings,
+            setups=setups,
+        )
+        _dbg_global(banner)
     except Exception:
         pass
 
@@ -137,24 +286,10 @@ def _NormalizeFileExtension(ext: Optional[str]) -> str:
     return clean
 
 
-def _ResolveSetupFolderAndFilename(outputFolder: str, setup_name: str) -> Tuple[str, str]:
-    """Split and sanitize setup name (supporting ':' subfolders) into (setupFolder, filename)."""
-    raw_segments = [s.strip() for s in setup_name.split(':')]
-    clean_segments = [_SanitizePathSegment(s) for s in raw_segments if s]
-    if not clean_segments:
-        clean_segments = ["unnamed"]
-    sFolder = os.path.join(outputFolder, *clean_segments[:-1]) if len(clean_segments) > 1 else outputFolder
-    sFname = clean_segments[-1]
-    return sFolder, sFname
-
 # Tool tip text
 toolTip = (
-    "Post process all setups into G-code for your machine.\n\n"
-    "The name of the setup is used for the name of the output "
-    "file adding the appropriate extension. A colon (':') in the name indicates "
-    "the preceding portion is the name of a subfolder. Multiple "
-    "colons can be used to nest subfolders. Spaces around colons "
-    "are removed."
+    "Post process selected NC Programs into G-code for your machine.\n\n"
+    "Each NC Program writes to its configured output filename and folder."
     )
 
 # Global list to keep all event handlers in scope.
@@ -234,6 +369,7 @@ def run(context):
     global settingsMgr
     ui = None
     try:
+        _SetDebugLogEnabled(False)
         is_app_startup = bool(isinstance(context, dict) and context.get("IsApplicationStartup"))
         _EnsureLocalModulesLoaded(force=True, allow_bootstrap=(not is_app_startup))
         settingsMgr = SettingsManager()
@@ -281,6 +417,7 @@ class SettingsManager:
             try:
                 docSettings = json.loads(attr.value)
                 if docSettings["version"] == version:
+                    docSettings["debug_log"] = bool(docSettings.get("debug_log", False))
                     return docSettings
             except Exception:
                 pass
@@ -332,6 +469,7 @@ class SettingsManager:
     def UpdateSettings(self, src, dst):
         if "restore_rapid" not in dst:
             dst["restore_rapid"] = dst.get("fastZ", dst.get("fastZHeuristic", True))
+        dst["debug_log"] = bool(dst.get("debug_log", False))
         if "ncPrograms" not in dst:
             legacy_prog = dst.get("ncProgram", "")
             dst["ncPrograms"] = [legacy_prog] if isinstance(legacy_prog, str) and legacy_prog else []
@@ -794,7 +932,7 @@ def _ResolveNcProgramOutputFilename(program, setup=None, fileExt: str = ".nc") -
     """
     Resolve output base filename from program's nc_program_filename parameter,
     falling back to program.name then setup.name only when missing or whitespace.
-    Strips trailing fileExt (case-insensitive) while preserving ':' subfolder syntax.
+    Strips trailing fileExt (case-insensitive).
     """
     raw_name = ""
     if program is not None and hasattr(program, "parameters") and program.parameters is not None:
@@ -1303,6 +1441,7 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
             ordered_checked = [n for n in all_prog_names if n in checked_set]
             docSettings["ncPrograms"] = ordered_checked
             docSettings["ncProgram"] = ordered_checked[0] if ordered_checked else ""
+            docSettings["debug_log"] = bool(docSettings.get("debug_log", False))
 
             # Connect to the execute event.
             onExecute = CommandExecuteHandler(docSettings)
@@ -1362,7 +1501,7 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                             pass
                     file_ext = _NormalizeFileExtension(raw_ext) if raw_ext else ".nc"
                     raw_fname = _ResolveNcProgramOutputFilename(prog, setup_obj, file_ext)
-                    _, leaf_fname = _ResolveSetupFolderAndFilename("", raw_fname)
+                    leaf_fname = _SanitizePathSegment(raw_fname)
                     info_str = f"{setup_name} -> {leaf_fname}{file_ext}"
 
                 info_inp = inputs.addStringValueInput(f"ncprog_info_{idx}", "", info_str)
@@ -1387,7 +1526,22 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                 "• <b>Turning:</b> Promotes collision-free air moves verified against dynamic 2D IPW simulation.<br>"
                 "• <b>Milling:</b> Promotes upward vertical Z+ retract moves reaching or exceeding clearance height.<br>"
                 "Restored moves are annotated with comments in the output program.")
-           
+
+            # check box to enable optional diagnostic debug log
+            debug_input = inputGroup.children.addBoolValueInput(
+                "debug_log",
+                "Produce debug log",
+                True,
+                "",
+                bool(docSettings.get("debug_log", False)),
+            )
+            debug_input.tooltip = "Write Diagnostic Debug Log"
+            debug_input.tooltipDescription = (
+                "Write diagnostic logs (including Fusion 360 version, Python environment, and "
+                "verification details) to <b>postclear_debug.log</b> in the system temp folder:<br>"
+                f"<code>{html.escape(_LOG_PATH)}</code>"
+            )
+
             inputGroup.isExpanded = docSettings["groupPersonal"]
 
             # button to save default settings
@@ -1519,6 +1673,23 @@ class CommandValidateInputsHandler(adsk.core.ValidateInputsEventHandler):
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
 
 
+def _FindCommandInputById(inputs, input_id: str):
+    """Look up a CommandInput at root level or inside group inputs (handles Fusion API and test mocks)."""
+    if inputs is None or not input_id:
+        return None
+    inp = inputs.itemById(input_id) if hasattr(inputs, "itemById") else None
+    if inp is not None:
+        return inp
+    grp = inputs.itemById("groupPersonal") if hasattr(inputs, "itemById") else None
+    children = getattr(grp, "children", None) if grp is not None else None
+    if children is not None and hasattr(children, "itemById"):
+        try:
+            return children.itemById(input_id)
+        except Exception:
+            return None
+    return None
+
+
 # Event handler for the execute event.
 class CommandExecuteHandler(adsk.core.CommandEventHandler):
     def __init__(self, docSettings):
@@ -1539,7 +1710,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
         for key in list(self.docSettings.keys()):
             if key in ("ncPrograms", "ncProgram"):
                 continue
-            inp = inputs.itemById(key)
+            inp = _FindCommandInputById(inputs, key)
             if inp:
                 if inp.objectType == adsk.core.GroupCommandInput.classType():
                     self.docSettings[key] = inp.isExpanded
@@ -1548,9 +1719,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                         self.docSettings[key] = inp.selectedItem.name
                 elif hasattr(inp, "value"):
                     self.docSettings[key] = inp.value
+        _SetDebugLogEnabled(bool(self.docSettings.get("debug_log", False)))
         _dbg_global(
             f"CommandExecuteHandler execute: ncPrograms={self.docSettings.get('ncPrograms')}, "
-            f"restore_rapid={self.docSettings.get('restore_rapid')}"
+            f"restore_rapid={self.docSettings.get('restore_rapid')}, "
+            f"debug_log={self.docSettings.get('debug_log', False)}"
         )
         PerformPostProcess(self.docSettings)
 
@@ -1560,6 +1733,7 @@ def PerformPostProcess(docSettings, setups=None):
     ui = None
     progress = None
     try:
+        _SetDebugLogEnabled(bool(docSettings.get("debug_log", False)) if isinstance(docSettings, dict) else False)
         app = adsk.core.Application.get()
         ui  = app.userInterface
         doc = app.activeDocument
@@ -1569,6 +1743,8 @@ def PerformPostProcess(docSettings, setups=None):
         cntSkipped = 0
         lstSkipped = ""
         verifyResults.clear()
+        if _debug_log_enabled:
+            _LogInvocationDiagnostics(app=app, doc=doc, cam=cam, docSettings=docSettings, setups=setups)
         _dbg_global(f"PerformPostProcess entered: incoming setups count={len(setups) if setups else 0}")
 
         global settingsMgr
@@ -1708,7 +1884,7 @@ def PerformPostProcess(docSettings, setups=None):
                         continue
 
                     raw_fname = _ResolveNcProgramOutputFilename(program, setup, fileExt)
-                    sFolder, sFname = _ResolveSetupFolderAndFilename(outputFolder, raw_fname)
+                    sFolder, sFname = outputFolder, _SanitizePathSegment(raw_fname)
                     target_path = os.path.join(sFolder, sFname + fileExt)
                     abs_target = os.path.abspath(target_path)
 
@@ -1976,7 +2152,7 @@ def _RecordVerifyResult(setup, cncPath, reportText, reportPath=None, pngPath=Non
     try:
         col_count = len(collisions or [])
         adsk.core.Application.get().log(
-            f"[PostProcessAll] Verified '{setup.name}': {promoted} rapid moves restored, {col_count} collision(s) | Report: {reportPath}"
+            f"[PostClear] Verified '{setup.name}': {promoted} rapid moves restored, {col_count} collision(s) | Report: {reportPath}"
         )
     except Exception:
         pass
@@ -2338,6 +2514,11 @@ def _EnsureLocalModulesLoaded(force=False, allow_bootstrap=True, progress_cb=Non
     if _is_test_env:
         return
 
+    _dbg_global(
+        f"_EnsureLocalModulesLoaded: force={force}, allow_bootstrap={allow_bootstrap}, "
+        f"deps_attempted={_deps_bootstrap_attempted}, modules_loaded={_modules_loaded_session}"
+    )
+
     did_bootstrap = False
     if allow_bootstrap and (not _deps_bootstrap_attempted or force) and dep_bootstrap is not None:
         try:
@@ -2369,8 +2550,8 @@ def _EnsureLocalModulesLoaded(force=False, allow_bootstrap=True, progress_cb=Non
                             progress = ui.createProgressDialog()
                             progress.isCancelButtonShown = False
                             progress.show(
-                                "PostProcessAll",
-                                "PostProcessAll: First-time setup — installing verification libraries...",
+                                "PostClear",
+                                "PostClear: First-time setup — installing verification libraries...",
                                 0,
                                 0,
                             )
@@ -2398,9 +2579,9 @@ def _EnsureLocalModulesLoaded(force=False, allow_bootstrap=True, progress_cb=Non
                     _deps_bootstrap_warned_session = True
                     try:
                         ui.messageBox(
-                            "PostProcessAll could not download verification libraries (numpy, shapely, matplotlib) — please check your internet connection.\n\n"
+                            "PostClear could not download verification libraries (numpy, shapely, matplotlib) — please check your internet connection.\n\n"
                             "Milling will use basic clearance verification (without plots); Turning verification requires these libraries. "
-                            "PostProcessAll will retry automatically on the next run once online."
+                            "PostClear will retry automatically on the next run once online."
                         )
                     except Exception:
                         pass
@@ -2766,7 +2947,7 @@ def _ExtractWorkpieceFromSetup(setup):
 _palette_handlers = []
 _last_action_timestamp = 0
 _last_action_key = ""
-constNotificationPaletteId = "PostProcessAll_NotificationPalette"
+constNotificationPaletteId = "PostClear_NotificationPalette"
 
 _HTMLEventHandlerBase = (
     getattr(adsk.core, "HTMLEventHandler", object)
@@ -3286,7 +3467,7 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
         details = details[:600].rstrip() + "\n... (see report for full details)"
 
     # 2. Log status summary to Application console (without flickering status bar)
-    status_summary = f"[PostProcessAll] {title}: {msg}"
+    status_summary = f"[PostClear] {title}: {msg}"
     try:
         if "adsk.core" in sys.modules and hasattr(adsk.core, "Application"):
             adsk.core.Application.get().log(status_summary)
@@ -3328,7 +3509,7 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
             actions,
             program_rows=program_rows if show_program_rows else None,
         )
-        tmp_html = os.path.join(tempfile.gettempdir(), "postprocess_toast.html")
+        tmp_html = os.path.join(tempfile.gettempdir(), "postclear_toast.html")
         try:
             with open(tmp_html, "w", encoding="utf-8") as f:
                 f.write(html_text)
@@ -3504,7 +3685,7 @@ def ShowVerifyResults(ui):
             status = f"WARNING: {warn_str}"
         else:
             status = "OK"
-        msg = f"[PostProcessAll] Verification for '{r['setup']}': {status} | NC: {r.get('cnc')} | Report: {r.get('report')}"
+        msg = f"[PostClear] Verification for '{r['setup']}': {status} | NC: {r.get('cnc')} | Report: {r.get('report')}"
         _dbg_global(msg)
         try:
             adsk.core.Application.get().log(msg)
@@ -3874,14 +4055,14 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
             warning_msg = f"{len(fatal_cols)} collision(s) detected"
             _dbg(f"Pass 2: WARNING: {warning_msg} in setup {setup.name}! Continuing with final NC code generation.")
             try:
-                adsk.core.Application.get().log(f"[PostProcessAll] WARNING: {warning_msg} in setup {setup.name}!")
+                adsk.core.Application.get().log(f"[PostClear] WARNING: {warning_msg} in setup {setup.name}!")
             except Exception:
                 pass
 
         if getattr(report, "fixture_warning", None):
             _dbg(f"Pass 2: WARNING: {report.fixture_warning} in setup {setup.name}!")
             try:
-                adsk.core.Application.get().log(f"[PostProcessAll] WARNING: {report.fixture_warning} in setup {setup.name}!")
+                adsk.core.Application.get().log(f"[PostClear] WARNING: {report.fixture_warning} in setup {setup.name}!")
             except Exception:
                 pass
             if warning_msg:
@@ -3959,6 +4140,7 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
     retVal = "Fusion reported an exception"
 
     try:
+        _SetDebugLogEnabled(bool(docSettings.get("debug_log", False)) if isinstance(docSettings, dict) else False)
         app = adsk.core.Application.get()
         ui  = app.userInterface
         doc = getattr(app, "activeDocument", None)

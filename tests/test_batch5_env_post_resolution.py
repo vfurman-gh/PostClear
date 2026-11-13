@@ -60,7 +60,7 @@ from pipeline import (
     find_autodesk_system_posts_dir,
     find_autodesk_fusion_invoking_root,
 )
-import PostProcessAll
+import PostClear
 
 
 class TestBatch5EnvironmentAndRootDetection(unittest.TestCase):
@@ -159,14 +159,14 @@ class TestBatch5BasePostResolution(unittest.TestCase):
                 f.write('capabilities = CAPABILITY_TURNING;\n')
                 f.write('description = "Long Header Turning Post";\n')
 
-            caps = PostProcessAll._GetPostCapabilities(cps_path)
+            caps = PostClear._GetPostCapabilities(cps_path)
             self.assertIsNotNone(caps)
             self.assertTrue(caps["turning"])
             self.assertFalse(caps["milling"])
 
             # Verify _IsPostCompatible detects it
-            self.assertTrue(PostProcessAll._IsPostCompatible(cps_path, is_turning=True))
-            self.assertFalse(PostProcessAll._IsPostCompatible(cps_path, is_turning=False))
+            self.assertTrue(PostClear._IsPostCompatible(cps_path, is_turning=True))
+            self.assertFalse(PostClear._IsPostCompatible(cps_path, is_turning=False))
 
     def test_h4_exact_path_authoritative(self):
         """Verify exact path to .cps file is authoritative and resolves immediately."""
@@ -185,7 +185,7 @@ class TestBatch5BasePostResolution(unittest.TestCase):
             class MockProgram:
                 postConfiguration = MockPostCfg()
 
-            resolved = PostProcessAll._ResolveBasePostPath(MockProgram(), is_turning=False)
+            resolved = PostClear._ResolveBasePostPath(MockProgram(), is_turning=False)
             self.assertEqual(resolved, os.path.abspath(cps_path))
 
     def test_h4_file_url_authoritative(self):
@@ -209,7 +209,7 @@ class TestBatch5BasePostResolution(unittest.TestCase):
             class MockProgram:
                 postConfiguration = MockPostCfg()
 
-            resolved = PostProcessAll._ResolveBasePostPath(MockProgram(), is_turning=False)
+            resolved = PostClear._ResolveBasePostPath(MockProgram(), is_turning=False)
             self.assertEqual(resolved, os.path.abspath(cps_path))
 
     def test_h4_user_cloud_preferred_over_system(self):
@@ -238,8 +238,8 @@ class TestBatch5BasePostResolution(unittest.TestCase):
             class MockProgram:
                 postConfiguration = MockPostCfg()
 
-            with patch("PostProcessAll._GetPostSearchDirsByTier", return_value=([user_dir], [sys_dir], [])):
-                resolved = PostProcessAll._ResolveBasePostPath(MockProgram(), is_turning=False)
+            with patch("PostClear._GetPostSearchDirsByTier", return_value=([user_dir], [sys_dir], [])):
+                resolved = PostClear._ResolveBasePostPath(MockProgram(), is_turning=False)
                 self.assertEqual(resolved, os.path.abspath(user_post))
 
     def test_h4_ambiguous_name_match_raises_error_naming_candidates(self):
@@ -268,9 +268,9 @@ class TestBatch5BasePostResolution(unittest.TestCase):
             class MockProgram:
                 postConfiguration = MockPostCfg()
 
-            with patch("PostProcessAll._GetPostSearchDirsByTier", return_value=([user_dir1, user_dir2], [], [])):
+            with patch("PostClear._GetPostSearchDirsByTier", return_value=([user_dir1, user_dir2], [], [])):
                 with self.assertRaises(ValueError) as cm:
-                    PostProcessAll._ResolveBasePostPath(MockProgram(), is_turning=True)
+                    PostClear._ResolveBasePostPath(MockProgram(), is_turning=True)
                 err_msg = str(cm.exception)
                 self.assertIn("Ambiguous post processor match", err_msg)
                 self.assertIn("lathe_custom", err_msg)
@@ -301,9 +301,9 @@ class TestBatch5BasePostResolution(unittest.TestCase):
             class MockProgram:
                 postConfiguration = MockPostCfg()
 
-            with patch("PostProcessAll._GetPostSearchDirsByTier", return_value=([], [sys_dir], [])):
+            with patch("PostClear._GetPostSearchDirsByTier", return_value=([], [sys_dir], [])):
                 with self.assertRaises(ValueError) as cm:
-                    PostProcessAll._ResolveBasePostPath(MockProgram(), is_turning=False)
+                    PostClear._ResolveBasePostPath(MockProgram(), is_turning=False)
                 err_msg = str(cm.exception)
                 self.assertIn("Ambiguous post processor match for description", err_msg)
                 self.assertIn(os.path.abspath(post1), err_msg)
@@ -316,13 +316,13 @@ class TestBatch5DumperConfigSecurity(unittest.TestCase):
     def test_m1_mkdtemp_0o700_permissions(self):
         """Verify per-run temp directory created for dumper config has mode 0o700."""
         with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
-            cfg_path = PostProcessAll._WriteDumperConfig(base_post_path=tmp_cps.name)
+            cfg_path = PostClear._WriteDumperConfig(base_post_path=tmp_cps.name)
             self.assertTrue(os.path.isfile(cfg_path))
             dir_path = os.path.dirname(cfg_path)
             # Check filesystem permission bits
             mode = stat.S_IMODE(os.stat(dir_path).st_mode)
             self.assertEqual(mode, 0o700, f"Expected 0o700 directory mode, got {oct(mode)}")
-            PostProcessAll._ClearDumperConfig(dir_path)
+            PostClear._ClearDumperConfig(dir_path)
 
     def test_m1_dumper_config_only_written_to_dumper_config_path(self):
         """Verify _WriteDumperConfig writes ONLY to DUMPER_CONFIG_PATH and never $TMPDIR or /tmp."""
@@ -341,7 +341,7 @@ class TestBatch5DumperConfigSecurity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as target_dir:
             os.chmod(target_dir, 0o700)
             with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
-                cfg_path = PostProcessAll._WriteDumperConfig(
+                cfg_path = PostClear._WriteDumperConfig(
                     base_post_path=tmp_cps.name,
                     target_dir=target_dir,
                 )
@@ -353,7 +353,7 @@ class TestBatch5DumperConfigSecurity(unittest.TestCase):
                 if os.path.isdir("/tmp") and os.path.abspath(tmp_sys) != "/tmp":
                     self.assertFalse(os.path.isfile(stray_tmp), "Dumper config must NOT be written to /tmp")
 
-                PostProcessAll._ClearDumperConfig(target_dir)
+                PostClear._ClearDumperConfig(target_dir)
                 self.assertFalse(os.path.isfile(cfg_path))
                 self.assertNotIn("DUMPER_CONFIG_PATH", os.environ)
 

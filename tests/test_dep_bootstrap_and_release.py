@@ -237,9 +237,9 @@ class TestDepBootstrapAndRelease(unittest.TestCase):
             self.assertEqual(pp_parts[-1], "/existing/path")
 
     def test_ensure_local_modules_loaded_startup_vs_interactive_and_retry(self):
-        # Ensure PostProcessAll's stub adsk is loaded via test_postprocessall_pipeline_integration first or directly
-        import tests.test_postprocessall_pipeline_integration  # noqa: F401
-        import PostProcessAll
+        # Ensure PostClear's stub adsk is loaded via test_postclear_pipeline_integration first or directly
+        import tests.test_postclear_pipeline_integration  # noqa: F401
+        import PostClear
 
         adsk_mod = sys.modules["adsk"]
         adsk_core_mod = sys.modules.get("adsk.core") or getattr(adsk_mod, "core", None)
@@ -247,9 +247,9 @@ class TestDepBootstrapAndRelease(unittest.TestCase):
         prev_file = getattr(adsk_mod, "__file__", None)
         had_core_file = hasattr(adsk_core_mod, "__file__") if adsk_core_mod is not None else False
         prev_core_file = getattr(adsk_core_mod, "__file__", None) if adsk_core_mod is not None else None
-        saved_attempted = PostProcessAll._deps_bootstrap_attempted
-        saved_warned = PostProcessAll._deps_bootstrap_warned_session
-        saved_loaded = PostProcessAll._modules_loaded_session
+        saved_attempted = PostClear._deps_bootstrap_attempted
+        saved_warned = PostClear._deps_bootstrap_warned_session
+        saved_loaded = PostClear._modules_loaded_session
         saved_pytest_env = os.environ.pop("PYTEST_CURRENT_TEST", None)
         saved_autodesk_env = {
             k: os.environ.get(k)
@@ -268,13 +268,13 @@ class TestDepBootstrapAndRelease(unittest.TestCase):
             adsk_mod.__file__ = None
             if adsk_core_mod is not None:
                 adsk_core_mod.__file__ = "/Applications/Autodesk Fusion.app/Contents/Api/Python/packages/adsk/core.py"
-            PostProcessAll._deps_bootstrap_attempted = False
-            PostProcessAll._deps_bootstrap_warned_session = False
-            PostProcessAll._modules_loaded_session = True  # Avoid live reload of modules during test
+            PostClear._deps_bootstrap_attempted = False
+            PostClear._deps_bootstrap_warned_session = False
+            PostClear._modules_loaded_session = True  # Avoid live reload of modules during test
 
-            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
-                 patch("PostProcessAll.InitAddIn"), \
-                 patch("PostProcessAll.SettingsManager"), \
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch("PostClear.InitAddIn"), \
+                 patch("PostClear.SettingsManager"), \
                  patch("importlib.reload") as mock_reload, \
                  patch("importlib.invalidate_caches"), \
                  patch("pipeline.find_autodesk_fusion_invoking_root", return_value=None), \
@@ -289,48 +289,48 @@ class TestDepBootstrapAndRelease(unittest.TestCase):
                      (True, "/tmp/pkg", "ok"),
                  ]) as mock_install:
                 # 1. IsApplicationStartup=True skips bootstrap during splash startup
-                PostProcessAll.run({"IsApplicationStartup": True})
+                PostClear.run({"IsApplicationStartup": True})
                 mock_install.assert_not_called()
-                self.assertFalse(PostProcessAll._deps_bootstrap_attempted)
+                self.assertFalse(PostClear._deps_bootstrap_attempted)
                 mock_ui.messageBox.assert_not_called()
 
                 # 2. First allow_bootstrap=True call hits offline failure -> hides progress, warns once, stays retryable
-                PostProcessAll._EnsureLocalModulesLoaded(force=False, allow_bootstrap=True)
+                PostClear._EnsureLocalModulesLoaded(force=False, allow_bootstrap=True)
                 self.assertEqual(mock_install.call_count, 1)
-                self.assertFalse(PostProcessAll._deps_bootstrap_attempted)
-                self.assertTrue(PostProcessAll._deps_bootstrap_warned_session)
+                self.assertFalse(PostClear._deps_bootstrap_attempted)
+                self.assertTrue(PostClear._deps_bootstrap_warned_session)
                 mock_progress.hide.assert_called_once()
                 mock_ui.messageBox.assert_called_once()
                 self.assertIn("could not download verification libraries", mock_ui.messageBox.call_args[0][0])
 
                 # 3. Repeated offline call retries pip, still hides progress, does NOT spam messageBox
                 mock_progress.reset_mock()
-                PostProcessAll._EnsureLocalModulesLoaded(force=False, allow_bootstrap=True)
+                PostClear._EnsureLocalModulesLoaded(force=False, allow_bootstrap=True)
                 self.assertEqual(mock_install.call_count, 2)
-                self.assertFalse(PostProcessAll._deps_bootstrap_attempted)
+                self.assertFalse(PostClear._deps_bootstrap_attempted)
                 mock_progress.hide.assert_called_once()
                 self.assertEqual(mock_ui.messageBox.call_count, 1)
 
                 # 4. Interactive run (IsApplicationStartup=False) once online retries, succeeds, marks attempted, clears warning flag
                 mock_progress.reset_mock()
-                PostProcessAll.run({"IsApplicationStartup": False})
+                PostClear.run({"IsApplicationStartup": False})
                 self.assertEqual(mock_install.call_count, 3)
-                self.assertTrue(PostProcessAll._deps_bootstrap_attempted)
-                self.assertFalse(PostProcessAll._deps_bootstrap_warned_session)
+                self.assertTrue(PostClear._deps_bootstrap_attempted)
+                self.assertFalse(PostClear._deps_bootstrap_warned_session)
                 mock_progress.hide.assert_called_once()
 
                 # 5. Subsequent non-forced call skips install once _deps_bootstrap_attempted is True
-                PostProcessAll._EnsureLocalModulesLoaded(force=False, allow_bootstrap=True)
+                PostClear._EnsureLocalModulesLoaded(force=False, allow_bootstrap=True)
                 self.assertEqual(mock_install.call_count, 3)
 
                 # 6. Regression: when _modules_loaded_session is already True and force=False with progress_cb,
                 # a successful bootstrap uses progress_cb (without createProgressDialog) and reloads ordered_mods!
                 mock_ui.createProgressDialog.reset_mock()
                 mock_reload.reset_mock()
-                PostProcessAll._deps_bootstrap_attempted = False
-                PostProcessAll._modules_loaded_session = True
+                PostClear._deps_bootstrap_attempted = False
+                PostClear._modules_loaded_session = True
                 mock_cb = MagicMock(return_value=True)
-                PostProcessAll._EnsureLocalModulesLoaded(
+                PostClear._EnsureLocalModulesLoaded(
                     force=False,
                     allow_bootstrap=True,
                     progress_cb=mock_cb,
@@ -369,9 +369,9 @@ class TestDepBootstrapAndRelease(unittest.TestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-            PostProcessAll._deps_bootstrap_attempted = saved_attempted
-            PostProcessAll._deps_bootstrap_warned_session = saved_warned
-            PostProcessAll._modules_loaded_session = saved_loaded
+            PostClear._deps_bootstrap_attempted = saved_attempted
+            PostClear._deps_bootstrap_warned_session = saved_warned
+            PostClear._modules_loaded_session = saved_loaded
 
     def test_install_runtime_packages_offline_fast_fail_and_no_index(self):
         with tempfile.TemporaryDirectory() as addon_dir, \
@@ -553,35 +553,53 @@ class TestDepBootstrapAndRelease(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out_dir:
             zip_path = build_release.build_release(source_dir=REPO_ROOT, output_dir=out_dir)
             self.assertTrue(os.path.isfile(zip_path))
-            self.assertEqual(os.path.basename(zip_path), "PostProcessAll-v3.0.0.zip")
+            self.assertEqual(os.path.basename(zip_path), "PostClear-v3.0.0.zip")
 
             with zipfile.ZipFile(zip_path, "r") as zf:
                 names = set(zf.namelist())
                 for req_name in (
-                    "PostProcessAll/PostProcessAll.py",
-                    "PostProcessAll/PostProcessAll.manifest",
-                    "PostProcessAll/dep_bootstrap.py",
-                    "PostProcessAll/context_parser.py",
-                    "PostProcessAll/pipeline.py",
-                    "PostProcessAll/universal_dumper.cps",
-                    "PostProcessAll/universal_replayer.cps",
-                    "PostProcessAll/requirements.txt",
-                    "PostProcessAll/README.md",
+                    "PostClear/PostClear.py",
+                    "PostClear/PostClear.manifest",
+                    "PostClear/dep_bootstrap.py",
+                    "PostClear/context_parser.py",
+                    "PostClear/pipeline.py",
+                    "PostClear/universal_dumper.cps",
+                    "PostClear/universal_replayer.cps",
+                    "PostClear/requirements.txt",
+                    "PostClear/README.md",
                 ):
                     self.assertIn(req_name, names)
 
                 # Must exclude all installer scripts, tests, dev files, legacy posts, settings, and local packages/
-                self.assertFalse(any(n.startswith("PostProcessAll/packages/") for n in names))
+                self.assertFalse(any(n.startswith("PostClear/packages/") for n in names))
                 self.assertFalse(any(n.endswith((".bat", ".command")) for n in names))
                 self.assertFalse(any(os.path.basename(n).startswith("install_") for n in names))
-                self.assertFalse(any(n.startswith("PostProcessAll/tests/") for n in names))
-                self.assertFalse(any(n.startswith("PostProcessAll/.venv/") for n in names))
-                self.assertFalse(any(n.startswith("PostProcessAll/docs/") for n in names))
+                self.assertFalse(any(n.startswith("PostClear/tests/") for n in names))
+                self.assertFalse(any(n.startswith("PostClear/.venv/") for n in names))
+                self.assertFalse(any(n.startswith("PostClear/docs/") for n in names))
                 self.assertFalse(any(n.endswith("centroid_turning.cps") for n in names))
                 self.assertFalse(any(n.endswith(".settings") for n in names))
 
                 # Text files normalized to LF
-                self.assertNotIn(b"\r\n", zf.read("PostProcessAll/PostProcessAll.py"))
+                self.assertNotIn(b"\r\n", zf.read("PostClear/PostClear.py"))
+
+                # Manifest UUID v4, author, and version checks
+                import json as _json
+                import uuid as _uuid
+                manifest = _json.loads(zf.read("PostClear/PostClear.manifest").decode("utf-8"))
+                self.assertEqual(manifest["author"], "Vadim Furman, agy")
+                self.assertEqual(manifest["version"], "3.0.0")
+                self.assertNotEqual(manifest["id"], "fec886de-a491-46e4-84c5-2bc0d4549040")
+                parsed_uuid = _uuid.UUID(manifest["id"])
+                self.assertEqual(parsed_uuid.version, 4)
+
+                # Core PostClear / Post Clear constants
+                import tests.test_postclear_pipeline_integration  # noqa: F401
+                import PostClear
+                self.assertEqual(PostClear.constCmdName, "Post Clear")
+                self.assertEqual(PostClear.constCmdDefId, "PostClear_Cmd")
+                self.assertEqual(PostClear.constNcProgramName, "PostClear NC Program")
+                self.assertEqual(PostClear.constNotificationPaletteId, "PostClear_NotificationPalette")
 
 
 if __name__ == "__main__":
