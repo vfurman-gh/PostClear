@@ -1141,6 +1141,46 @@ def _GetNCProgramOutputUnits(program, docSettings=None):
 
 
 # Event handler for right-click markingMenuDisplaying event.
+def _FindPostProcessAnchorControlId(controls) -> Optional[str]:
+    """Locate Fusion's built-in Post Process control ID in a marking menu control list."""
+    if controls is None:
+        return None
+    known_ids = (
+        constPostProcessControlId,
+        "IronNCProgramPostProcess",
+        "CAMPostProcess",
+        "PostProcess",
+        "PostProcessCommand",
+    )
+    for cid in known_ids:
+        try:
+            ctrl = controls.itemById(cid)
+            if ctrl is not None and isinstance(getattr(ctrl, "id", None), str) and ctrl.id == cid:
+                return cid
+        except Exception:
+            pass
+
+    all_ctrls = _extract_cam_collection(controls)
+    for ctrl in all_ctrls:
+        ctrl_id = getattr(ctrl, "id", None)
+        if ctrl_id == constCmdDefId:
+            continue
+        cmd_def = getattr(ctrl, "commandDefinition", None)
+        cmd_name = getattr(cmd_def, "name", "") if cmd_def is not None else ""
+        if isinstance(cmd_name, str) and cmd_name.strip().lower() == "post process":
+            if isinstance(ctrl_id, str) and ctrl_id:
+                return ctrl_id
+
+    for ctrl in all_ctrls:
+        ctrl_id = getattr(ctrl, "id", None)
+        if ctrl_id == constCmdDefId:
+            continue
+        if isinstance(ctrl_id, str) and "postprocess" in ctrl_id.lower():
+            return ctrl_id
+
+    return None
+
+
 class MarkingMenuHandler(_MarkingMenuEventHandlerBase):
     def __init__(self):
         super().__init__()
@@ -1196,12 +1236,17 @@ class MarkingMenuHandler(_MarkingMenuEventHandlerBase):
             cmd_defs = getattr(ui, "commandDefinitions", None)
             cmd_def = cmd_defs.itemById(constCmdDefId) if cmd_defs else None
             if controls is not None and cmd_def is not None:
-                if controls.itemById(constCmdDefId) is None:
-                    post_ctrl = controls.itemById("PostProcessCommand")
-                    if post_ctrl is not None:
-                        controls.addCommand(cmd_def, "PostProcessCommand", False)
-                    else:
-                        controls.addCommand(cmd_def)
+                try:
+                    existing_ctrl = controls.itemById(constCmdDefId)
+                    if existing_ctrl is not None and getattr(existing_ctrl, "id", None) == constCmdDefId:
+                        existing_ctrl.deleteMe()
+                except Exception:
+                    pass
+                anchor_id = _FindPostProcessAnchorControlId(controls)
+                if anchor_id:
+                    controls.addCommand(cmd_def, anchor_id, False)
+                else:
+                    controls.addCommand(cmd_def)
         except Exception as exc:
             _dbg_global(f"MarkingMenuHandler exception: {exc}")
 

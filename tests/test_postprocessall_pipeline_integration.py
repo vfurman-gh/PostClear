@@ -3138,8 +3138,32 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         cam.ncPrograms = MockCamCollection([prog_a, prog_b])
 
         cmd_def = MagicMock()
-        mock_controls = MagicMock()
-        mock_controls.itemById.side_effect = lambda cid: MagicMock() if cid == "PostProcessCommand" else None
+
+        def _make_controls(ctrl_list):
+            by_id = {getattr(c, "id", ""): c for c in ctrl_list}
+
+            class _ControlsCol(list):
+                def itemById(self, cid):
+                    return by_id.get(cid)
+
+            col = _ControlsCol(ctrl_list)
+            col.count = len(ctrl_list)
+            col.item = lambda i: ctrl_list[i]
+            col.addCommand = MagicMock()
+            return col
+
+        iron_nc_ctrl = MagicMock()
+        iron_nc_ctrl.id = "IronNCProgramPostProcess"
+        iron_post_ctrl = MagicMock()
+        iron_post_ctrl.id = PostProcessAll.constPostProcessControlId  # "IronPostProcess"
+        custom_post_ctrl = MagicMock()
+        custom_post_ctrl.id = "CustomCamPostBtn"
+        custom_post_ctrl.commandDefinition = MagicMock()
+        custom_post_ctrl.commandDefinition.name = "Post Process"
+        stale_self_ctrl = MagicMock()
+        stale_self_ctrl.id = PostProcessAll.constCmdDefId
+
+        mock_controls = _make_controls([iron_nc_ctrl, stale_self_ctrl])
         mock_linear_menu = MagicMock(controls=mock_controls)
 
         mock_ui = MagicMock()
@@ -3153,7 +3177,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
         saved_pending = PostProcessAll._pending_context_selection
         try:
-            # 1. Right-click on NCProgram ProgB -> injects only constCmdDefId after PostProcessCommand & preselects ProgB
+            # 1. Right-click on NCProgram ProgB with IronNCProgramPostProcess -> deletes stale self & anchors after IronNCProgramPostProcess
             PostProcessAll._pending_context_selection = None
             handler = PostProcessAll.MarkingMenuHandler()
             ev_args = MagicMock(
@@ -3165,32 +3189,35 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                  patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam):
                 handler.notify(MagicMock())
 
-            mock_controls.addCommand.assert_called_once_with(cmd_def, "PostProcessCommand", False)
+            stale_self_ctrl.deleteMe.assert_called_once()
+            mock_controls.addCommand.assert_called_once_with(cmd_def, "IronNCProgramPostProcess", False)
             pre = PostProcessAll._ResolvePreselectedNcProgramNames(cam, mock_ui)
             self.assertEqual(pre, ["ProgB"])
 
-            # 2. Right-click on "NC Programs" folder node -> preselects ALL NC Programs
-            mock_controls.addCommand.reset_mock()
+            # 2. Right-click on "NC Programs" folder node with custom "Post Process" command name -> anchors after CustomCamPostBtn & preselects ALL
+            mock_controls_custom = _make_controls([custom_post_ctrl])
+            mock_linear_custom = MagicMock(controls=mock_controls_custom)
             nc_folder = MagicMock()
             nc_folder.name = "NC Programs"
             nc_folder.objectType = "adsk::cam::CAMFolder"
-            ev_folder = MagicMock(selectedEntities=[nc_folder], linearMarkingMenu=mock_linear_menu)
+            ev_folder = MagicMock(selectedEntities=[nc_folder], linearMarkingMenu=mock_linear_custom)
             with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
                  patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_folder), create=True), \
                  patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam):
                 handler.notify(MagicMock())
-            mock_controls.addCommand.assert_called_once_with(cmd_def, "PostProcessCommand", False)
+            mock_controls_custom.addCommand.assert_called_once_with(cmd_def, "CustomCamPostBtn", False)
             self.assertEqual(PostProcessAll._ResolvePreselectedNcProgramNames(cam, mock_ui), ["ProgA", "ProgB"])
 
-            # 3. Right-click on Setup -> preselects NC Programs referencing that Setup
-            mock_controls.addCommand.reset_mock()
-            ev_setup = MagicMock(selectedEntities=[setup1], linearMarkingMenu=mock_linear_menu)
+            # 3. Right-click on Setup with IronPostProcess -> anchors after IronPostProcess & preselects matching NC Program
+            mock_controls_setup = _make_controls([iron_post_ctrl])
+            mock_linear_setup = MagicMock(controls=mock_controls_setup)
+            ev_setup = MagicMock(selectedEntities=[setup1], linearMarkingMenu=mock_linear_setup)
             with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
                  patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_setup), create=True), \
                  patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam), \
                  patch("PostProcessAll.GetNcProgramSetupsAndOperations", side_effect=lambda c, s, program=None: ([setup1], []) if program is prog_a else ([], [])):
                 handler.notify(MagicMock())
-            mock_controls.addCommand.assert_called_once_with(cmd_def, "PostProcessCommand", False)
+            mock_controls_setup.addCommand.assert_called_once_with(cmd_def, PostProcessAll.constPostProcessControlId, False)
             self.assertEqual(PostProcessAll._ResolvePreselectedNcProgramNames(cam, mock_ui), ["ProgA"])
 
             # 4. Non-CAM entity (e.g., BRepBody) -> ignored cleanly, no addCommand call
