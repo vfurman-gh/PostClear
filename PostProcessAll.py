@@ -49,12 +49,13 @@ if not hasattr(adsk.cam, "PostOutputUnitOptions"):
 
 # Version number of settings as saved in documents and settings file
 # update this whenever settings content changes
-version = 16
+version = 17
 
 # Initial default values of settings
 defaultSettings = {
     "version" : version,
     "ncProgram": "",
+    "ncPrograms": [],
     "output" : "",
     "restore_rapid" : True,
     # Groups are expanded or not
@@ -163,8 +164,28 @@ handlers = []
 # Global settingsMgr object
 settingsMgr = None
 
+_MarkingMenuEventHandlerBase = (
+    getattr(adsk.core, "MarkingMenuEventHandler", object)
+    if ("adsk" in sys.modules and hasattr(adsk, "core") and hasattr(adsk.core, "MarkingMenuEventHandler"))
+    else object
+)
+_marking_menu_handler = None
+_pending_context_selection = None  # Optional[Tuple[float, List[str]]]
+
+
 def _CleanupCommandUI(ui) -> None:
-    """Safely remove any existing toolbar controls, command definition, and handlers."""
+    """Safely remove any existing toolbar controls, marking-menu handler, command definition, and handlers."""
+    global _marking_menu_handler, _pending_context_selection
+    _pending_context_selection = None
+
+    if _marking_menu_handler is not None:
+        try:
+            if ui and hasattr(ui, "markingMenuDisplaying") and ui.markingMenuDisplaying:
+                ui.markingMenuDisplaying.remove(_marking_menu_handler)
+        except Exception:
+            pass
+        _marking_menu_handler = None
+
     if not ui:
         handlers.clear()
         return
@@ -272,18 +293,29 @@ class SettingsManager:
                 if self.default["version"] != version:
                     self.UpdateSettings(defaultSettings, self.default)
             except Exception:
-                self.default = dict(defaultSettings)
+                self.default = {
+                    k: (list(v) if isinstance(v, list) else v)
+                    for k, v in defaultSettings.items()
+                }
                 self.fMustSave = True
         
         if not docSettings:
-            docSettings = dict(self.default)
+            docSettings = {
+                k: (list(v) if isinstance(v, list) else v)
+                for k, v in self.default.items()
+            }
         else:
             self.UpdateSettings(self.default, docSettings)
+        if "ncPrograms" in docSettings and isinstance(docSettings["ncPrograms"], list):
+            docSettings["ncPrograms"] = list(docSettings["ncPrograms"])
         return docSettings
 
     def SaveDefault(self, docSettings):
         self.fMustSave = False
-        self.default = dict(docSettings)
+        self.default = {
+            k: (list(v) if isinstance(v, list) else v)
+            for k, v in docSettings.items()
+        }
         try:
             strSettings = json.dumps(docSettings)
             with open(self.GetPath(), "w", encoding="utf-8") as file:
@@ -299,6 +331,15 @@ class SettingsManager:
     def UpdateSettings(self, src, dst):
         if "restore_rapid" not in dst:
             dst["restore_rapid"] = dst.get("fastZ", dst.get("fastZHeuristic", True))
+        if "ncPrograms" not in dst:
+            legacy_prog = dst.get("ncProgram", "")
+            dst["ncPrograms"] = [legacy_prog] if isinstance(legacy_prog, str) and legacy_prog else []
+        elif isinstance(dst.get("ncPrograms"), list):
+            dst["ncPrograms"] = [str(x) for x in dst["ncPrograms"] if x]
+        else:
+            dst["ncPrograms"] = []
+        if dst["ncPrograms"] and not dst.get("ncProgram"):
+            dst["ncProgram"] = dst["ncPrograms"][0]
         for k in (
             "verifyGcode", "splitSetup", "fastZ", "fastZHeuristic", "toolChange", "endCodes", "homeEndsOp",
             "sequence", "twoDigits", "onlySelected", "groupRename", "groupPost", "numericName",
@@ -307,7 +348,8 @@ class SettingsManager:
             dst.pop(k, None)
         for item in src:
             if not (item in dst):
-                dst[item] = src[item]
+                val = src[item]
+                dst[item] = list(val) if isinstance(val, list) else val
         dst["version"] = src["version"]
 
     def GetPath(self):
@@ -347,6 +389,17 @@ def InitAddIn():
         cmdControl.isPromotedByDefault = True
         cmdControl.isPromoted = True
 
+        # Register right-click marking menu handler for CAM entities.
+        global _marking_menu_handler
+        if hasattr(ui, "markingMenuDisplaying") and ui.markingMenuDisplaying is not None:
+            try:
+                onMarkingMenu = MarkingMenuHandler()
+                ui.markingMenuDisplaying.add(onMarkingMenu)
+                _marking_menu_handler = onMarkingMenu
+                handlers.append(onMarkingMenu)
+            except Exception:
+                pass
+
     except:
         if ui:
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
@@ -376,9 +429,13 @@ def AssignOutputFolder(parameters, folder):
 def _is_setup_cam_object(obj, cam=None):
     if obj is None:
         return False
+    obj_type = getattr(obj, "objectType", None)
+    if isinstance(obj_type, str) and obj_type:
+        if obj_type == "adsk::cam::Setup":
+            return True
+        if not obj_type.startswith("adsk::cam::"):
+            return False
     if hasattr(adsk.cam, "Setup") and isinstance(obj, adsk.cam.Setup):
-        return True
-    if getattr(obj, "objectType", "") == "adsk::cam::Setup":
         return True
     if hasattr(obj, "operationType"):
         return True
@@ -690,6 +747,8 @@ def GetNcProgram(cam, settings):
         return None
     target = None
     prog_name = settings.get("ncProgram") if settings else None
+    if not prog_name and settings and isinstance(settings.get("ncPrograms"), (list, tuple)) and settings["ncPrograms"]:
+        prog_name = settings["ncPrograms"][0]
     if prog_name:
         for program in cam.ncPrograms:
             if program.name == prog_name:
@@ -698,6 +757,269 @@ def GetNcProgram(cam, settings):
     if target is None and cam.ncPrograms.count > 0:
         target = cam.ncPrograms.item(0)
     return target
+
+
+def GetSelectedNcPrograms(cam, settings) -> List[Any]:
+    """Resolve the list of selected NCProgram objects from settings (with legacy ncProgram fallback)."""
+    if not cam or not hasattr(cam, "ncPrograms"):
+        return []
+    all_progs = _extract_cam_collection(cam.ncPrograms)
+    selected: List[Any] = []
+
+    prog_names = settings.get("ncPrograms") if settings else None
+    if isinstance(prog_names, (list, tuple)) and len(prog_names) > 0:
+        for name in prog_names:
+            for p in all_progs:
+                if getattr(p, "name", None) == name and p not in selected:
+                    selected.append(p)
+                    break
+
+    if not selected and settings and settings.get("ncProgram"):
+        target = GetNcProgram(cam, settings)
+        if target is not None:
+            selected.append(target)
+
+    if not selected:
+        target = GetNcProgram(cam, settings)
+        if target is not None:
+            selected.append(target)
+        elif all_progs:
+            selected.append(all_progs[0])
+
+    return selected
+
+
+def _ResolveNcProgramOutputFilename(program, setup=None, fileExt: str = ".nc") -> str:
+    """
+    Resolve output base filename from program's nc_program_filename parameter,
+    falling back to program.name then setup.name only when missing or whitespace.
+    Strips trailing fileExt (case-insensitive) while preserving ':' subfolder syntax.
+    """
+    raw_name = ""
+    if program is not None and hasattr(program, "parameters") and program.parameters is not None:
+        try:
+            params = program.parameters
+            p_fn = params.itemByName("nc_program_filename") if hasattr(params, "itemByName") else params.get("nc_program_filename")
+            if p_fn is not None:
+                val = _extract_choice_value(p_fn)
+                if val and val.strip():
+                    raw_name = val.strip()
+        except Exception:
+            pass
+
+    if not raw_name and program is not None:
+        p_name = getattr(program, "name", None)
+        if isinstance(p_name, str) and p_name.strip():
+            raw_name = p_name.strip()
+
+    if not raw_name and setup is not None:
+        s_name = getattr(setup, "name", None)
+        if isinstance(s_name, str) and s_name.strip():
+            raw_name = s_name.strip()
+
+    if not raw_name:
+        raw_name = "unnamed"
+
+    norm_ext = _NormalizeFileExtension(fileExt) if fileExt else ""
+    if norm_ext and raw_name.lower().endswith(norm_ext.lower()):
+        stripped = raw_name[:-len(norm_ext)].strip()
+        if stripped:
+            raw_name = stripped
+
+    return raw_name
+
+
+def _is_nc_program_object(obj, cam=None) -> bool:
+    if obj is None:
+        return False
+    obj_type = getattr(obj, "objectType", None)
+    if isinstance(obj_type, str) and obj_type:
+        if obj_type == "adsk::cam::NCProgram":
+            return True
+        if not obj_type.startswith("adsk::cam::"):
+            return False
+    if hasattr(adsk.cam, "NCProgram") and isinstance(obj, adsk.cam.NCProgram):
+        return True
+    if cam and hasattr(cam, "ncPrograms"):
+        for p in _extract_cam_collection(cam.ncPrograms):
+            if p == obj:
+                return True
+            p_tok = getattr(p, "entityToken", None)
+            o_tok = getattr(obj, "entityToken", None)
+            if isinstance(p_tok, str) and p_tok and p_tok == o_tok:
+                return True
+    return False
+
+
+def _is_cam_context_entity(obj, cam=None) -> bool:
+    if obj is None:
+        return False
+    obj_type = getattr(obj, "objectType", None)
+    if isinstance(obj_type, str) and obj_type:
+        return obj_type.startswith("adsk::cam::")
+    obj_name = getattr(obj, "name", None)
+    if isinstance(obj_name, str) and obj_name in ("NC Programs", "Setups"):
+        return True
+    if _is_nc_program_object(obj, cam) or _is_setup_cam_object(obj, cam) or _is_folder_cam_object(obj):
+        return True
+    return False
+
+
+def _ResolveNcProgramNamesFromEntities(cam, entities) -> List[str]:
+    """Resolve matching NCProgram names from browser/context selected CAM entities."""
+    if not cam or not hasattr(cam, "ncPrograms") or not entities:
+        return []
+    all_progs = _extract_cam_collection(cam.ncPrograms)
+    if not all_progs:
+        return []
+
+    matched_names: List[str] = []
+
+    def _add_name(name):
+        if isinstance(name, str) and name and name not in matched_names:
+            matched_names.append(name)
+
+    selected_setups = []
+    for ent in entities:
+        if ent is None:
+            continue
+        obj_type = getattr(ent, "objectType", None)
+        obj_type_str = obj_type if isinstance(obj_type, str) else ""
+        ent_name = getattr(ent, "name", None)
+        ent_name_str = ent_name if isinstance(ent_name, str) else ""
+
+        if _is_nc_program_object(ent, cam):
+            for p in all_progs:
+                p_name = getattr(p, "name", None)
+                if p == ent or (isinstance(p_name, str) and p_name == ent_name_str):
+                    _add_name(p_name)
+                    break
+        elif ("NCPrograms" in obj_type_str) or ent_name_str == "NC Programs":
+            for p in all_progs:
+                _add_name(getattr(p, "name", None))
+        elif ("Setups" in obj_type_str) or ent_name_str == "Setups":
+            for p in all_progs:
+                _add_name(getattr(p, "name", None))
+        elif _is_setup_cam_object(ent, cam):
+            selected_setups.append(ent)
+
+    if selected_setups:
+        for p in all_progs:
+            try:
+                p_setups, _ = GetNcProgramSetupsAndOperations(cam, {}, program=p)
+            except Exception:
+                p_setups = []
+            for ps in p_setups:
+                ps_name = getattr(ps, "name", None)
+                if any(
+                    ps == s
+                    or (isinstance(ps_name, str) and ps_name and ps_name == getattr(s, "name", None))
+                    for s in selected_setups
+                ):
+                    _add_name(getattr(p, "name", None))
+                    break
+
+    return matched_names
+
+
+def _ResolvePreselectedNcProgramNames(cam, ui) -> List[str]:
+    """Resolve initially checked NC Program names from transient context-menu selection or ui.activeSelections."""
+    global _pending_context_selection
+    all_progs = _extract_cam_collection(getattr(cam, "ncPrograms", None)) if cam else []
+    valid_names = {getattr(p, "name", None) for p in all_progs if isinstance(getattr(p, "name", None), str)}
+
+    if _pending_context_selection is not None:
+        ts, names = _pending_context_selection
+        _pending_context_selection = None
+        if (time.time() - ts) < 3.0 and names:
+            filtered = [n for n in names if n in valid_names]
+            if filtered:
+                return filtered
+
+    if ui and hasattr(ui, "activeSelections") and ui.activeSelections is not None:
+        try:
+            sels = _extract_cam_collection(ui.activeSelections)
+            entities = [getattr(sel, "entity", None) for sel in sels if getattr(sel, "entity", None) is not None]
+            if entities:
+                matched = _ResolveNcProgramNamesFromEntities(cam, entities)
+                if matched:
+                    return matched
+        except Exception:
+            pass
+
+    return []
+
+
+def _GetRootCommandInputs(eventArgs):
+    """Resolve the top-level CommandInputs even when eventArgs.inputs is a child group or table collection."""
+    candidates = [
+        getattr(getattr(getattr(eventArgs, "firingEvent", None), "sender", None), "commandInputs", None),
+        getattr(getattr(getattr(eventArgs, "input", None), "parentCommand", None), "commandInputs", None),
+        getattr(eventArgs, "inputs", None),
+    ]
+    for c in candidates:
+        if c is not None:
+            try:
+                tbl = c.itemById("ncProgramsTable")
+                if tbl is not None and getattr(tbl, "id", None) == "ncProgramsTable":
+                    return c
+            except Exception:
+                pass
+    return getattr(eventArgs, "inputs", None)
+
+
+def _TableHasSelectAllHeader(tbl) -> bool:
+    """Return True if row 0, col 0 of tbl holds the ncprog_select_all header checkbox."""
+    if tbl is None or not hasattr(tbl, "getInputAtPosition"):
+        return False
+    try:
+        cell0 = tbl.getInputAtPosition(0, 0)
+        return getattr(cell0, "id", None) == "ncprog_select_all"
+    except Exception:
+        return False
+
+
+def _GetNcProgramRowInputs(inputs, tbl, idx: int, row_offset: int = 0):
+    """Look up (chk_inp, name_inp) for data index idx via itemById with tbl.getInputAtPosition fallback."""
+    expected_id = f"ncprog_chk_{idx}"
+    tbl_row = idx + row_offset
+    chk = inputs.itemById(expected_id) if inputs is not None else None
+    if (chk is None or getattr(chk, "id", None) != expected_id) and tbl is not None and hasattr(tbl, "getInputAtPosition"):
+        try:
+            chk = tbl.getInputAtPosition(tbl_row, 0)
+        except Exception:
+            chk = None
+    if chk is None or getattr(chk, "id", None) != expected_id:
+        return None, None
+    name_id = f"ncprog_name_{idx}"
+    name_inp = inputs.itemById(name_id) if inputs is not None else None
+    if name_inp is None and tbl is not None and hasattr(tbl, "getInputAtPosition"):
+        try:
+            name_inp = tbl.getInputAtPosition(tbl_row, 1)
+        except Exception:
+            name_inp = None
+    return chk, name_inp
+
+
+def _CollectCheckedNcProgramsFromInputs(inputs) -> Tuple[List[str], int]:
+    """Return (checked_program_names, total_rows) from the NC Programs TableCommandInput rows."""
+    selected: List[str] = []
+    total = 0
+    if inputs is None:
+        return selected, total
+    tbl = inputs.itemById("ncProgramsTable")
+    row_offset = 1 if _TableHasSelectAllHeader(tbl) else 0
+    row_count = getattr(tbl, "rowCount", None) if tbl is not None else None
+    indices = range(max(0, row_count - row_offset)) if isinstance(row_count, int) else range(500)
+    for i in indices:
+        chk, name_inp = _GetNcProgramRowInputs(inputs, tbl, i, row_offset=row_offset)
+        if chk is None:
+            break
+        total += 1
+        prog_name = getattr(name_inp, "value", "") if name_inp is not None else ""
+        if getattr(chk, "value", False) and isinstance(prog_name, str) and prog_name:
+            selected.append(prog_name)
+    return selected, total
 
 
 def _extract_choice_value(param) -> str:
@@ -818,6 +1140,72 @@ def _GetNCProgramOutputUnits(program, docSettings=None):
     return doc_opt
 
 
+# Event handler for right-click markingMenuDisplaying event.
+class MarkingMenuHandler(_MarkingMenuEventHandlerBase):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        global _pending_context_selection
+        try:
+            eventArgs = args
+            if "adsk.core" in sys.modules and hasattr(adsk.core, "MarkingMenuEventArgs"):
+                try:
+                    casted = adsk.core.MarkingMenuEventArgs.cast(args)
+                    if casted:
+                        eventArgs = casted
+                except Exception:
+                    pass
+
+            app = adsk.core.Application.get()
+            ui = getattr(app, "userInterface", None) if app else None
+            doc = getattr(app, "activeDocument", None) if app else None
+            if not ui:
+                return
+
+            sel_ents = _extract_cam_collection(getattr(eventArgs, "selectedEntities", None))
+            cam = None
+            if doc and hasattr(doc, "products") and doc.products:
+                try:
+                    cam = adsk.cam.CAM.cast(doc.products.itemByProductType(constCAMProductId))
+                except Exception:
+                    cam = None
+
+            has_cam_entity = any(_is_cam_context_entity(ent, cam) for ent in sel_ents)
+            if sel_ents and not has_cam_entity:
+                return
+
+            ws_id = getattr(getattr(ui, "activeWorkspace", None), "id", None)
+            act_prod = getattr(app, "activeProduct", None)
+            in_cam_context = (
+                ws_id == constCAMWorkspaceId
+                or getattr(act_prod, "productType", None) == constCAMProductId
+                or has_cam_entity
+            )
+            if not in_cam_context:
+                return
+
+            matched_names = _ResolveNcProgramNamesFromEntities(cam, sel_ents)
+            if matched_names:
+                _pending_context_selection = (time.time(), matched_names)
+            else:
+                _pending_context_selection = None
+
+            linear_menu = getattr(eventArgs, "linearMarkingMenu", None)
+            controls = getattr(linear_menu, "controls", None) if linear_menu else None
+            cmd_defs = getattr(ui, "commandDefinitions", None)
+            cmd_def = cmd_defs.itemById(constCmdDefId) if cmd_defs else None
+            if controls is not None and cmd_def is not None:
+                if controls.itemById(constCmdDefId) is None:
+                    post_ctrl = controls.itemById("PostProcessCommand")
+                    if post_ctrl is not None:
+                        controls.addCommand(cmd_def, "PostProcessCommand", False)
+                    else:
+                        controls.addCommand(cmd_def)
+        except Exception as exc:
+            _dbg_global(f"MarkingMenuHandler exception: {exc}")
+
+
 # Event handler for the commandCreated event.
 class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
     def __init__(self):
@@ -830,10 +1218,11 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
 
             # Get document attributes that will set initial values
             app = adsk.core.Application.get()
+            ui = app.userInterface
             cam = adsk.cam.CAM.cast(app.activeDocument.products.itemByProductType(constCAMProductId))
-            docSettings  = settingsMgr.GetSettings(app.activeDocument.attributes)
+            docSettings = settingsMgr.GetSettings(app.activeDocument.attributes)
 
-            # Get the NCProgram
+            # Get the NCPrograms
             programs = cam.ncPrograms
             if programs.count == 0:
                 ncInput = programs.createInput()
@@ -844,17 +1233,30 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                 program.attributes.add(constAttrGroup, constAttrCompressedName, outputFolder)
                 AssignOutputFolder(program.parameters, ExpandFileName(outputFolder))
                 program.parameters.itemByName("nc_program_createInBrowser").value.value = True
-            elif programs.count == 1:
-                program = programs.item(0)
+
+            all_progs = _extract_cam_collection(programs)
+            all_prog_names = [p.name for p in all_progs if getattr(p, "name", None)]
+            valid_name_set = set(all_prog_names)
+
+            # Determine initial checked NC Programs: live context/selection first, then saved settings, else first program
+            preselected = [n for n in _ResolvePreselectedNcProgramNames(cam, ui) if n in valid_name_set]
+            if preselected:
+                checked_names = preselected
             else:
-                haveProgram = False
-                for program in programs:
-                    if program.name == docSettings["ncProgram"]:
-                        haveProgram = True
-                        break
-                if not haveProgram:
-                    program = programs.item(0)              
-            docSettings["ncProgram"] = program.name
+                saved_progs = docSettings.get("ncPrograms")
+                if isinstance(saved_progs, (list, tuple)) and saved_progs:
+                    checked_names = [n for n in saved_progs if n in valid_name_set]
+                elif docSettings.get("ncProgram") in valid_name_set:
+                    checked_names = [docSettings["ncProgram"]]
+                else:
+                    checked_names = []
+                if not checked_names and all_prog_names:
+                    checked_names = [all_prog_names[0]]
+
+            checked_set = set(checked_names)
+            ordered_checked = [n for n in all_prog_names if n in checked_set]
+            docSettings["ncPrograms"] = ordered_checked
+            docSettings["ncProgram"] = ordered_checked[0] if ordered_checked else ""
 
             # Connect to the execute event.
             onExecute = CommandExecuteHandler(docSettings)
@@ -864,16 +1266,65 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
             # Add inputs that will appear in a dialog
             inputs = cmd.commandInputs
 
-            input = inputs.addDropDownCommandInput("ncProgram", 
-                                                   "NC Program",
-                                                   adsk.core.DropDownStyles.TextListDropDownStyle)
-            for listItem in programs:
-                input.listItems.add(listItem.name, listItem.name == program.name)
-            input.isFullWidth = True
-            input.tooltip = "NC Program to Use"
-            input.tooltipDescription = (
-                "Post processing will use the settings from the selected NC Program."
+            tableInput = inputs.addTableCommandInput("ncProgramsTable", "NC Programs", 3, "1:5:4")
+            tableInput.minimumVisibleRows = min(4, max(2, programs.count + 1))
+            tableInput.maximumVisibleRows = 9
+            tableInput.hasGrid = False
+
+            # Row 0: Select All header aligned cleanly on top of column 0 checkboxes
+            sel_all_inp = inputs.addBoolValueInput(
+                "ncprog_select_all",
+                "",
+                True,
+                "",
+                len(ordered_checked) == len(all_prog_names) and len(all_prog_names) > 0,
             )
+            sel_all_inp.tooltip = "Select or deselect all NC Programs"
+            hdr_name_inp = inputs.addStringValueInput("ncprog_hdr_label", "", "Select All")
+            hdr_name_inp.isReadOnly = True
+            hdr_info_inp = inputs.addStringValueInput("ncprog_hdr_info", "", "")
+            hdr_info_inp.isReadOnly = True
+            tableInput.addCommandInput(sel_all_inp, 0, 0)
+            tableInput.addCommandInput(hdr_name_inp, 0, 1)
+            tableInput.addCommandInput(hdr_info_inp, 0, 2)
+
+            for idx, prog in enumerate(all_progs):
+                p_name = getattr(prog, "name", f"NC Program {idx + 1}")
+                chk_inp = inputs.addBoolValueInput(f"ncprog_chk_{idx}", "", True, "", p_name in checked_set)
+                name_inp = inputs.addStringValueInput(f"ncprog_name_{idx}", "", p_name)
+                name_inp.isReadOnly = True
+
+                # Build setup & output filename summary
+                try:
+                    p_setups, _ = GetNcProgramSetupsAndOperations(cam, docSettings, program=prog)
+                except Exception:
+                    p_setups = []
+
+                if len(p_setups) > 1:
+                    info_str = "⚠ Multiple setups"
+                else:
+                    setup_obj = p_setups[0] if len(p_setups) == 1 else None
+                    setup_name = _safe_str(getattr(setup_obj, "name", None)) or "No setup"
+                    raw_ext = ""
+                    p_params = getattr(prog, "parameters", None)
+                    if p_params is not None:
+                        try:
+                            ext_param = p_params.itemByName("nc_program_nc_extension")
+                            if ext_param is not None:
+                                raw_ext = _extract_choice_value(ext_param)
+                        except Exception:
+                            pass
+                    file_ext = _NormalizeFileExtension(raw_ext) if raw_ext else ".nc"
+                    raw_fname = _ResolveNcProgramOutputFilename(prog, setup_obj, file_ext)
+                    _, leaf_fname = _ResolveSetupFolderAndFilename("", raw_fname)
+                    info_str = f"{setup_name} -> {leaf_fname}{file_ext}"
+
+                info_inp = inputs.addStringValueInput(f"ncprog_info_{idx}", "", info_str)
+                info_inp.isReadOnly = True
+
+                tableInput.addCommandInput(chk_inp, idx + 1, 0)
+                tableInput.addCommandInput(name_inp, idx + 1, 1)
+                tableInput.addCommandInput(info_inp, idx + 1, 2)
 
             # Optimization & Verification group
             inputGroup = inputs.addGroupCommandInput("groupPersonal", "Optimization & Verification")
@@ -922,6 +1373,7 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
 class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
     def __init__(self, docSettings):
         self.docSettings = docSettings
+        self._updating_select_all = False
         super().__init__()
 
     def notify(self, args):
@@ -929,16 +1381,56 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
         ui  = app.userInterface
         try:
             eventArgs = adsk.core.InputChangedEventArgs.cast(args)
-            cmd = eventArgs.input.parentCommand
-            inputs = eventArgs.inputs
-
-            doc = app.activeDocument
-            cam = adsk.cam.CAM.cast(doc.products.itemByProductType(constCAMProductId))
+            inputs = _GetRootCommandInputs(eventArgs)
 
             # See if button clicked
             input = eventArgs.input
             if input.id == "save":
                 settingsMgr.SaveDefault(self.docSettings)
+
+            elif input.id == "ncprog_select_all":
+                if self._updating_select_all:
+                    return
+                self._updating_select_all = True
+                try:
+                    target_val = bool(input.value)
+                    selected = []
+                    if inputs is not None:
+                        tbl = inputs.itemById("ncProgramsTable")
+                        row_offset = 1 if _TableHasSelectAllHeader(tbl) else 0
+                        row_count = getattr(tbl, "rowCount", None) if tbl is not None else None
+                        indices = range(max(0, row_count - row_offset)) if isinstance(row_count, int) else range(500)
+                        for i in indices:
+                            chk, name_inp = _GetNcProgramRowInputs(inputs, tbl, i, row_offset=row_offset)
+                            if chk is None:
+                                break
+                            chk.value = target_val
+                            if target_val:
+                                p_name = getattr(name_inp, "value", "") if name_inp is not None else ""
+                                if isinstance(p_name, str) and p_name:
+                                    selected.append(p_name)
+                    self.docSettings["ncPrograms"] = selected
+                    self.docSettings["ncProgram"] = selected[0] if selected else ""
+                finally:
+                    self._updating_select_all = False
+
+            elif input.id.startswith("ncprog_chk_"):
+                if self._updating_select_all:
+                    return
+                self._updating_select_all = True
+                try:
+                    selected, total = _CollectCheckedNcProgramsFromInputs(inputs)
+                    sel_all = inputs.itemById("ncprog_select_all") if inputs is not None else None
+                    if sel_all is None and inputs is not None:
+                        tbl = inputs.itemById("ncProgramsTable")
+                        if _TableHasSelectAllHeader(tbl):
+                            sel_all = tbl.getInputAtPosition(0, 0)
+                    if sel_all is not None and total > 0:
+                        sel_all.value = (len(selected) == total)
+                    self.docSettings["ncPrograms"] = selected
+                    self.docSettings["ncProgram"] = selected[0] if selected else ""
+                finally:
+                    self._updating_select_all = False
 
             elif input.id in self.docSettings:
                 if input.objectType == adsk.core.GroupCommandInput.classType():
@@ -961,10 +1453,21 @@ class CommandValidateInputsHandler(adsk.core.ValidateInputsEventHandler):
         app = adsk.core.Application.get()
         ui  = app.userInterface
 
-        # No validation currently performed. Skeleton code retained.
         try:
             eventArgs = adsk.core.ValidateInputsEventArgs.cast(args)
-            inputs = eventArgs.firingEvent.sender.commandInputs
+            inputs = _GetRootCommandInputs(eventArgs)
+            selected, total = _CollectCheckedNcProgramsFromInputs(inputs)
+            err_box = inputs.itemById("error") if inputs is not None else None
+            if total > 0 and not selected:
+                eventArgs.areInputsValid = False
+                if err_box is not None:
+                    err_box.text = "Select at least one NC Program."
+                    err_box.isVisible = True
+            else:
+                eventArgs.areInputsValid = True
+                if err_box is not None:
+                    err_box.text = ""
+                    err_box.isVisible = False
 
         except:
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
@@ -981,8 +1484,15 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
         cmd = eventArgs.command
         inputs = cmd.commandInputs
 
+        selected, total = _CollectCheckedNcProgramsFromInputs(inputs)
+        if total > 0:
+            self.docSettings["ncPrograms"] = selected
+            self.docSettings["ncProgram"] = selected[0] if selected else ""
+
         # Code to react to the event.
         for key in list(self.docSettings.keys()):
+            if key in ("ncPrograms", "ncProgram"):
+                continue
             inp = inputs.itemById(key)
             if inp:
                 if inp.objectType == adsk.core.GroupCommandInput.classType():
@@ -992,7 +1502,10 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                         self.docSettings[key] = inp.selectedItem.name
                 elif hasattr(inp, "value"):
                     self.docSettings[key] = inp.value
-        _dbg_global(f"CommandExecuteHandler execute: restore_rapid={self.docSettings.get('restore_rapid')}")
+        _dbg_global(
+            f"CommandExecuteHandler execute: ncPrograms={self.docSettings.get('ncPrograms')}, "
+            f"restore_rapid={self.docSettings.get('restore_rapid')}"
+        )
         PerformPostProcess(self.docSettings)
 
 
@@ -1016,58 +1529,182 @@ def PerformPostProcess(docSettings, setups=None):
         if settingsMgr is None:
             settingsMgr = SettingsManager()
 
-        program = GetNcProgram(cam, docSettings)
-        parameters = program.parameters
-        setups, setup_operations_map = GetNcProgramSetupsAndOperations(cam, docSettings, setups, program)
+        selected_programs = GetSelectedNcPrograms(cam, docSettings)
+        if not selected_programs:
+            fallback_prog = GetNcProgram(cam, docSettings)
+            if fallback_prog is not None:
+                selected_programs = [fallback_prog]
 
-        # Abort with error if multiple setups are detected
-        if len(setups) > 1:
-            prog_name = getattr(program, "name", "NC Program")
-            setup_names = ", ".join(f"'{getattr(s, 'name', 'Setup')}'" for s in setups)
-            err = f"Multiple setups detected in NC Program '{prog_name}' ({setup_names}). Processing multiple setups in a single NC Program is not supported."
-            _dbg_global(f"PerformPostProcess: {err}")
-            if ui:
-                ui.messageBox(
-                    err,
-                    constCmdName,
-                    adsk.core.MessageBoxButtonTypes.OKButtonType,
-                    adsk.core.MessageBoxIconTypes.CriticalIconType,
-                )
+        if not selected_programs:
+            err = "No NC Programs found to post process."
+            _NotifyPostProcessResult(
+                ui=ui,
+                cntFiles=0,
+                cntSkipped=1,
+                lstSkipped=err,
+                outputFolder="",
+                verifyResults=verifyResults,
+                is_fatal=True,
+            )
             return err
 
-        # normalize output folder for this user
-        # "\" is converted to "/"
-        outputFolder = parameters.itemByName("nc_program_output_folder").value.value.replace("\\", "/")
-        # keep leading "\\" for file share
-        if outputFolder[0:2] == "//":
-            outputFolder = "\\\\" + outputFolder[2:]
-        try:
-            pathlib.Path(outputFolder).mkdir(parents=True, exist_ok=True)
-        except Exception:
-            # see if we can map it to folder with compressed user
-            attr = program.attributes.itemByName(constAttrGroup, constAttrCompressedName)
-            if attr and attr.value:
-                compressedName = attr.value
-                if compressedName and compressedName[0] == "~" and compressedName[1:] == outputFolder[-(len(compressedName) - 1):]:
-                    # yes, it matches
-                    outputFolder = ExpandFileName(compressedName)
+        # Pre-flight across all selected NC Programs before starting progress dialog
+        all_empty_invalid = []
+        existing_files = []
+        runnable_tasks = []
+        program_snapshots = {}
+        seen_targets = {}
+        first_output_folder = ""
+        all_output_folders = set()
+
+        for prog_idx, program in enumerate(selected_programs):
+            prog_name = _safe_str(getattr(program, "name", None)) or f"NC Program {prog_idx + 1}"
+            parameters = getattr(program, "parameters", None)
+            setups_override = setups if (setups is not None and len(selected_programs) == 1) else None
+            p_setups, setup_operations_map = GetNcProgramSetupsAndOperations(cam, docSettings, setups_override, program)
+
+            # Abort with error if multiple setups are detected in a single NC Program
+            if len(p_setups) > 1:
+                setup_names = ", ".join(f"'{getattr(s, 'name', 'Setup')}'" for s in p_setups)
+                err = (
+                    f"Multiple setups detected in NC Program '{prog_name}' ({setup_names}). "
+                    f"Processing multiple setups in a single NC Program is not supported."
+                )
+                _dbg_global(f"PerformPostProcess: {err}")
+                if ui:
+                    ui.messageBox(
+                        err,
+                        constCmdName,
+                        adsk.core.MessageBoxButtonTypes.OKButtonType,
+                        adsk.core.MessageBoxIconTypes.CriticalIconType,
+                    )
+                return err
+
+            # Normalize output folder for this user ("\" -> "/")
+            raw_folder = ""
+            if parameters is not None:
+                try:
+                    p_folder = parameters.itemByName("nc_program_output_folder")
+                    raw_folder = _extract_choice_value(p_folder)
+                except Exception:
+                    raw_folder = ""
+            outputFolder = raw_folder.replace("\\", "/")
+            # Keep leading "\\" for file share
+            if outputFolder[0:2] == "//":
+                outputFolder = "\\\\" + outputFolder[2:]
             try:
                 pathlib.Path(outputFolder).mkdir(parents=True, exist_ok=True)
             except Exception:
-                pass
+                # See if we can map it to folder with compressed user
+                try:
+                    attr = program.attributes.itemByName(constAttrGroup, constAttrCompressedName)
+                    if attr and attr.value:
+                        compressedName = attr.value
+                        if compressedName and compressedName[0] == "~" and compressedName[1:] == outputFolder[-(len(compressedName) - 1):]:
+                            outputFolder = ExpandFileName(compressedName)
+                except Exception:
+                    pass
+                try:
+                    pathlib.Path(outputFolder).mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
 
-        compressedName = CompressFileName(outputFolder)
-        program.attributes.add(constAttrGroup, constAttrCompressedName, compressedName)
-        docSettings["output"] = compressedName
+            if not first_output_folder:
+                first_output_folder = outputFolder
+            if outputFolder:
+                all_output_folders.add(outputFolder)
+
+            compressedName = CompressFileName(outputFolder)
+            try:
+                program.attributes.add(constAttrGroup, constAttrCompressedName, compressedName)
+            except Exception:
+                pass
+            docSettings["output"] = compressedName
+
+            empty_invalid = getattr(setup_operations_map, "empty_or_invalid_ops", [])
+            if empty_invalid:
+                all_empty_invalid.extend(empty_invalid)
+
+            # Snapshot original NCProgram parameters so the user's NCProgram is never left mutated
+            orig_prog_params = {}
+            if parameters is not None:
+                for p_key in (
+                    "nc_program_name",
+                    "nc_program_filename",
+                    "nc_program_openInEditor",
+                    "nc_program_nc_extension",
+                    "nc_program_output_folder",
+                ):
+                    try:
+                        p_item = parameters.itemByName(p_key)
+                        if p_item is not None:
+                            orig_prog_params[p_key] = p_item.value.value
+                    except Exception:
+                        pass
+            program_snapshots[id(program)] = (program, parameters, outputFolder, orig_prog_params)
+
+            if len(p_setups) != 0 and cam.allOperations.count != 0:
+                raw_ext = ""
+                if parameters is not None:
+                    try:
+                        ext_param = parameters.itemByName("nc_program_nc_extension")
+                        if ext_param is not None:
+                            raw_ext = _extract_choice_value(ext_param)
+                    except Exception:
+                        pass
+                fileExt = _NormalizeFileExtension(raw_ext)
+
+                for setup in p_setups:
+                    target_ops = _lookup_setup_ops(setup, setup_operations_map)
+                    if not target_ops or getattr(setup, "isSuppressed", False):
+                        continue
+                    if getattr(setup, "allOperations", None) is not None and getattr(setup.allOperations, "count", 1) == 0:
+                        continue
+
+                    raw_fname = _ResolveNcProgramOutputFilename(program, setup, fileExt)
+                    sFolder, sFname = _ResolveSetupFolderAndFilename(outputFolder, raw_fname)
+                    target_path = os.path.join(sFolder, sFname + fileExt)
+                    abs_target = os.path.abspath(target_path)
+
+                    if abs_target in seen_targets:
+                        other_prog = seen_targets[abs_target]
+                        err = (
+                            f"Duplicate output filename detected: NC Programs '{other_prog}' and '{prog_name}' "
+                            f"both target '{abs_target}'. Please give each NC Program a unique filename."
+                        )
+                        _dbg_global(f"PerformPostProcess: {err}")
+                        if ui:
+                            ui.messageBox(
+                                err,
+                                constCmdName,
+                                adsk.core.MessageBoxButtonTypes.OKButtonType,
+                                adsk.core.MessageBoxIconTypes.CriticalIconType,
+                            )
+                        return err
+
+                    seen_targets[abs_target] = prog_name
+                    if os.path.isfile(target_path):
+                        existing_files.append(target_path)
+
+                    runnable_tasks.append({
+                        "program": program,
+                        "prog_name": prog_name,
+                        "parameters": parameters,
+                        "setup": setup,
+                        "target_ops": target_ops,
+                        "setupFolder": sFolder,
+                        "fname": sFname,
+                        "outputFolder": outputFolder,
+                        "target_path": target_path,
+                    })
 
         # Save settings in document attributes
         settingsMgr.SaveSettings(doc.attributes, docSettings)
 
-        # Check upfront if any operations have empty or invalid toolpaths
-        empty_invalid = getattr(setup_operations_map, "empty_or_invalid_ops", [])
-        if empty_invalid and ui:
+        # Prompt once for any empty/invalid toolpaths across all selected NC Programs
+        if all_empty_invalid and ui:
             lines = []
-            for s, op, reason in empty_invalid:
+            for s, op, reason in all_empty_invalid:
                 s_name = getattr(s, "name", "Setup")
                 op_name = getattr(op, "name", "Operation")
                 lines.append(f"• Setup '{s_name}' -> Operation '{op_name}' ({reason})")
@@ -1088,52 +1725,36 @@ def PerformPostProcess(docSettings, setups=None):
                 _dbg_global("PerformPostProcess: user chose not to proceed with empty/invalid toolpaths; aborting.")
                 return  # abort!
 
-        if len(setups) != 0 and cam.allOperations.count != 0:
-            # Check upfront if any final output file already exists.
-            # When the final output file already exists, modally ask user if to overwrite it (Yes/No, No aborts).
-            fileExt = _NormalizeFileExtension(parameters.itemByName("nc_program_nc_extension").value.value)
+        # Prompt once for any existing target output files across all selected NC Programs
+        if existing_files and ui:
+            if len(existing_files) == 1:
+                target = existing_files[0]
+                prompt = (
+                    f"The output file already exists:\n\n"
+                    f"{target}\n\n"
+                    f"Do you want to overwrite it?"
+                )
+            else:
+                file_lines = "\n".join(f"• {f}" for f in existing_files)
+                prompt = (
+                    f"The following output file(s) already exist:\n\n"
+                    f"{file_lines}\n\n"
+                    f"Do you want to overwrite them?"
+                )
+            res = ui.messageBox(
+                prompt,
+                constCmdName,
+                adsk.core.MessageBoxButtonTypes.YesNoButtonType,
+                adsk.core.MessageBoxIconTypes.QuestionIconType
+            )
+            if res != adsk.core.DialogResults.DialogYes:
+                _dbg_global("PerformPostProcess: user chose not to overwrite existing file; aborting.")
+                return  # abort!
 
-            existing_files = []
-            for setup in setups:
-                target_ops = _lookup_setup_ops(setup, setup_operations_map)
-                if not target_ops or getattr(setup, "isSuppressed", False):
-                    continue
-                if getattr(setup, "allOperations", None) is not None and getattr(setup.allOperations, "count", 1) == 0:
-                    continue
-
-                sFolder, sFname = _ResolveSetupFolderAndFilename(outputFolder, setup.name)
-                target_path = os.path.join(sFolder, sFname + fileExt)
-                if os.path.isfile(target_path):
-                    existing_files.append(target_path)
-
-            if existing_files:
-                if ui:
-                    if len(existing_files) == 1:
-                        target = existing_files[0]
-                        prompt = (
-                            f"The output file already exists:\n\n"
-                            f"{target}\n\n"
-                            f"Do you want to overwrite it?"
-                        )
-                    else:
-                        file_lines = "\n".join(f"• {f}" for f in existing_files)
-                        prompt = (
-                            f"The following output file(s) already exist:\n\n"
-                            f"{file_lines}\n\n"
-                            f"Do you want to overwrite them?"
-                        )
-                    res = ui.messageBox(
-                        prompt,
-                        constCmdName,
-                        adsk.core.MessageBoxButtonTypes.YesNoButtonType,
-                        adsk.core.MessageBoxIconTypes.QuestionIconType
-                    )
-                    if res != adsk.core.DialogResults.DialogYes:
-                        _dbg_global("PerformPostProcess: user chose not to overwrite existing file; aborting.")
-                        return  # abort!
-
+        program_outcomes = []
+        if runnable_tasks:
             progress = ui.createProgressDialog() if (ui and hasattr(ui, "createProgressDialog")) else None
-            total_setups = max(1, len(setups))
+            total_tasks = max(1, len(runnable_tasks))
             if progress:
                 progress.isCancelButtonShown = True
                 progress.show("Post Processing...", "Initializing post processing... (%p%)", 0, 100)
@@ -1144,13 +1765,13 @@ def PerformPostProcess(docSettings, setups=None):
                     except Exception:
                         pass
 
-            def make_setup_progress_cb(s_idx, s_name):
+            def make_setup_progress_cb(t_idx, label):
                 def _cb(step_msg, frac):
                     if progress:
                         if progress.wasCancelled:
                             return False
-                        pct = int(((s_idx + max(0.0, min(1.0, frac))) / total_setups) * 100)
-                        progress.message = f"{s_name}: {step_msg} (%p%)"
+                        pct = int(((t_idx + max(0.0, min(1.0, frac))) / total_tasks) * 100)
+                        progress.message = f"{label}: {step_msg} (%p%)"
                         progress.progressValue = max(0, min(100, pct))
                         if "adsk" in sys.modules and hasattr(adsk, "doEvents"):
                             try:
@@ -1161,74 +1782,100 @@ def PerformPostProcess(docSettings, setups=None):
                 _cb.progress_dialog = progress
                 return _cb
 
-            cntSetups = 0
-
-            # Snapshot original NCProgram parameters so the user's NCProgram is never left mutated
-            orig_prog_params = {}
-            for p_key in ("nc_program_name", "nc_program_filename", "nc_program_openInEditor", "nc_program_nc_extension"):
-                try:
-                    p_item = parameters.itemByName(p_key)
-                    if p_item is not None:
-                        orig_prog_params[p_key] = p_item.value.value
-                except Exception:
-                    pass
-
             try:
-                for setup in setups:
+                for task_idx, task in enumerate(runnable_tasks):
                     if progress and progress.wasCancelled:
                         break
-                    target_ops = _lookup_setup_ops(setup, setup_operations_map)
-                    if not target_ops or getattr(setup, "isSuppressed", False):
-                        continue
-                    if getattr(setup, "allOperations", None) is not None and getattr(setup.allOperations, "count", 1) == 0:
-                        continue
+                    program = task["program"]
+                    prog_name = task["prog_name"]
+                    setup = task["setup"]
+                    target_ops = task["target_ops"]
+                    setupFolder = task["setupFolder"]
+                    fname = task["fname"]
+                    label = f"{prog_name} / {setup.name}" if len(selected_programs) > 1 else setup.name
 
-                    setupFolder, fname = _ResolveSetupFolderAndFilename(outputFolder, setup.name)
-
-                    setup_cb = make_setup_progress_cb(cntSetups, setup.name)
+                    setup_cb = make_setup_progress_cb(task_idx, label)
                     setup_cb("Starting setup...", 0.0)
 
-                    # post the file with only the operations selected in the NCProgram
+                    prev_len = len(verifyResults)
                     status = PostProcessSetup(
                         fname, setup, setupFolder, docSettings, program,
                         target_operations=target_ops, progress_cb=setup_cb
                     )
-                    if status == None:
+                    # Backfill nc_program on any verifyResult appended during this task
+                    for vr in verifyResults[prev_len:]:
+                        if not vr.get("nc_program"):
+                            vr["nc_program"] = prog_name
+                        if not vr.get("folder"):
+                            vr["folder"] = task["outputFolder"]
+
+                    if status is None:
                         cntFiles += 1
                         setup_cb("Completed.", 1.0)
+                        if len(verifyResults) == prev_len:
+                            program_outcomes.append({
+                                "nc_program": prog_name,
+                                "setup": setup.name,
+                                "cnc": task["target_path"],
+                                "folder": task["outputFolder"],
+                                "status": "success",
+                                "summary": "Completed",
+                            })
                     elif "cancelled" in status.lower():
                         cntSkipped += 1
-                        lstSkipped += "\nCancelled by user on setup " + setup.name
+                        lstSkipped += f"\nCancelled by user on setup {setup.name}"
+                        program_outcomes.append({
+                            "nc_program": prog_name,
+                            "setup": setup.name,
+                            "cnc": task["target_path"],
+                            "folder": task["outputFolder"],
+                            "status": "warning",
+                            "summary": status,
+                        })
                         break
                     else:
                         cntSkipped += 1
-                        lstSkipped += "\nFailed on setup " + setup.name + ": " + status
-
-                    cntSetups += 1
+                        lstSkipped += f"\nFailed on setup {setup.name}: {status}"
+                        if len(verifyResults) == prev_len:
+                            program_outcomes.append({
+                                "nc_program": prog_name,
+                                "setup": setup.name,
+                                "cnc": task["target_path"],
+                                "folder": task["outputFolder"],
+                                "status": "error",
+                                "summary": status,
+                            })
             finally:
                 if progress:
                     try:
                         progress.hide()
                     except Exception:
                         pass
-                # restore program output folder and original NCProgram name/filename parameters
-                AssignOutputFolder(parameters, outputFolder)
-                for p_key, p_val in orig_prog_params.items():
-                    try:
-                        p_item = parameters.itemByName(p_key)
-                        if p_item is not None:
-                            p_item.value.value = p_val
-                    except Exception:
-                        pass
+                # Restore every program's output folder and original parameters
+                for _, parameters, orig_folder, orig_prog_params in program_snapshots.values():
+                    if parameters is not None:
+                        try:
+                            AssignOutputFolder(parameters, orig_folder)
+                        except Exception:
+                            pass
+                        for p_key, p_val in orig_prog_params.items():
+                            try:
+                                p_item = parameters.itemByName(p_key)
+                                if p_item is not None:
+                                    p_item.value.value = p_val
+                            except Exception:
+                                pass
 
+        shared_folder = first_output_folder if len(all_output_folders) <= 1 else ""
         # done with setups, report results non-modally
         _NotifyPostProcessResult(
             ui=ui,
             cntFiles=cntFiles,
             cntSkipped=cntSkipped,
             lstSkipped=lstSkipped,
-            outputFolder=outputFolder,
+            outputFolder=shared_folder or first_output_folder,
             verifyResults=verifyResults,
+            program_outcomes=program_outcomes,
         )
         ShowVerifyResults(ui)
 
@@ -1243,7 +1890,7 @@ def PerformPostProcess(docSettings, setups=None):
             cntFiles=0,
             cntSkipped=1,
             lstSkipped=user_err,
-            outputFolder=outputFolder if 'outputFolder' in locals() else "",
+            outputFolder=first_output_folder if 'first_output_folder' in locals() else "",
             verifyResults=verifyResults,
             is_fatal=True,
         )
@@ -1252,7 +1899,7 @@ def PerformPostProcess(docSettings, setups=None):
 verifyResults = []
 
 
-def _RecordVerifyResult(setup, cncPath, reportText, reportPath=None, pngPath=None, promoted=None, spikes=None, volume_mm3=None, collisions=None, error=None, warning=None):
+def _RecordVerifyResult(setup, cncPath, reportText, reportPath=None, pngPath=None, promoted=None, spikes=None, volume_mm3=None, collisions=None, error=None, warning=None, nc_program=None):
     basePath = os.path.splitext(cncPath)[0]
     if not reportPath:
         reportPath = basePath + "_report.md"
@@ -1268,6 +1915,7 @@ def _RecordVerifyResult(setup, cncPath, reportText, reportPath=None, pngPath=Non
         kind_str = c.kind.name if hasattr(c.kind, "name") else str(c.kind)
         kinds[kind_str] = kinds.get(kind_str, 0) + 1
     verifyResults.append({
+        "nc_program": nc_program or "",
         "setup": setup.name,
         "cnc": cncPath,
         "png": pngPath,
@@ -2014,24 +2662,26 @@ def _HandleNotificationAction(palette_id, action, data):
 
     _dbg_global(f"_HandleNotificationAction: executing action={action}, data={data}")
 
-    # 1. Execute OS action first (independent of Fusion UI state)
+    # 1. Execute OS action first (independent of Fusion UI state); keep palette open
     if action in ("open_file", "open_folder"):
         if data and os.path.exists(data):
             res = _OpenFile(data)
             _dbg_global(f"_HandleNotificationAction: _OpenFile({data}) returned {res}")
         else:
             _dbg_global(f"_HandleNotificationAction: path does not exist: '{data}'")
+        return
 
-    # 2. Hide palette if requested or on action
-    try:
-        app = adsk.core.Application.get() if ("adsk" in sys.modules and hasattr(adsk, "core") and hasattr(adsk.core, "Application")) else None
-        ui = getattr(app, "userInterface", None) if app else None
-        if ui and hasattr(ui, "palettes") and ui.palettes:
-            p = ui.palettes.itemById(palette_id)
-            if p:
-                p.isVisible = False
-    except Exception as hide_exc:
-        _dbg_global(f"_HandleNotificationAction hide palette note: {hide_exc}")
+    # 2. Hide palette only when explicitly dismissed/closed
+    if action in ("dismiss", "close"):
+        try:
+            app = adsk.core.Application.get() if ("adsk" in sys.modules and hasattr(adsk, "core") and hasattr(adsk.core, "Application")) else None
+            ui = getattr(app, "userInterface", None) if app else None
+            if ui and hasattr(ui, "palettes") and ui.palettes:
+                p = ui.palettes.itemById(palette_id)
+                if p:
+                    p.isVisible = False
+        except Exception as hide_exc:
+            _dbg_global(f"_HandleNotificationAction hide palette note: {hide_exc}")
 
 
 class _NotificationNavigationEventHandler(_NavigationEventHandlerBase):
@@ -2097,7 +2747,7 @@ class _NotificationHTMLEventHandler(_HTMLEventHandlerBase):
             _dbg_global(f"NotificationHTMLEventHandler exception: {exc}")
 
 
-def _BuildNotificationHTML(title, status_type, message, details, actions):
+def _BuildNotificationHTML(title, status_type, message, details, actions, program_rows=None):
     """
     Generate self-contained HTML for non-modal Fusion toast notification.
     Note: Fusion 360's palettes.add2 requires the HTML string to strictly start
@@ -2116,14 +2766,96 @@ def _BuildNotificationHTML(title, status_type, message, details, actions):
     bg_accent = color_map.get(status_type, '#2e7d32')
     icon = icon_map.get(status_type, '✓')
 
-    action_buttons = []
-    for label, action_name, action_data in actions:
+    def _make_btn(label, action_name, action_data, css_cls="action-btn"):
         esc_data = html.escape(action_data, quote=True).replace('\\', '\\\\').replace("'", "\\'")
         nav_href = f"action://{action_name}?path={urllib.parse.quote(action_data)}"
-        action_buttons.append(
-            f'<a class="action-btn" href="{nav_href}" onclick="sendAction(event, \'{action_name}\', \'{esc_data}\')">{html.escape(label)}</a>'
+        return (
+            f'<a class="{css_cls}" href="{nav_href}" '
+            f'onclick="sendAction(event, \'{action_name}\', \'{esc_data}\')">{html.escape(label)}</a>'
         )
+
+    action_buttons = [_make_btn(label, action_name, action_data) for label, action_name, action_data in actions]
     actions_html = "\n".join(action_buttons)
+
+    rows_html = ""
+    if program_rows:
+        row_items = []
+        row_folders = {
+            (r.get("folder") or (os.path.dirname(r["cnc"]) if r.get("cnc") else ""))
+            for r in program_rows
+            if (r.get("folder") or r.get("cnc"))
+        }
+        show_row_folder = len(row_folders) > 1
+        for r in program_rows:
+            r_status = r.get("status", "success")
+            r_icon = icon_map.get(r_status, "✓")
+            r_color = color_map.get(r_status, "#2e7d32")
+            nc_prog = (r.get("nc_program") or "").strip()
+            setup_name = (r.get("setup") or "").strip()
+            if nc_prog and setup_name and nc_prog != setup_name:
+                row_label = f"{nc_prog} · {setup_name}"
+            else:
+                row_label = nc_prog or setup_name or "Program"
+            row_summary = r.get("summary") or ""
+
+            mini_btns = []
+            if r.get("cnc") and os.path.isfile(r["cnc"]):
+                mini_btns.append(_make_btn("NC", "open_file", r["cnc"], css_cls="mini-btn"))
+            if r.get("report") and os.path.isfile(r["report"]):
+                mini_btns.append(_make_btn("Report", "open_file", r["report"], css_cls="mini-btn"))
+            if r.get("png") and os.path.isfile(r["png"]):
+                mini_btns.append(_make_btn("Plot", "open_file", r["png"], css_cls="mini-btn"))
+            row_folder = r.get("folder") or (os.path.dirname(r["cnc"]) if r.get("cnc") else "")
+            if show_row_folder and row_folder and os.path.isdir(row_folder):
+                mini_btns.append(_make_btn("Folder", "open_folder", row_folder, css_cls="mini-btn"))
+
+            summary_div = f'<div class="row-summary">{html.escape(row_summary)}</div>' if row_summary else ""
+            row_items.append(
+                f'<div class="program-row">'
+                f'  <span class="row-icon" style="background-color:{r_color};">{r_icon}</span>'
+                f'  <div class="row-info">'
+                f'    <div class="row-title">{html.escape(row_label)}</div>'
+                f'    {summary_div}'
+                f'  </div>'
+                f'  <div class="row-actions">{"".join(mini_btns)}</div>'
+                f'</div>'
+            )
+        rows_html = f'<div class="program-list">{"".join(row_items)}</div>'
+
+    if status_type == "success":
+        auto_dismiss_js = """
+  var wasClicked = false;
+  var dismissTimer = setTimeout(function() {
+    if (!wasClicked) sendAction(null, 'dismiss', '');
+  }, 2000);
+  function cancelAutoDismiss() {
+    wasClicked = true;
+    if (dismissTimer) {
+      clearTimeout(dismissTimer);
+      dismissTimer = null;
+    }
+  }
+  document.addEventListener('mousedown', cancelAutoDismiss, true);
+  document.addEventListener('click', cancelAutoDismiss, true);
+  document.addEventListener('mouseenter', function() {
+    if (dismissTimer) {
+      clearTimeout(dismissTimer);
+      dismissTimer = null;
+    }
+  });
+  document.addEventListener('mouseleave', function() {
+    if (!wasClicked) {
+      if (dismissTimer) clearTimeout(dismissTimer);
+      dismissTimer = setTimeout(function() {
+        if (!wasClicked) sendAction(null, 'dismiss', '');
+      }, 2000);
+    }
+  });"""
+    else:
+        auto_dismiss_js = """
+  var wasClicked = true;
+  var dismissTimer = null;
+  function cancelAutoDismiss() {}"""
 
     # Note: Must strictly begin with <html> (no <!DOCTYPE html>) for Fusion 360 C++ add2 parser
     html_content = f"""<html>
@@ -2184,9 +2916,91 @@ def _BuildNotificationHTML(title, status_type, message, details, actions):
   .toast-details {{
     font-size: 11px;
     color: #9e9e9e;
-    margin-bottom: 12px;
+    margin-bottom: 10px;
     word-break: break-word;
     white-space: pre-wrap;
+  }}
+  .program-list {{
+    max-height: 250px;
+    overflow-y: auto;
+    margin: 6px 0 10px 0;
+    border: 1px solid #3c3c3c;
+    border-radius: 4px;
+    background: #242424;
+  }}
+  @media (prefers-color-scheme: light) {{
+    .program-list {{ border-color: #dcdcdc; background: #f6f6f6; }}
+  }}
+  .program-row {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-bottom: 1px solid #353535;
+  }}
+  .program-row:last-child {{ border-bottom: none; }}
+  @media (prefers-color-scheme: light) {{
+    .program-row {{ border-bottom-color: #e4e4e4; }}
+  }}
+  .row-icon {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    color: #ffffff;
+    font-size: 10px;
+    font-weight: bold;
+    flex-shrink: 0;
+  }}
+  .row-info {{
+    flex-grow: 1;
+    min-width: 0;
+  }}
+  .row-title {{
+    font-size: 11.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .row-summary {{
+    font-size: 10.5px;
+    color: #b0b0b0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  @media (prefers-color-scheme: light) {{
+    .row-summary {{ color: #555555; }}
+  }}
+  .row-actions {{
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }}
+  a.mini-btn {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: #3e3e3e;
+    color: #ffffff !important;
+    text-decoration: none !important;
+    border: 1px solid #555555;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 10.5px;
+    font-weight: 500;
+    cursor: pointer;
+  }}
+  @media (prefers-color-scheme: light) {{
+    a.mini-btn {{ background: #eeeeee; color: #111111 !important; border-color: #cccccc; }}
+  }}
+  a.mini-btn:hover {{
+    background: #007acc;
+    border-color: #007acc;
+    color: #ffffff !important;
   }}
   .toast-actions {{
     display: flex;
@@ -2222,6 +3036,9 @@ def _BuildNotificationHTML(title, status_type, message, details, actions):
 </style>
 <script>
   function sendAction(e, action, data) {{
+    if (action !== 'dismiss' && action !== 'close') {{
+      cancelAutoDismiss();
+    }}
     // 1. Try adsk.fusionSendData if available
     try {{
       if (typeof adsk !== 'undefined' && adsk && adsk.fusionSendData) {{
@@ -2236,18 +3053,7 @@ def _BuildNotificationHTML(title, status_type, message, details, actions):
       var navUrl = 'action://' + encodeURIComponent(action) + '?path=' + encodeURIComponent(data) + '&t=' + Date.now();
       window.location.href = navUrl;
     }} catch (err2) {{}}
-  }}
-  var dismissTimer = setTimeout(function() {{
-    sendAction(null, 'dismiss', '');
-  }}, 6000);
-  document.addEventListener('mouseenter', function() {{
-    if (dismissTimer) clearTimeout(dismissTimer);
-  }});
-  document.addEventListener('mouseleave', function() {{
-    dismissTimer = setTimeout(function() {{
-      sendAction(null, 'dismiss', '');
-    }}, 2500);
-  }});
+  }}{auto_dismiss_js}
 </script>
 </head>
 <body>
@@ -2256,6 +3062,7 @@ def _BuildNotificationHTML(title, status_type, message, details, actions):
     <div class="toast-title">{html.escape(title)}</div>
   </div>
   <div class="toast-body">{html.escape(message)}</div>
+  {rows_html}
   {f'<div class="toast-details">{html.escape(details)}</div>' if details else ''}
   <div class="toast-actions">
     {actions_html}
@@ -2265,13 +3072,14 @@ def _BuildNotificationHTML(title, status_type, message, details, actions):
     return html_content.strip()
 
 
-def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder, verifyResults=None, is_fatal=False):
+def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder, verifyResults=None, is_fatal=False, program_outcomes=None):
     """
     Provide non-modal feedback via Fusion statusMessage and non-modal Palette toast,
     matching Fusion native post-processing behavior without blocking modal message boxes.
     """
     global _notification_handler
     verifyResults = verifyResults or []
+    program_outcomes = program_outcomes or []
 
     # 1. Determine status type and headline
     has_errors = (cntFiles == 0 or is_fatal)
@@ -2297,7 +3105,46 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
             prom = r0.get("promoted", 0) or 0
             msg = f"{r0['setup']}: {cntFiles} file written ({prom} rapid moves restored, 0 collisions)."
         else:
-            msg = f"{cntFiles} file(s) successfully written."
+            total_prom = sum((r.get("promoted", 0) or 0) for r in verifyResults)
+            if len(verifyResults) > 1:
+                msg = f"{cntFiles} NC programs completed ({total_prom} G0 restored, 0 collisions)."
+            else:
+                msg = f"{cntFiles} file(s) successfully written."
+
+    # Build per-program rows from verifyResults and any non-verified outcomes
+    program_rows = []
+    seen_row_keys = set()
+    for r in verifyResults:
+        total_cols = sum(r["kinds"].values()) if r.get("kinds") else 0
+        if r.get("error"):
+            r_status = "error"
+            r_summary = str(r["error"])
+        elif r.get("warning") or total_cols > 0:
+            r_status = "warning"
+            r_summary = str(r.get("warning") or f"{total_cols} collision(s) detected")
+        else:
+            r_status = "success"
+            prom = r.get("promoted", 0) or 0
+            r_summary = f"{prom} G0 restored · 0 collisions"
+        cnc_p = r.get("cnc", "")
+        folder_p = r.get("folder") or (os.path.dirname(cnc_p) if cnc_p else "")
+        nc_prog = r.get("nc_program") or ""
+        setup_name = r.get("setup") or ""
+        seen_row_keys.add((nc_prog, setup_name, cnc_p))
+        program_rows.append({
+            "status": r_status,
+            "nc_program": nc_prog,
+            "setup": setup_name,
+            "summary": r_summary,
+            "cnc": cnc_p,
+            "report": r.get("report", ""),
+            "png": r.get("png", ""),
+            "folder": folder_p,
+        })
+    for po in program_outcomes:
+        key = (po.get("nc_program", ""), po.get("setup", ""), po.get("cnc", ""))
+        if key not in seen_row_keys:
+            program_rows.append(po)
 
     details = outputFolder if outputFolder else ""
     if cntSkipped > 0 and lstSkipped:
@@ -2316,21 +3163,39 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
 
     # 3. Build Action buttons for the non-modal toast
     actions = []
-    last_res = verifyResults[-1] if verifyResults else None
-    if last_res:
-        if last_res.get("cnc") and os.path.isfile(last_res["cnc"]):
-            actions.append(("Open NC File", "open_file", last_res["cnc"]))
-    if outputFolder and os.path.isdir(outputFolder):
-        actions.append(("Open Folder", "open_folder", outputFolder))
-    if last_res:
-        if last_res.get("report") and os.path.isfile(last_res["report"]):
-            actions.append(("View Report", "open_file", last_res["report"]))
-        if last_res.get("png") and os.path.isfile(last_res["png"]):
-            actions.append(("View Plot", "open_file", last_res["png"]))
+    show_program_rows = len(program_rows) > 1
+    if not show_program_rows:
+        last_res = verifyResults[-1] if verifyResults else None
+        if last_res:
+            if last_res.get("cnc") and os.path.isfile(last_res["cnc"]):
+                actions.append(("Open NC File", "open_file", last_res["cnc"]))
+        if outputFolder and os.path.isdir(outputFolder):
+            actions.append(("Open Folder", "open_folder", outputFolder))
+        if last_res:
+            if last_res.get("report") and os.path.isfile(last_res["report"]):
+                actions.append(("View Report", "open_file", last_res["report"]))
+            if last_res.get("png") and os.path.isfile(last_res["png"]):
+                actions.append(("View Plot", "open_file", last_res["png"]))
+    else:
+        row_folders = {
+            r.get("folder") for r in program_rows if r.get("folder")
+        }
+        if len(row_folders) <= 1:
+            shared = next(iter(row_folders), outputFolder)
+            if shared and os.path.isdir(shared):
+                actions.append(("Open Folder", "open_folder", shared))
+    actions.append(("Dismiss", "dismiss", ""))
 
     # 4. Display non-modal Palette toast if supported by ui
     if ui and hasattr(ui, "palettes") and ui.palettes is not None:
-        html_text = _BuildNotificationHTML(title, status_type, msg, details, actions)
+        html_text = _BuildNotificationHTML(
+            title,
+            status_type,
+            msg,
+            details,
+            actions,
+            program_rows=program_rows if show_program_rows else None,
+        )
         tmp_html = os.path.join(tempfile.gettempdir(), "postprocess_toast.html")
         try:
             with open(tmp_html, "w", encoding="utf-8") as f:
@@ -2339,7 +3204,12 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
             _dbg_global(f"_NotifyPostProcessResult write tmp_html note: {fe}")
 
         palette_w = 500
-        palette_h = 220
+        if len(program_rows) <= 1:
+            palette_h = 220
+            is_resizable = False
+        else:
+            palette_h = min(440, 150 + 56 * len(program_rows))
+            is_resizable = True
         target_x = 940
         target_y = 680
 
@@ -2397,7 +3267,7 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
                         tmp_html,
                         True,   # isVisible=True so native Qt window is allocated for setPosition/setSize
                         True,   # showCloseButton
-                        False,  # isResizable
+                        is_resizable,
                         palette_w,
                         palette_h,
                     )
@@ -2413,7 +3283,7 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
                         tmp_html,
                         True,
                         True,
-                        False,
+                        is_resizable,
                         palette_w,
                         palette_h,
                     )
@@ -2920,6 +3790,7 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
             collisions=report.collisions,
             error=None,
             warning=warning_msg,
+            nc_program=_safe_str(getattr(program, "name", None)),
         )
 
         return None
@@ -2939,6 +3810,7 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
             collisions=[],
             error=err_msg,
             warning=None,
+            nc_program=_safe_str(getattr(program, "name", None)),
         )
         return f"PostProcess pipeline error: {err_msg}"
     finally:

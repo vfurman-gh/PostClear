@@ -550,10 +550,14 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         import PostProcessAll
         from PostProcessAll import _BuildNotificationHTML
 
-        # 1. Verify auto-dismiss timeout is 6 seconds (6000ms)
+        # 1. Verify auto-dismiss timeout is 2 seconds (2000ms) on success, disabled on warning/error
         html = _BuildNotificationHTML("Done", "success", "OK", "", [])
-        self.assertIn("6000);", html, "Default auto-dismiss timeout must be 6 seconds")
-        self.assertIn("2500);", html, "Mouseleave auto-dismiss timeout must be 2.5 seconds")
+        self.assertIn("2000);", html, "Success auto-dismiss timeout must be 2 seconds")
+        self.assertIn("wasClicked", html, "Notification HTML must support click cancellation of auto-dismiss")
+        warn_html = _BuildNotificationHTML("Warn", "warning", "Check", "", [])
+        self.assertNotIn("2000);", warn_html, "Warning notifications must not auto-dismiss")
+        err_html = _BuildNotificationHTML("Err", "error", "Fail", "", [])
+        self.assertNotIn("2000);", err_html, "Error notifications must not auto-dismiss")
 
         # 2. Verify progress reporting callback logic
         progress_calls = []
@@ -606,7 +610,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 return self[idx]
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            target_file = os.path.join(tmp_dir, "Setup 1.nc")
+            target_file = os.path.join(tmp_dir, "Prog.nc")
             with open(target_file, "w", encoding="utf8") as f:
                 f.write("ORIGINAL_CONTENT")
 
@@ -671,7 +675,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
 
             self.assertEqual(len(msgbox_calls), 1, "Must prompt user with modal messageBox")
             prompt, title, btn_type, icon_type = msgbox_calls[0]
-            self.assertIn("Setup 1.nc", prompt)
+            self.assertIn("Prog.nc", prompt)
             self.assertIn("already exists", prompt)
             self.assertEqual(btn_type, PostProcessAll.adsk.core.MessageBoxButtonTypes.YesNoButtonType)
             self.assertEqual(len(progress_created), 0, "Must NOT open progress dialog when aborted")
@@ -694,7 +698,7 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
                 return self[idx]
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            target_file = os.path.join(tmp_dir, "Setup 1.nc")
+            target_file = os.path.join(tmp_dir, "Prog.nc")
             with open(target_file, "w", encoding="utf8") as f:
                 f.write("ORIGINAL_CONTENT")
 
@@ -2546,14 +2550,16 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         mock_app.userInterface = mock_ui
 
         saved_handlers = list(PostProcessAll.handlers)
+        saved_mm_handler = PostProcessAll._marking_menu_handler
         try:
             PostProcessAll.handlers.clear()
+            PostProcessAll._marking_menu_handler = None
             with patch("PostProcessAll.adsk.core.Application.get", return_value=mock_app):
                 PostProcessAll.InitAddIn()
                 mock_ui.messageBox.assert_not_called()
                 self.assertEqual(len(created_defs), 1)
                 self.assertEqual(len(created_controls), 1)
-                self.assertEqual(len(PostProcessAll.handlers), 1)
+                self.assertEqual(len(PostProcessAll.handlers), 2)
 
                 # Call InitAddIn() again without stop() — must delete stale control then stale cmdDef.
                 PostProcessAll.InitAddIn()
@@ -2569,9 +2575,10 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
             )
             self.assertEqual(len(created_defs), 2)
             self.assertEqual(len(created_controls), 2)
-            self.assertEqual(len(PostProcessAll.handlers), 1)
+            self.assertEqual(len(PostProcessAll.handlers), 2)
         finally:
             PostProcessAll.handlers[:] = saved_handlers
+            PostProcessAll._marking_menu_handler = saved_mm_handler
 
     def test_stop_and_run_idempotent_reload(self):
         """run() refreshes local modules via _EnsureLocalModulesLoaded(force=True) and stop() cleans up safely."""
@@ -2614,6 +2621,598 @@ class TestPostProcessAllPipelineIntegration(unittest.TestCase):
         finally:
             PostProcessAll.handlers[:] = saved_handlers
             PostProcessAll.settingsMgr = saved_settings_mgr
+
+
+    def test_v17_settings_migration_and_selected_nc_programs(self):
+        """SettingsManager v17 migrates legacy ncProgram -> ncPrograms and resolves multi-selection."""
+        import PostProcessAll
+
+        self.assertEqual(PostProcessAll.version, 17)
+        self.assertIn("ncPrograms", PostProcessAll.defaultSettings)
+        self.assertEqual(PostProcessAll.defaultSettings["ncPrograms"], [])
+
+        mgr = PostProcessAll.SettingsManager()
+        legacy = {
+            "version": 16,
+            "ncProgram": "ProgB",
+            "output": "/tmp/out",
+        }
+        mgr.UpdateSettings(PostProcessAll.defaultSettings, legacy)
+        self.assertEqual(legacy["version"], 17)
+        self.assertEqual(legacy["ncPrograms"], ["ProgB"])
+        self.assertEqual(legacy["ncProgram"], "ProgB")
+
+        prog_a = MagicMock()
+        prog_a.name = "ProgA"
+        prog_b = MagicMock()
+        prog_b.name = "ProgB"
+        prog_c = MagicMock()
+        prog_c.name = "ProgC"
+        cam = MagicMock()
+        cam.ncPrograms = MockCamCollection([prog_a, prog_b, prog_c])
+
+        selected = PostProcessAll.GetSelectedNcPrograms(cam, {"ncPrograms": ["ProgC", "ProgA"]})
+        self.assertEqual([p.name for p in selected], ["ProgC", "ProgA"])
+
+        # Fallback to legacy single ncProgram when ncPrograms is empty
+        fallback = PostProcessAll.GetSelectedNcPrograms(cam, {"ncPrograms": [], "ncProgram": "ProgB"})
+        self.assertEqual([p.name for p in fallback], ["ProgB"])
+
+    def test_multi_nc_program_command_dialog_validation_and_execute(self):
+        """Verify TableCommandInput checklist, select-all sync, validation, and execute persistence."""
+        import PostProcessAll
+
+        prog_a = MagicMock()
+        prog_a.name = "ProgA"
+        prog_a.parameters = MagicMock()
+        prog_a.parameters.itemByName.side_effect = lambda k: {
+            "nc_program_filename": MagicMock(value=MagicMock(value="PartA")),
+            "nc_program_nc_extension": MagicMock(value=MagicMock(value=".nc")),
+        }.get(k)
+
+        prog_b = MagicMock()
+        prog_b.name = "ProgB"
+        prog_b.parameters = MagicMock()
+        prog_b.parameters.itemByName.side_effect = lambda k: {
+            "nc_program_filename": MagicMock(value=MagicMock(value="PartB")),
+            "nc_program_nc_extension": MagicMock(value=MagicMock(value=".nc")),
+        }.get(k)
+
+        cam = MagicMock()
+        cam.ncPrograms = MockCamCollection([prog_a, prog_b])
+
+        input_store = {}
+
+        def _make_bool(inp_id, name, checkbox=True, icon="", val=False):
+            m = MagicMock()
+            m.id = inp_id
+            m.name = name
+            m.value = bool(val)
+            m.isVisible = True
+            input_store[inp_id] = m
+            return m
+
+        def _make_str(inp_id, name, val=""):
+            m = MagicMock()
+            m.id = inp_id
+            m.name = name
+            m.value = val
+            m.isReadOnly = False
+            input_store[inp_id] = m
+            return m
+
+        def _make_text(inp_id, name, text, rows, read_only):
+            m = MagicMock()
+            m.id = inp_id
+            m.text = text
+            m.isVisible = True
+            input_store[inp_id] = m
+            return m
+
+        def _make_table(inp_id, name, cols, ratios):
+            t = MagicMock()
+            t.id = inp_id
+            t.rowCount = 0
+            t._cells = {}
+
+            def _add_cell(inp, r, c):
+                t._cells[(r, c)] = inp
+                t.rowCount = max(t.rowCount, r + 1)
+
+            t.addCommandInput.side_effect = _add_cell
+            t.getInputAtPosition.side_effect = lambda r, c: t._cells.get((r, c))
+            input_store[inp_id] = t
+            return t
+
+        def _make_group(inp_id, name):
+            g = MagicMock()
+            g.id = inp_id
+            g.children = MagicMock()
+            g.children.addBoolValueInput.side_effect = _make_bool
+            input_store[inp_id] = g
+            return g
+
+        mock_inputs = MagicMock()
+        mock_inputs.addBoolValueInput.side_effect = _make_bool
+        mock_inputs.addStringValueInput.side_effect = _make_str
+        mock_inputs.addTextBoxCommandInput.side_effect = _make_text
+        mock_inputs.addTableCommandInput.side_effect = _make_table
+        mock_inputs.addGroupCommandInput.side_effect = _make_group
+        mock_inputs.itemById.side_effect = lambda k: input_store.get(k)
+
+        mock_cmd = MagicMock()
+        mock_cmd.commandInputs = mock_inputs
+
+        mock_app = MagicMock()
+        mock_app.activeDocument.products.itemByProductType.return_value = cam
+        mock_app.activeDocument.attributes = MagicMock()
+
+        doc_settings = dict(PostProcessAll.defaultSettings)
+        doc_settings["ncPrograms"] = ["ProgA"]
+        doc_settings["ncProgram"] = "ProgA"
+
+        saved_handlers = list(PostProcessAll.handlers)
+        saved_settings_mgr = PostProcessAll.settingsMgr
+        try:
+            mock_mgr = MagicMock()
+            mock_mgr.GetSettings.return_value = doc_settings
+            PostProcessAll.settingsMgr = mock_mgr
+
+            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app):
+                with patch.object(PostProcessAll.adsk.core, "CommandCreatedEventArgs", MagicMock(cast=lambda a: MagicMock(command=mock_cmd)), create=True), \
+                     patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam), \
+                     patch("PostProcessAll.GetNcProgramSetupsAndOperations", return_value=([MagicMock(name="Setup 1")], {})):
+                    PostProcessAll.CommandEventHandler().notify(MagicMock())
+
+                self.assertIn("ncProgramsTable", input_store)
+                self.assertIn("ncprog_select_all", input_store)
+                tbl = input_store["ncProgramsTable"]
+                self.assertEqual(tbl.rowCount, 3)
+                self.assertEqual(tbl.getInputAtPosition(0, 0).id, "ncprog_select_all")
+                self.assertEqual(tbl.getInputAtPosition(0, 1).value, "Select All")
+                self.assertTrue(tbl.getInputAtPosition(0, 1).isReadOnly)
+                self.assertEqual(tbl.getInputAtPosition(1, 0).id, "ncprog_chk_0")
+                self.assertEqual(tbl.getInputAtPosition(2, 0).id, "ncprog_chk_1")
+                self.assertTrue(input_store["ncprog_chk_0"].value)
+                self.assertFalse(input_store["ncprog_chk_1"].value)
+                self.assertFalse(input_store["ncprog_select_all"].value)
+
+                # InputChangedHandler: Select All -> True checks all rows
+                changed_handler = PostProcessAll.CommandInputChangedHandler(doc_settings)
+                input_store["ncprog_select_all"].value = True
+                with patch.object(
+                    PostProcessAll.adsk.core,
+                    "InputChangedEventArgs",
+                    MagicMock(cast=lambda a: MagicMock(input=input_store["ncprog_select_all"], inputs=mock_inputs)),
+                    create=True,
+                ):
+                    changed_handler.notify(MagicMock())
+                self.assertTrue(input_store["ncprog_chk_0"].value)
+                self.assertTrue(input_store["ncprog_chk_1"].value)
+                self.assertEqual(doc_settings["ncPrograms"], ["ProgA", "ProgB"])
+
+                # Validation with 0 checked disables OK and shows error
+                input_store["ncprog_chk_0"].value = False
+                input_store["ncprog_chk_1"].value = False
+                val_handler = PostProcessAll.CommandValidateInputsHandler()
+                val_args = MagicMock(inputs=mock_inputs, areInputsValid=True)
+                with patch.object(
+                    PostProcessAll.adsk.core,
+                    "ValidateInputsEventArgs",
+                    MagicMock(cast=lambda a: val_args),
+                    create=True,
+                ):
+                    val_handler.notify(MagicMock())
+                self.assertFalse(val_args.areInputsValid)
+                self.assertTrue(input_store["error"].isVisible)
+
+                # Validation firing from child GroupCommandInput.children while 0 checked still blocks OK
+                val_args_nested = MagicMock(
+                    inputs=input_store["groupPersonal"].children,
+                    firingEvent=MagicMock(sender=MagicMock(commandInputs=mock_inputs)),
+                    areInputsValid=True,
+                )
+                with patch.object(
+                    PostProcessAll.adsk.core,
+                    "ValidateInputsEventArgs",
+                    MagicMock(cast=lambda a: val_args_nested),
+                    create=True,
+                ):
+                    val_handler.notify(MagicMock())
+                self.assertFalse(val_args_nested.areInputsValid)
+                self.assertTrue(input_store["error"].isVisible)
+
+                # Check ProgB only -> valid and execute persists ["ProgB"]
+                input_store["ncprog_chk_1"].value = True
+                val_args2 = MagicMock(inputs=mock_inputs, areInputsValid=False)
+                with patch.object(
+                    PostProcessAll.adsk.core,
+                    "ValidateInputsEventArgs",
+                    MagicMock(cast=lambda a: val_args2),
+                    create=True,
+                ):
+                    val_handler.notify(MagicMock())
+                self.assertTrue(val_args2.areInputsValid)
+                self.assertFalse(input_store["error"].isVisible)
+
+                exec_handler = PostProcessAll.CommandExecuteHandler(doc_settings)
+                exec_cmd = MagicMock(commandInputs=mock_inputs)
+                with patch.object(
+                    PostProcessAll.adsk.core,
+                    "CommandEventArgs",
+                    MagicMock(cast=lambda a: MagicMock(command=exec_cmd)),
+                    create=True,
+                ), \
+                     patch.object(PostProcessAll.adsk.core, "GroupCommandInput", MagicMock(classType=lambda: "Group"), create=True), \
+                     patch.object(PostProcessAll.adsk.core, "DropDownCommandInput", MagicMock(classType=lambda: "DropDown"), create=True), \
+                     patch("PostProcessAll.PerformPostProcess") as mock_perform:
+                    exec_handler.notify(MagicMock())
+
+            self.assertEqual(doc_settings["ncPrograms"], ["ProgB"])
+            self.assertEqual(doc_settings["ncProgram"], "ProgB")
+            mock_perform.assert_called_once_with(doc_settings)
+        finally:
+            PostProcessAll.handlers[:] = saved_handlers
+            PostProcessAll.settingsMgr = saved_settings_mgr
+
+    def test_resolve_nc_program_output_filename_and_duplicate_path_collision(self):
+        """Verify nc_program_filename is always used and duplicate resolved paths abort PerformPostProcess."""
+        import PostProcessAll
+
+        setup = MagicMock()
+        setup.name = "Setup 1"
+        setup.isSuppressed = False
+
+        def _make_prog(prog_name, fname):
+            p = MagicMock()
+            p.name = prog_name
+            p.attributes.itemByName.return_value = MagicMock(value="")
+            p.parameters = MagicMock()
+            p.parameters.itemByName.side_effect = lambda k: {
+                "nc_program_filename": MagicMock(value=MagicMock(value=fname)),
+                "nc_program_nc_extension": MagicMock(value=MagicMock(value=".nc")),
+                "nc_program_post_property_unit": MagicMock(value=MagicMock(value=0)),
+                "nc_program_output_folder": MagicMock(value=MagicMock(value="/tmp")),
+            }.get(k)
+            return p
+
+        p1 = _make_prog("Program One", "SharedName.NC")
+        p2 = _make_prog("Program Two", "sub:Part2.nc")
+        p_blank = _make_prog("Program Three", "   ")
+
+        self.assertEqual(PostProcessAll._ResolveNcProgramOutputFilename(p1, setup, ".nc"), "SharedName")
+        self.assertEqual(PostProcessAll._ResolveNcProgramOutputFilename(p2, setup, ".nc"), "sub:Part2")
+        self.assertEqual(PostProcessAll._ResolveNcProgramOutputFilename(p_blank, setup, ".nc"), "Program Three")
+        self.assertEqual(PostProcessAll._ResolveNcProgramOutputFilename(MagicMock(name=None, parameters=None), setup, ".nc"), "Setup 1")
+
+        # Duplicate output target collision across 2 selected programs
+        p_dup1 = _make_prog("NC1", "SameOut")
+        p_dup2 = _make_prog("NC2", "SameOut")
+
+        op1 = MagicMock(name="Face1", hasToolpath=True, isSuppressed=False)
+        op2 = MagicMock(name="Pocket1", hasToolpath=True, isSuppressed=False)
+        setup.allOperations = MockCamCollection([op1, op2])
+        cam = MagicMock()
+        cam.allOperations = MockCamCollection([op1, op2])
+        cam.ncPrograms = MockCamCollection([p_dup1, p_dup2])
+        cam.setups = MockCamCollection([setup])
+
+        mock_ui = MagicMock()
+        mock_app = MagicMock()
+        mock_app.userInterface = mock_ui
+        mock_app.activeDocument.products.itemByProductType.return_value = cam
+        mock_app.activeDocument.attributes.itemByName.return_value = None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            doc_settings = dict(PostProcessAll.defaultSettings)
+            doc_settings["output"] = tmp_dir
+            doc_settings["ncPrograms"] = ["NC1", "NC2"]
+
+            def _get_prog_setups_ops(_cam, _settings, setups_arg=None, program=None):
+                ops = [op1] if program is p_dup1 else [op2]
+                return [setup], {setup.name: ops}
+
+            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam), \
+                 patch("PostProcessAll.GetNcProgramSetupsAndOperations", side_effect=_get_prog_setups_ops), \
+                 patch("PostProcessAll.PostProcessSetup") as mock_pps:
+                PostProcessAll.PerformPostProcess(doc_settings)
+
+            mock_pps.assert_not_called()
+            mock_ui.createProgressDialog.assert_not_called()
+            mock_ui.messageBox.assert_called_once()
+            err_msg = mock_ui.messageBox.call_args[0][0]
+            self.assertIn("Duplicate", err_msg)
+            self.assertIn("SameOut.nc", err_msg)
+
+    def test_perform_post_process_multi_nc_program_batch_single_prompts_and_restore(self):
+        """Batching 2 NC Programs uses single overwrite prompt, single progress dialog, and restores params."""
+        import PostProcessAll
+
+        op1 = MagicMock(name="Op1", hasToolpath=True, isSuppressed=False)
+        op2 = MagicMock(name="Op2", hasToolpath=True, isSuppressed=False)
+        setup1 = MagicMock()
+        setup1.name = "Setup 1"
+        setup1.isSuppressed = False
+        setup1.allOperations = MockCamCollection([op1])
+        setup2 = MagicMock()
+        setup2.name = "Setup 2"
+        setup2.isSuppressed = False
+        setup2.allOperations = MockCamCollection([op2])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def _make_prog(name, fname):
+                p = MagicMock()
+                p.name = name
+                p.attributes.itemByName.return_value = MagicMock(value="")
+                fname_val = MagicMock(value=fname)
+                out_val = MagicMock(value=tmp_dir)
+                p.parameters = MagicMock()
+                p.parameters.itemByName.side_effect = lambda k, fv=fname_val, ov=out_val: {
+                    "nc_program_name": MagicMock(value=MagicMock(value=name)),
+                    "nc_program_filename": MagicMock(value=fv),
+                    "nc_program_nc_extension": MagicMock(value=MagicMock(value=".nc")),
+                    "nc_program_post_property_unit": MagicMock(value=MagicMock(value=0)),
+                    "nc_program_output_folder": MagicMock(value=ov),
+                    "nc_program_openInEditor": MagicMock(value=MagicMock(value=False)),
+                }.get(k)
+                return p, fname_val
+
+            p1, fv1 = _make_prog("NC1", "FirstPart")
+            p2, fv2 = _make_prog("NC2", "SecondPart")
+
+            cam = MagicMock()
+            cam.allOperations = MockCamCollection([op1, op2])
+            cam.ncPrograms = MockCamCollection([p1, p2])
+            cam.setups = MockCamCollection([setup1, setup2])
+
+            msgbox_calls = []
+
+            def _msgbox(prompt, title="", btn=None, icon=None):
+                msgbox_calls.append((prompt, title, btn, icon))
+                return PostProcessAll.adsk.core.DialogResults.DialogYes
+
+            mock_progress = MagicMock()
+            mock_progress.wasCancelled = False
+            mock_ui = MagicMock()
+            mock_ui.messageBox.side_effect = _msgbox
+            mock_ui.createProgressDialog.return_value = mock_progress
+
+            mock_app = MagicMock()
+            mock_app.userInterface = mock_ui
+            mock_app.activeDocument.products.itemByProductType.return_value = cam
+            mock_app.activeDocument.attributes.itemByName.return_value = None
+
+            # Create BOTH target files beforehand to verify a SINGLE aggregated overwrite prompt
+            for fn in ("FirstPart.nc", "SecondPart.nc"):
+                with open(os.path.join(tmp_dir, fn), "w", encoding="utf8") as f:
+                    f.write("OLD")
+
+            doc_settings = dict(PostProcessAll.defaultSettings)
+            doc_settings["output"] = tmp_dir
+            doc_settings["ncPrograms"] = ["NC1", "NC2"]
+
+            def _get_prog_setups_ops(_cam, _settings, setups_arg=None, program=None):
+                if program is p1:
+                    return [setup1], {setup1.name: [op1]}
+                return [setup2], {setup2.name: [op2]}
+
+            pps_calls = []
+
+            def _fake_pps(fname_arg, setup_arg, setup_folder_arg, settings_arg, program_arg, **kwargs):
+                pps_calls.append((setup_arg.name, program_arg.name, fname_arg))
+                PostProcessAll._RecordVerifyResult(
+                    setup=setup_arg,
+                    nc_program=program_arg.name,
+                    cncPath=os.path.join(setup_folder_arg, f"{fname_arg}.nc"),
+                    reportText="OK",
+                    reportPath=None,
+                    pngPath=None,
+                )
+                return None
+
+            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam), \
+                 patch("PostProcessAll.GetNcProgramSetupsAndOperations", side_effect=_get_prog_setups_ops), \
+                 patch("PostProcessAll.PostProcessSetup", side_effect=_fake_pps), \
+                 patch("PostProcessAll._NotifyPostProcessResult") as mock_notify:
+                PostProcessAll.PerformPostProcess(doc_settings)
+
+            self.assertEqual(len(msgbox_calls), 1, "Must show only ONE aggregated overwrite prompt for both programs")
+            self.assertIn("FirstPart.nc", msgbox_calls[0][0])
+            self.assertIn("SecondPart.nc", msgbox_calls[0][0])
+            mock_ui.createProgressDialog.assert_called_once()
+            self.assertEqual(pps_calls, [("Setup 1", "NC1", "FirstPart"), ("Setup 2", "NC2", "SecondPart")])
+            # Verify nc_program recorded in verifyResults
+            self.assertEqual(len(PostProcessAll.verifyResults), 2)
+            self.assertEqual(PostProcessAll.verifyResults[0]["nc_program"], "NC1")
+            self.assertEqual(PostProcessAll.verifyResults[1]["nc_program"], "NC2")
+            # Original nc_program_filename values preserved
+            self.assertEqual(fv1.value, "FirstPart")
+            self.assertEqual(fv2.value, "SecondPart")
+            mock_notify.assert_called_once()
+            self.assertEqual(len(mock_notify.call_args.kwargs.get("verifyResults", [])), 2)
+
+    def test_reworked_notification_html_scaling_and_non_dismissing_actions(self):
+        """Verify open_file/open_folder keep palette open, 2s auto-dismiss + click-cancel on success, and multi-program row layout."""
+        import PostProcessAll
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            nc1 = os.path.join(tmp_dir, "Part1.nc")
+            rep1 = os.path.join(tmp_dir, "Part1_report.md")
+            png1 = os.path.join(tmp_dir, "Part1.png")
+            nc2 = os.path.join(tmp_dir, "Part2.nc")
+            for p in (nc1, rep1, png1, nc2):
+                with open(p, "w", encoding="utf8") as f:
+                    f.write("data")
+
+            # 1. _HandleNotificationAction keeps palette visible on open_file / open_folder, hides only on dismiss / close
+            mock_palette = MagicMock()
+            mock_palette.isVisible = True
+            mock_ui = MagicMock()
+            mock_ui.palettes.itemById.return_value = mock_palette
+            mock_app = MagicMock()
+            mock_app.userInterface = mock_ui
+
+            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
+                 patch("PostProcessAll.os.path.exists", return_value=True), \
+                 patch("PostProcessAll.subprocess.Popen") as mock_popen, \
+                 patch("PostProcessAll.sys.platform", "darwin"):
+                PostProcessAll._HandleNotificationAction(PostProcessAll.constNotificationPaletteId, "open_file", nc1)
+                self.assertTrue(mock_palette.isVisible, "open_file must NOT hide notification palette")
+                mock_popen.assert_called_once()
+
+                PostProcessAll._HandleNotificationAction(PostProcessAll.constNotificationPaletteId, "open_folder", tmp_dir)
+                self.assertTrue(mock_palette.isVisible, "open_folder must NOT hide notification palette")
+
+                PostProcessAll._HandleNotificationAction(PostProcessAll.constNotificationPaletteId, "dismiss", "")
+                self.assertFalse(mock_palette.isVisible, "dismiss must hide notification palette")
+
+                mock_palette.isVisible = True
+                PostProcessAll._HandleNotificationAction(PostProcessAll.constNotificationPaletteId, "close", "")
+                self.assertFalse(mock_palette.isVisible, "close must hide notification palette")
+
+            # 2. _NotifyPostProcessResult with 3 programs -> scaled height & isResizable=True & per-row buttons
+            created_palettes = []
+
+            def _make_palette(pid, title, html_path, is_vis, show_close, is_resiz, w, h):
+                with open(html_path, "r", encoding="utf-8") as hf:
+                    html_str = hf.read()
+                pal = MagicMock()
+                pal.id = pid
+                pal.isVisible = is_vis
+                pal.isResizable = is_resiz
+                created_palettes.append((pal, html_str, is_resiz, w, h))
+                return pal
+
+            mock_ui2 = MagicMock()
+            mock_ui2.palettes.itemById.return_value = None
+            mock_ui2.palettes.add2.side_effect = _make_palette
+            mock_ui2.palettes.add.side_effect = _make_palette
+
+            outcomes = [
+                {"nc_program": "NC1", "setup": "Setup 1", "cnc": nc1, "report": rep1, "png": png1, "status": "success", "summary": "Clean"},
+                {"nc_program": "NC2", "setup": "Setup 2", "cnc": nc2, "report": None, "png": None, "status": "success", "summary": "Clean"},
+                {"nc_program": "NC3", "setup": "Setup 3", "cnc": nc1, "report": None, "png": None, "status": "success", "summary": "Clean"},
+            ]
+            PostProcessAll._NotifyPostProcessResult(mock_ui2, 3, 0, [], tmp_dir, verifyResults=[], program_outcomes=outcomes)
+
+            self.assertEqual(len(created_palettes), 1)
+            _, html_out, is_resiz, pal_w, pal_h = created_palettes[0]
+            self.assertTrue(is_resiz, "Multi-program notification must be resizable")
+            self.assertEqual(pal_w, 500)
+            self.assertEqual(pal_h, 150 + 56 * 3)
+            self.assertIn("program-list", html_out)
+            self.assertIn("NC1", html_out)
+            self.assertIn("2000);", html_out)
+            self.assertIn("wasClicked", html_out)
+
+            # 3. Single-program failure -> non-resizable 500x220, no 2000ms auto-dismiss, explicit Dismiss button
+            created_palettes.clear()
+            outcomes_err = [
+                {"nc_program": "NC1", "setup": "Setup 1", "cnc": nc1, "report": rep1, "png": None, "status": "error", "summary": "Holder collision"},
+            ]
+            PostProcessAll._NotifyPostProcessResult(mock_ui2, 1, 0, [], tmp_dir, verifyResults=[], is_fatal=True, program_outcomes=outcomes_err)
+            _, err_html_out, err_resiz, _, err_h = created_palettes[0]
+            self.assertFalse(err_resiz)
+            self.assertEqual(err_h, 220)
+            self.assertNotIn("2000);", err_html_out)
+            self.assertIn("Dismiss", err_html_out)
+
+    def test_marking_menu_context_injection_preselection_and_cleanup(self):
+        """Verify MarkingMenuHandler adds only constCmdDefId on CAM context, preselects NCPrograms, ignores non-CAM, and cleans up."""
+        import PostProcessAll
+
+        prog_a = MagicMock()
+        prog_a.name = "ProgA"
+        prog_a.objectType = "adsk::cam::NCProgram"
+        prog_b = MagicMock()
+        prog_b.name = "ProgB"
+        prog_b.objectType = "adsk::cam::NCProgram"
+
+        setup1 = MagicMock()
+        setup1.name = "Setup 1"
+        setup1.objectType = "adsk::cam::Setup"
+
+        cam = MagicMock()
+        cam.ncPrograms = MockCamCollection([prog_a, prog_b])
+
+        cmd_def = MagicMock()
+        mock_controls = MagicMock()
+        mock_controls.itemById.side_effect = lambda cid: MagicMock() if cid == "PostProcessCommand" else None
+        mock_linear_menu = MagicMock(controls=mock_controls)
+
+        mock_ui = MagicMock()
+        mock_ui.activeWorkspace.id = PostProcessAll.constCAMWorkspaceId
+        mock_ui.commandDefinitions.itemById.return_value = cmd_def
+
+        mock_app = MagicMock()
+        mock_app.userInterface = mock_ui
+        mock_app.activeDocument.products.itemByProductType.return_value = cam
+        mock_app.activeProduct.productType = PostProcessAll.constCAMProductId
+
+        saved_pending = PostProcessAll._pending_context_selection
+        try:
+            # 1. Right-click on NCProgram ProgB -> injects only constCmdDefId after PostProcessCommand & preselects ProgB
+            PostProcessAll._pending_context_selection = None
+            handler = PostProcessAll.MarkingMenuHandler()
+            ev_args = MagicMock(
+                selectedEntities=[prog_b],
+                linearMarkingMenu=mock_linear_menu,
+            )
+            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_args), create=True), \
+                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam):
+                handler.notify(MagicMock())
+
+            mock_controls.addCommand.assert_called_once_with(cmd_def, "PostProcessCommand", False)
+            pre = PostProcessAll._ResolvePreselectedNcProgramNames(cam, mock_ui)
+            self.assertEqual(pre, ["ProgB"])
+
+            # 2. Right-click on "NC Programs" folder node -> preselects ALL NC Programs
+            mock_controls.addCommand.reset_mock()
+            nc_folder = MagicMock()
+            nc_folder.name = "NC Programs"
+            nc_folder.objectType = "adsk::cam::CAMFolder"
+            ev_folder = MagicMock(selectedEntities=[nc_folder], linearMarkingMenu=mock_linear_menu)
+            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_folder), create=True), \
+                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam):
+                handler.notify(MagicMock())
+            mock_controls.addCommand.assert_called_once_with(cmd_def, "PostProcessCommand", False)
+            self.assertEqual(PostProcessAll._ResolvePreselectedNcProgramNames(cam, mock_ui), ["ProgA", "ProgB"])
+
+            # 3. Right-click on Setup -> preselects NC Programs referencing that Setup
+            mock_controls.addCommand.reset_mock()
+            ev_setup = MagicMock(selectedEntities=[setup1], linearMarkingMenu=mock_linear_menu)
+            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_setup), create=True), \
+                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam), \
+                 patch("PostProcessAll.GetNcProgramSetupsAndOperations", side_effect=lambda c, s, program=None: ([setup1], []) if program is prog_a else ([], [])):
+                handler.notify(MagicMock())
+            mock_controls.addCommand.assert_called_once_with(cmd_def, "PostProcessCommand", False)
+            self.assertEqual(PostProcessAll._ResolvePreselectedNcProgramNames(cam, mock_ui), ["ProgA"])
+
+            # 4. Non-CAM entity (e.g., BRepBody) -> ignored cleanly, no addCommand call
+            mock_controls.addCommand.reset_mock()
+            brep = MagicMock()
+            brep.objectType = "adsk::fusion::BRepBody"
+            ev_non_cam = MagicMock(selectedEntities=[brep], linearMarkingMenu=mock_linear_menu)
+            with patch.object(PostProcessAll.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostProcessAll.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_non_cam), create=True), \
+                 patch.object(PostProcessAll.adsk.cam.CAM, "cast", return_value=cam):
+                handler.notify(MagicMock())
+            mock_controls.addCommand.assert_not_called()
+
+            # 5. Cleanup detaches _marking_menu_handler from ui.markingMenuDisplaying
+            PostProcessAll._marking_menu_handler = handler
+            PostProcessAll._CleanupCommandUI(mock_ui)
+            mock_ui.markingMenuDisplaying.remove.assert_called_once_with(handler)
+            self.assertIsNone(PostProcessAll._marking_menu_handler)
+            self.assertIsNone(PostProcessAll._pending_context_selection)
+        finally:
+            PostProcessAll._pending_context_selection = saved_pending
+            PostProcessAll._marking_menu_handler = None
 
 
 if __name__ == "__main__":
