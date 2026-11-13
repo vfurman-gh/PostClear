@@ -1,13 +1,15 @@
-# PostClear — Fusion 360 CAM Batch Post & Clearance Verification
+# PostClear — Fusion 360 CAM Multi-Tool Post & Clearance Verification
 
 ![PostClear](resources/Command/32x32.png)
 
-Fusion 360 Personal Edition CAM users run into two recurring headaches at the post-processing stage:
+Fusion 360 Personal Edition CAM users run into two annoyances at the post-processing stage:
 
 * **Personal Edition removes rapid moves:** Fusion converts rapid positioning moves (G0) into linear feed moves, slowing air travel across the job. Simple text-replacement scripts that blindly turn high-feed moves back into rapids risk driving a cutter or toolholder straight into uncut stock or a chuck jaw.
-* **Multi-setup jobs require repetitive posting:** Parts with multiple setups (Op 1, Op 2, milling plus turning) force you to post each NC Program one at a time and check every output file by hand.
+* **Personal Edition blocks multi-tool NC files:** Fusion refuses to post operations that use multiple tools into a single NC file, forcing you to export one separate file per tool and run them individually or stitch G-code by hand.
 
-**PostClear batch-posts one or many NC Programs in a single step, simulates the evolving stock to catch collisions, and restores G0 rapids only where the tool and holder are proven to clear the workpiece.**
+**PostClear combines multi-tool operations into one complete NC file with native tool changes (and batches multiple NC Programs in one run), simulates the evolving stock across every tool to catch collisions, and restores G0 rapids only where the tool and holder clear the workpiece.**
+
+As a bonus, PostClear generates high-resolution material removal rate (MRR) plots so you can spot machine overload or underload at a glance.
 
 ---
 
@@ -25,11 +27,9 @@ No separate Python installation or command-line setup is needed.
 
 On first use, the add-in uses Fusion's built-in Python to download its verification libraries (NumPy, Shapely, and Matplotlib) into `PostClear/packages/`. This takes roughly 5–10 seconds once, and automatically refreshes itself whenever Autodesk updates Fusion's internal Python version.
 
-| Task | Steps |
-| :--- | :--- |
-| **Update** | Replace the folder contents with the new release (keep `PostClear.settings` if present), or run `git pull`, then restart Fusion or Stop/Run the add-in in **Shift+S**. |
-| **Uninstall** | Open **Scripts and Add-Ins** (**Shift+S**) → **Add-Ins**, click **Stop**, remove **PostClear** from *My Add-Ins*, and delete the folder. |
-| **Offline first run** | Milling falls back to basic clearance checks without plots; connect to the internet once so full 3D/2D simulation and plotting libraries can download. |
+* **Update:** Replace the folder contents with the new release (keep `PostClear.settings` if present), or run `git pull`, then restart Fusion or Stop/Run the add-in in **Shift+S**.
+* **Uninstall:** Open **Scripts and Add-Ins** (**Shift+S**) → **Add-Ins**, click **Stop**, remove **PostClear** from *My Add-Ins*, and delete the folder.
+* **Offline first run:** Milling falls back to basic clearance checks without plots; connect to the internet once so full 3D/2D simulation and plotting libraries can download.
 
 ---
 
@@ -37,28 +37,26 @@ On first use, the add-in uses Fusion's built-in Python to download its verificat
 
 ### 1. Launch Post Clear
 
-You can start the command from two places in the **Manufacture** workspace:
+Before running Post Clear, create an **NC Program** in Fusion 360 configured with at least a valid post processor and output folder/filename.
+
+Then start the command from either place in the **Manufacture** workspace:
 
 * **Toolbar or Actions menu:** Click **Post Clear** on the Manufacture toolbar (right next to Fusion's built-in Post Process button).
 * **Right-click context menu:** Right-click an individual **NC Program**, the **NC Programs** folder, or a **Setup** in the browser tree and choose **Post Clear** right below Post Process. The dialog opens with the matching NC Programs already checked.
 
 ### 2. Choose NC Programs & Settings
 
-The dialog lists every NC Program in the active document with its target setup and output filename. If the document has setups without an NC Program, the add-in creates a default NC Program for you.
+The dialog lists every NC Program in the active document with its target setup and output filename.
 
 * **Select programs:** Check individual NC Programs or toggle **Select All** in the top-left header cell.
 * **Restore rapid moves (G0):** Enabled by default. Promotes verified non-cutting feed moves back to G0 rapids when safe.
 * **Produce debug log:** Disabled by default. Check this option to write troubleshooting diagnostics (including Fusion 360, Python, and library versions) to `postclear_debug.log` in your system temp folder.
 * **Output naming:** Each NC Program writes to its configured output filename and folder.
-* **Batch pre-checks:** Before posting starts, the add-in checks for missing toolpaths, regenerates out-of-date operations if needed, and asks once before overwriting existing NC files.
+* **Batch pre-checks:** Before posting starts, the add-in warns if any operations have empty or invalid toolpaths and asks once before overwriting existing NC files.
 
 ### 3. Review Verification Results
 
-When posting finishes, a compact notification card appears in the corner of the Fusion window with one row per posted program:
-
-* **Quick-open buttons:** Open the generated **NC** file, the Markdown verification **Report**, the high-resolution toolpath/stock **Plot**, or the output **Folder** in one click.
-* **Stay out of the way when clean:** If every program posts cleanly with no warnings, the notification closes itself after 2 seconds (clicking anywhere on the card keeps it open).
-* **Stay visible on issues:** If a collision or spike warning is detected, the notification stays on screen until you dismiss it.
+When posting finishes, a notification card appears in the corner of the Fusion window with one row per posted program and quick-open buttons for the generated **NC** file, Markdown verification **Report**, high-resolution **Plot**, and output **Folder**.
 
 ---
 
@@ -76,29 +74,18 @@ When posting finishes, a compact notification card appears in the corner of the 
 
 ## How It Works
 
-```mermaid
-flowchart LR
-    A["Selected NC Programs"] --> B["Capture Toolpaths & Stock"]
-    B --> C["Simulate Stock & Collisions"]
-    C --> D["Replay Your Post (.cps)"]
-    D --> E["NC Code + Report & Plot"]
+![PostClear pipeline](resources/pipeline.svg)
 
-    style A fill:#f6f8fa,stroke:#57606a,color:#24292f
-    style B fill:#f6f8fa,stroke:#57606a,color:#24292f
-    style C fill:#ddf4ff,stroke:#0969da,color:#0a3069,stroke-width:2px
-    style D fill:#f6f8fa,stroke:#57606a,color:#24292f
-    style E fill:#f6f8fa,stroke:#57606a,color:#24292f
-```
-*High-level verification and posting flow for each setup (excludes Fusion UI dialog and file pre-checks).*
+*High-level verification and posting flow for each setup.*
 
-Instead of editing G-code with fragile regular expressions, the add-in runs a two-pass workflow around your existing Fusion post processor:
+Internally, the add-in runs a two-pass pipeline around your machine-specific (Tormach, Haas, Centroid, LinuxCNC, GRBL, Mach3, and others) Fusion post processor:
 
-* **Pass 1 — Capture exact motion and stock:** Extracts every toolpath move, tool assembly, and stock boundary (box, round bar, CAD solid, or leftover stock from the previous setup) directly from Fusion CAM.
-* **Simulation — Verify clearances against live stock:** Tracks material removal move by move for both 3D milling and 2D turning, flagging collisions and marking air moves that safely clear the remaining stock and fixtures.
-* **Pass 2 — Run your unmodified post processor:** Replays your chosen vendor post processor (Tormach, Haas, Centroid, LinuxCNC, GRBL, Mach3, and others) once across the setup so tool changes, modal states, and machine formatting come straight from your post.
+* **Pass 1 — Capture each tool's motion and stock:** Posts operations one tool at a time under the hood to extract exact toolpath moves, tool assemblies, and stock boundaries from Fusion CAM, then merges them in order into one continuous job.
+* **Simulation — Verify clearances across tool changes:** Tracks material removal move by move across every tool for both 3D milling and 2D turning, flagging collisions and marking air moves that clear the remaining stock and fixtures.
+* **Pass 2 — Replay your unmodified post processor once:** Feeds the merged multi-tool sequence through your vendor post in one run to emit a single NC file with machine-specific tool changes (M6).
 
 ---
 
 ## Acknowledgments
 
-Inspired by Tim Paterson's original [PostProcessAll](https://github.com/TimPaterson/Fusion360-Batch-Post) Fusion 360 add-in, which pioneered bringing batch setup posting and rapid restoration to Fusion CAM users.
+Inspired by Tim Paterson's original [PostProcessAll](https://github.com/TimPaterson/Fusion360-Batch-Post) Fusion 360 add-in, which pioneered bringing multi-tool posting and rapid restoration to Fusion CAM users.

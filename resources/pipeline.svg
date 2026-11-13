@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 82" width="940" height="82" role="img" aria-label="PostClear pipeline: Selected NC Programs, Capture Per-Tool Moves, Simulate Live Stock, Replay Post Once (.cps), Multi-Tool NC + Report">
+  <defs>
+    <marker id="arrow" viewBox="0 0 7 7" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0.5 L 6.5 3.5 L 0 6.5 z" fill="#8c959f" />
+    </marker>
+    <style>
+      .box-text {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        font-size: 13px;
+        font-weight: 500;
+        fill: #24292f;
+        text-anchor: middle;
+      }
+      .box-text-highlight {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        font-size: 13px;
+        font-weight: 600;
+        fill: #0a3069;
+        text-anchor: middle;
+      }
+    </style>
+  </defs>
+
+  <!-- Step 1 -->
+  <rect x="15" y="12" width="158" height="58" rx="8" ry="8" fill="#f6f8fa" stroke="#57606a" stroke-width="1.5" />
+  <text x="94" y="37" class="box-text">Selected</text>
+  <text x="94" y="54" class="box-text">NC Programs</text>
+
+  <line x1="176" y1="41" x2="200" y2="41" stroke="#8c959f" stroke-width="1.75" marker-end="url(#arrow)" />
+
+  <!-- Step 2 -->
+  <rect x="203" y="12" width="158" height="58" rx="8" ry="8" fill="#f6f8fa" stroke="#57606a" stroke-width="1.5" />
+  <text x="282" y="37" class="box-text">Capture</text>
+  <text x="282" y="54" class="box-text">Per-Tool Moves</text>
+
+  <line x1="364" y1="41" x2="388" y2="41" stroke="#8c959f" stroke-width="1.75" marker-end="url(#arrow)" />
+
+  <!-- Step 3 (Highlight) -->
+  <rect x="391" y="12" width="158" height="58" rx="8" ry="8" fill="#ddf4ff" stroke="#0969da" stroke-width="2" />
+  <text x="470" y="37" class="box-text-highlight">Simulate</text>
+  <text x="470" y="54" class="box-text-highlight">Live Stock</text>
+
+  <line x1="552" y1="41" x2="576" y2="41" stroke="#8c959f" stroke-width="1.75" marker-end="url(#arrow)" />
+
+  <!-- Step 4 -->
+  <rect x="579" y="12" width="158" height="58" rx="8" ry="8" fill="#f6f8fa" stroke="#57606a" stroke-width="1.5" />
+  <text x="658" y="37" class="box-text">Replay Post</text>
+  <text x="658" y="54" class="box-text">Once (.cps)</text>
+
+  <line x1="740" y1="41" x2="764" y2="41" stroke="#8c959f" stroke-width="1.75" marker-end="url(#arrow)" />
+
+  <!-- Step 5 -->
+  <rect x="767" y="12" width="158" height="58" rx="8" ry="8" fill="#f6f8fa" stroke="#57606a" stroke-width="1.5" />
+  <text x="846" y="37" class="box-text">Multi-Tool</text>
+  <text x="846" y="54" class="box-text">NC + Report</text>
+</svg>

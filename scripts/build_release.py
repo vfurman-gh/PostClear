@@ -39,7 +39,7 @@ RUNTIME_TOP_FILES = (
     "LICENSE",
 )
 
-LF_TEXT_EXTS = (".py", ".cps", ".manifest", ".md", ".txt")
+LF_TEXT_EXTS = (".py", ".cps", ".manifest", ".md", ".txt", ".svg")
 
 
 def _read_manifest_version(source_dir: str) -> str:
