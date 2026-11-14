@@ -120,6 +120,8 @@ function makeTool(t) {
   return obj;
 }
 
+var _vendorGetProperty = null;
+
 function makeSection(s, idx, allRawSections) {
   var toolObj = makeTool(s.tool);
   var wp = toMat(s.workPlane);
@@ -367,7 +369,9 @@ function makeSection(s, idx, allRawSections) {
     getParameter: function(name, def) {
       return (s.params && Object.prototype.hasOwnProperty.call(s.params, name)) ? s.params[name] : def;
     },
-    getProperty: function(name) { return undefined; },
+    getProperty: function(name, def) {
+      return (typeof _vendorGetProperty === "function") ? _vendorGetProperty(name, def) : def;
+    },
     checkGroup: function() { return false; }
   };
 }
@@ -388,6 +392,8 @@ function hydrateCycle(c) {
 
 // Suppress C++ kernel callbacks on the bootstrap .cnc file until onClose()
 function onOpen() {}
+function onComment() {}
+function onManualNC() {}
 function onSection() {}
 function onSpindleSpeed() {}
 function onOrientateSpindle() {}
@@ -553,9 +559,11 @@ function onClose() {
     "writeWords",
     "writeWords2",
     "var currentSection, tool, movement, radiusCompensation, spindleSpeed, cycle, cycleType, cycleExpanded, programName, programComment;\n" +
-    "var onOpen, onComment, onPassThrough, onParameter, onSection, onSpindleSpeed, onOrientateSpindle, onMovement, onFeedMode, onRadiusCompensation, onDwell, onCommand, onRapid, onLinear, onCircular, onCycle, onCyclePoint, onCycleEnd, onSectionEnd, onClose;\n" +
+    "var onOpen, onComment, onPassThrough, onParameter, onSection, onSpindleSpeed, onOrientateSpindle, onMovement, onFeedMode, onRadiusCompensation, onDwell, onCommand, onManualNC, onRapid, onLinear, onCircular, onCycle, onCyclePoint, onCycleEnd, onSectionEnd, onClose;\n" +
     "var __didRepos = false;\n" +
-    "function getCurrentSectionId() { return currentSection.getId(); }\n" +
+    "var __inSection = false;\n" +
+    "var __manualNCQueue = [];\n" +
+    "function getCurrentSectionId() { return (__inSection && currentSection) ? currentSection.getId() : -1; }\n" +
     "function isFirstSection() { return currentSection.getId() === 0; }\n" +
     "function isLastSection() { return currentSection.getId() === (getNumberOfSections() - 1); }\n" +
     "function hasPreviousSection() { return currentSection.getId() > 0; }\n" +
@@ -761,8 +769,46 @@ function onClose() {
     "    }\n" +
     "  }\n" +
     "}\n" +
+    "function expandManualNC(command, value) {\n" +
+    "  var matched = null;\n" +
+    "  for (var qi = 0; qi < __manualNCQueue.length; ++qi) {\n" +
+    "    var q = __manualNCQueue[qi];\n" +
+    "    if (!q.used && q.command === command && q.value === value) {\n" +
+    "      q.used = true;\n" +
+    "      matched = q;\n" +
+    "      break;\n" +
+    "    }\n" +
+    "  }\n" +
+    "  if (matched && matched.expanded && matched.expanded.length > 0) {\n" +
+    "    for (var mi = 0; mi < matched.expanded.length; ++mi) {\n" +
+    "      var mev = matched.expanded[mi];\n" +
+    "      if (mev.type === 'onComment') { if (typeof onComment === 'function') onComment(mev.c); }\n" +
+    "      else if (mev.type === 'onPassThrough') { if (typeof onPassThrough === 'function') onPassThrough(mev.text); }\n" +
+    "      else if (mev.type === 'onParameter') { if (typeof onParameter === 'function') onParameter(mev.name, mev.value); }\n" +
+    "      else if (mev.type === 'onCommand') { if (typeof onCommand === 'function') onCommand(mev.cmd); }\n" +
+    "      else if (mev.type === 'onDwell') { if (typeof onDwell === 'function') onDwell(mev.sec); }\n" +
+    "    }\n" +
+    "    return;\n" +
+    "  }\n" +
+    "  if (typeof COMMAND_COMMENT !== 'undefined' && command === COMMAND_COMMENT) {\n" +
+    "    if (typeof onComment === 'function') onComment(value);\n" +
+    "  } else if (typeof COMMAND_PASS_THROUGH !== 'undefined' && command === COMMAND_PASS_THROUGH) {\n" +
+    "    if (typeof onPassThrough === 'function') onPassThrough(value);\n" +
+    "  } else if (typeof COMMAND_DWELL !== 'undefined' && command === COMMAND_DWELL) {\n" +
+    "    if (typeof onDwell === 'function') onDwell(value);\n" +
+    "  } else if (typeof COMMAND_DISPLAY_MESSAGE !== 'undefined' && command === COMMAND_DISPLAY_MESSAGE) {\n" +
+    "    if (typeof onParameter === 'function') onParameter('display', value);\n" +
+    "  } else {\n" +
+    "    if (typeof onCommand === 'function') onCommand(command);\n" +
+    "  }\n" +
+    "}\n" +
     "return {\n" +
     "  setGlobals: function(pn, pc) { programName = pn; programComment = pc; },\n" +
+    "  setInSection: function(v) { __inSection = !!v; },\n" +
+    "  enqueueManualNC: function(rec) {\n" +
+    "    __manualNCQueue.push({command: rec.command, value: rec.value, expanded: rec.expanded || [], used: false});\n" +
+    "  },\n" +
+    "  getProperty: getProperty,\n" +
     "  setState: function(st) {\n" +
     "    if ('currentSection' in st) currentSection = st.currentSection;\n" +
     "    if ('tool' in st) tool = st.tool;\n" +
@@ -806,6 +852,7 @@ function onClose() {
     "  onRadiusCompensation: (typeof onRadiusCompensation === 'function') ? onRadiusCompensation : null,\n" +
     "  onDwell: (typeof onDwell === 'function') ? onDwell : null,\n" +
     "  onCommand: (typeof onCommand === 'function') ? onCommand : null,\n" +
+    "  onManualNC: (typeof onManualNC === 'function') ? onManualNC : null,\n" +
     "  onRapid: (typeof onRapid === 'function') ? onRapid : null,\n" +
     "  onLinear: (typeof onLinear === 'function') ? onLinear : null,\n" +
     "  onCircular: (typeof onCircular === 'function') ? onCircular : null,\n" +
@@ -850,7 +897,27 @@ function onClose() {
   };
 
   var vendor = buildVendor(_customWriteln, _customWriteWords, _customWriteWords2);
+  _vendorGetProperty = function(name, def) {
+    return (vendor && typeof vendor.getProperty === "function") ? vendor.getProperty(name, def) : def;
+  };
   vendor.setGlobals(data.programName, data.programComment);
+
+  function _replayManualNC(rec) {
+    if (!rec) return;
+    if (vendor.onManualNC) {
+      vendor.enqueueManualNC(rec);
+      vendor.onManualNC(rec.command, rec.value);
+    } else if (rec.expanded) {
+      for (var mi = 0; mi < rec.expanded.length; ++mi) {
+        var mev = rec.expanded[mi];
+        if (mev.type === "onComment" && vendor.onComment) vendor.onComment(mev.c);
+        else if (mev.type === "onPassThrough" && vendor.onPassThrough) vendor.onPassThrough(mev.text);
+        else if (mev.type === "onParameter" && vendor.onParameter) vendor.onParameter(mev.name, mev.value);
+        else if (mev.type === "onCommand" && vendor.onCommand) vendor.onCommand(mev.cmd);
+        else if (mev.type === "onDwell" && vendor.onDwell) vendor.onDwell(mev.sec);
+      }
+    }
+  }
 
   if (data.postProperties && typeof data.postProperties === "object" && vendor.applyPostProp) {
     for (var ppk in data.postProperties) {
@@ -945,6 +1012,11 @@ function onClose() {
   for (var ci = 0; ci < data.comments.length; ++ci) {
     if (vendor.onComment) vendor.onComment(data.comments[ci]);
   }
+  if (data.manualNC) {
+    for (var mci = 0; mci < data.manualNC.length; ++mci) {
+      _replayManualNC(data.manualNC[mci]);
+    }
+  }
 
   function _matricesApproxEqual(a, b, tol) {
     if (!a || !b || !a.right || !a.up || !a.forward || !b.right || !b.up || !b.forward) {
@@ -995,6 +1067,7 @@ function onClose() {
     }
     inCycle = false;
 
+    vendor.setInSection(true);
     if (vendor.onSection) vendor.onSection();
 
     // R1: Verify vendor post's active kernel frame (R, T) matches verifier's (workPlane, workOrigin).
@@ -1082,6 +1155,9 @@ function onClose() {
         case "onCommand":
           if (vendor.onCommand) vendor.onCommand(ev.cmd);
           break;
+        case "onManualNC":
+          _replayManualNC(ev);
+          break;
         case "onRapid": {
           curLocalPos = new Vector(ev.sx, ev.sy, ev.sz);
           var rEnd = _fp(ev.x, ev.y, ev.z);
@@ -1166,10 +1242,16 @@ function onClose() {
     }
     vendor.setState({spindleSpeed: rawSec.endSpindleSpeed});
     if (vendor.onSectionEnd) vendor.onSectionEnd();
+    vendor.setInSection(false);
 
     if (rawSec.postComments) {
       for (var pci = 0; pci < rawSec.postComments.length; ++pci) {
         if (vendor.onComment) vendor.onComment(rawSec.postComments[pci]);
+      }
+    }
+    if (rawSec.postManualNC) {
+      for (var pmi = 0; pmi < rawSec.postManualNC.length; ++pmi) {
+        _replayManualNC(rawSec.postManualNC[pmi]);
       }
     }
   }

@@ -853,6 +853,124 @@ class TestFrameSafetyAndToolDataFixes(unittest.TestCase):
             self.assertIn("Multi-Axis", all_md)
             self.assertIn("holder not checked", all_md)
 
+    def test_plane_neg1_3d_arc_expands_linearized_moves_under_identity_workplane(self):
+        """Free-plane (plane == -1) 3D arcs expand linearizedMoves even when workPlane is identity."""
+        base_sec = {
+            "id": 0,
+            "type": 0,
+            "workOrigin": _zero_wo(),
+            "workPlane": _identity_wp(),
+            "params": {"operation-comment": "3DArcOp"},
+            "tool": {"number": 1, "diameter": 6.0},
+            "events": [
+                {
+                    "type": "onCircular",
+                    "clockwise": False,
+                    "plane": -1,
+                    "cx": 0.0,
+                    "cy": 0.0,
+                    "cz": 0.0,
+                    "sx": 10.0,
+                    "sy": 0.0,
+                    "sz": 0.0,
+                    "x": 0.0,
+                    "y": 10.0,
+                    "z": 5.0,
+                    "nx": 0.7071,
+                    "ny": 0.0,
+                    "nz": 0.7071,
+                    "feed": 500.0,
+                    "movement": 1,
+                    "linearizedMoves": [
+                        {"sx": 10.0, "sy": 0.0, "sz": 0.0, "x": 7.071, "y": 7.071, "z": 2.5},
+                        {"sx": 7.071, "sy": 7.071, "sz": 2.5, "x": 0.0, "y": 10.0, "z": 5.0},
+                    ],
+                }
+            ],
+        }
+        segs_3d = parse_context_dump({"unit": 1, "sections": [base_sec]})
+        self.assertEqual(len(segs_3d), 2)
+        self.assertTrue(all((not s.is_arc) and s.motion == MotionKind.LINEAR for s in segs_3d))
+
+        planar_sec = copy.deepcopy(base_sec)
+        planar_sec["events"][0]["plane"] = 0
+        planar_sec["events"][0]["z"] = 0.0
+        planar_sec["events"][0]["nx"] = 0.0
+        planar_sec["events"][0]["ny"] = 0.0
+        planar_sec["events"][0]["nz"] = 1.0
+        segs_xy = parse_context_dump({"unit": 1, "sections": [planar_sec]})
+        self.assertEqual(len(segs_xy), 1)
+        self.assertTrue(segs_xy[0].is_arc)
+
+    def test_multi_axis_replay_diag_strips_promoted_events_from_report(self):
+        """multiAxisSections in replay diag sidecar strips matching sections from report.promoted_events."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ctx = {
+                "unit": 1,
+                "workpiece": {"lower": {"x": -10, "y": -10, "z": -10}, "upper": {"x": 50, "y": 50, "z": 5}},
+                "sections": [
+                    {
+                        "id": 0,
+                        "type": 0,
+                        "workOrigin": _zero_wo(),
+                        "workPlane": _identity_wp(),
+                        "params": {"operation-comment": "Sim5AxOp"},
+                        "tool": {"number": 1, "diameter": 6.0},
+                        "events": [
+                            {"type": "onLinear", "sx": 0.0, "sy": 0.0, "sz": 10.0, "x": 10.0, "y": 0.0, "z": 10.0, "feed": 500.0},
+                        ],
+                    },
+                    {
+                        "id": 1,
+                        "type": 0,
+                        "workOrigin": _zero_wo(),
+                        "workPlane": _identity_wp(),
+                        "params": {"operation-comment": "Planar3AxOp"},
+                        "tool": {"number": 1, "diameter": 6.0},
+                        "events": [
+                            {"type": "onLinear", "sx": 0.0, "sy": 0.0, "sz": 10.0, "x": 10.0, "y": 0.0, "z": 10.0, "feed": 500.0},
+                        ],
+                    },
+                ],
+            }
+            ctx_path = os.path.join(tmp_dir, "ctx.json")
+            with open(ctx_path, "w", encoding="utf-8") as f:
+                json.dump(ctx, f)
+            dummy_post = os.path.join(tmp_dir, "dummy.cps")
+            with open(dummy_post, "w", encoding="utf-8") as f:
+                f.write("stub")
+
+            fake_verifier = MagicMock()
+            fake_verifier.holder_unchecked_ops = set()
+            fake_verifier.verify_toolpath.return_value = VerificationReport(
+                total_machining_time_sec=2.0,
+                total_volume_removed_mm3=0.0,
+                collisions=[],
+                promoted_events={(0, 0), (1, 0)},
+                operation_names=["Sim5AxOp", "Planar3AxOp"],
+            )
+
+            orch = PipelineOrchestrator(post_bin=dummy_post)
+
+            def _fake_replay(*args, **kwargs):
+                orch.last_replay_diag = {
+                    "frameMismatches": [],
+                    "frameMismatchSections": [],
+                    "multiAxisSections": [{"secIdx": 0, "id": 0, "op": "Sim5AxOp"}],
+                }
+                return "M30\n"
+
+            with patch.object(orch, "replay_combined_context", side_effect=_fake_replay):
+                report, _ = orch.run(
+                    context_dump_paths=[ctx_path],
+                    base_post_path=dummy_post,
+                    bootstrap_cnc_path=dummy_post,
+                    verifier=fake_verifier,
+                    promote=True,
+                )
+            self.assertNotIn((0, 0), report.promoted_events)
+            self.assertIn((1, 0), report.promoted_events)
+
 
 if __name__ == "__main__":
     unittest.main()

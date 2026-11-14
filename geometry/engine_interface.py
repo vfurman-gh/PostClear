@@ -111,11 +111,17 @@ class BaseVerificationEngine(IVerificationEngine):
     def _promotion_blocked(self, move: MotionSegment) -> bool:
         """
         Check if rapid promotion must be blocked for this move.
-        Moves under active radius compensation (rc != 0) or transition moves
-        (rc_transition=True) must never be promoted to rapids.
+        Moves under active radius compensation (rc != 0), transition moves
+        (rc_transition=True), tilted 3+2 sections, or simultaneous multi-axis
+        sections must never be promoted to rapids.
         """
         meta = getattr(move, "metadata", None) or {}
-        return int(meta.get("rc", 0) or 0) != 0 or bool(meta.get("rc_transition", False))
+        return (
+            int(meta.get("rc", 0) or 0) != 0
+            or bool(meta.get("rc_transition", False))
+            or bool(meta.get("tilted_section", False))
+            or bool(meta.get("multi_axis", False))
+        )
 
     def record_event_evaluation(
         self,

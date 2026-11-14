@@ -427,32 +427,52 @@ def parse_context_dump(
                 plane_idx = int(ev.get("plane", 0))
                 plane_str = {0: "XY", 1: "ZX", 2: "YZ"}.get(plane_idx, "ZX" if sec_type == 1 else "XY")
                 tilted_arc = False
-                if has_sec_transform:
-                    if "nx" in ev and "ny" in ev and "nz" in ev:
-                        nx0, ny0, nz0 = float(ev["nx"]), float(ev["ny"]), float(ev["nz"])
-                    else:
-                        nx0, ny0, nz0 = {0: (0.0, 0.0, 1.0), 1: (0.0, 1.0, 0.0), 2: (1.0, 0.0, 0.0)}.get(
-                            plane_idx, (0.0, 1.0, 0.0) if sec_type == 1 else (0.0, 0.0, 1.0)
-                        )
-                    nx = wp_rx * nx0 + wp_ux * ny0 + wp_fx * nz0
-                    ny = wp_ry * nx0 + wp_uy * ny0 + wp_fy * nz0
-                    nz = wp_rz * nx0 + wp_uz * ny0 + wp_fz * nz0
-                    if wp_det < 0.0:
-                        cw = not cw
-                    if abs(nx) < 1e-5 and abs(ny) < 1e-5 and abs(abs(nz) - 1.0) < 1e-4:
-                        plane_str = "XY"
-                        if nz < 0.0:
+                if sec_type != 1:
+                    if has_sec_transform:
+                        if "nx" in ev and "ny" in ev and "nz" in ev:
+                            nx0, ny0, nz0 = float(ev["nx"]), float(ev["ny"]), float(ev["nz"])
+                        else:
+                            nx0, ny0, nz0 = {0: (0.0, 0.0, 1.0), 1: (0.0, 1.0, 0.0), 2: (1.0, 0.0, 0.0)}.get(
+                                plane_idx, (0.0, 0.0, 1.0)
+                            )
+                        nx = wp_rx * nx0 + wp_ux * ny0 + wp_fx * nz0
+                        ny = wp_ry * nx0 + wp_uy * ny0 + wp_fy * nz0
+                        nz = wp_rz * nx0 + wp_uz * ny0 + wp_fz * nz0
+                        if wp_det < 0.0:
                             cw = not cw
-                    elif abs(nx) < 1e-5 and abs(nz) < 1e-5 and abs(abs(ny) - 1.0) < 1e-4:
-                        plane_str = "ZX"
-                        if ny < 0.0:
-                            cw = not cw
-                    elif abs(ny) < 1e-5 and abs(nz) < 1e-5 and abs(abs(nx) - 1.0) < 1e-4:
-                        plane_str = "YZ"
-                        if nx < 0.0:
-                            cw = not cw
-                    else:
-                        tilted_arc = True
+                        if abs(nx) < 1e-5 and abs(ny) < 1e-5 and abs(abs(nz) - 1.0) < 1e-4:
+                            plane_str = "XY"
+                            if nz < 0.0:
+                                cw = not cw
+                        elif abs(nx) < 1e-5 and abs(nz) < 1e-5 and abs(abs(ny) - 1.0) < 1e-4:
+                            plane_str = "ZX"
+                            if ny < 0.0:
+                                cw = not cw
+                        elif abs(ny) < 1e-5 and abs(nz) < 1e-5 and abs(abs(nx) - 1.0) < 1e-4:
+                            plane_str = "YZ"
+                            if nx < 0.0:
+                                cw = not cw
+                        else:
+                            tilted_arc = True
+                    elif plane_idx not in (0, 1, 2):
+                        if "nx" in ev and "ny" in ev and "nz" in ev:
+                            nx, ny, nz = float(ev["nx"]), float(ev["ny"]), float(ev["nz"])
+                            if abs(nx) < 1e-5 and abs(ny) < 1e-5 and abs(abs(nz) - 1.0) < 1e-4:
+                                plane_str = "XY"
+                                if nz < 0.0:
+                                    cw = not cw
+                            elif abs(nx) < 1e-5 and abs(nz) < 1e-5 and abs(abs(ny) - 1.0) < 1e-4:
+                                plane_str = "ZX"
+                                if ny < 0.0:
+                                    cw = not cw
+                            elif abs(ny) < 1e-5 and abs(nz) < 1e-5 and abs(abs(nx) - 1.0) < 1e-4:
+                                plane_str = "YZ"
+                                if nx < 0.0:
+                                    cw = not cw
+                            else:
+                                tilted_arc = True
+                        else:
+                            tilted_arc = True
 
                 if tilted_arc and ev.get("linearizedMoves"):
                     prev_pt = start_pos

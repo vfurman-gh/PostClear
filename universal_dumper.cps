@@ -203,6 +203,7 @@ var dumpData = {
   },
   globalParams: {},
   comments: [],
+  manualNC: [],
   sections: []
 };
 
@@ -388,6 +389,10 @@ onOpen = function() {
 };
 
 onComment = function(c) {
+  if (capturingExpanded) {
+    capturingExpanded.push({type: "onComment", c: c});
+    return;
+  }
   if (!curSec) {
     if (dumpData.sections.length === 0) {
       dumpData.comments.push(c);
@@ -400,12 +405,20 @@ onComment = function(c) {
 };
 
 onPassThrough = function(text) {
+  if (capturingExpanded) {
+    capturingExpanded.push({type: "onPassThrough", text: text});
+    return;
+  }
   if (curSec) {
     curSec.events.push({type: "onPassThrough", text: text});
   }
 };
 
 onParameter = function(name, value) {
+  if (capturingExpanded) {
+    capturingExpanded.push({type: "onParameter", name: name, value: value});
+    return;
+  }
   if (!opened) {
     dumpData.globalParams[name] = value;
   } else if (!curSec) {
@@ -541,7 +554,8 @@ onSection = function() {
     params: pendingParams,
     tool: t,
     events: [],
-    postComments: []
+    postComments: [],
+    postManualNC: []
   };
   pendingParams = {};
   dumpData.sections.push(curSec);
@@ -577,7 +591,32 @@ onDwell = function(sec) {
 };
 
 onCommand = function(cmd) {
+  if (capturingExpanded) {
+    capturingExpanded.push({type: "onCommand", cmd: cmd});
+    return;
+  }
   curSec.events.push({type: "onCommand", cmd: cmd});
+};
+
+onManualNC = function(command, value) {
+  var exp = [];
+  capturingExpanded = exp;
+  try {
+    if (typeof expandManualNC === "function") {
+      expandManualNC(command, value);
+    }
+  } catch (e) {}
+  capturingExpanded = null;
+  var rec = {type: "onManualNC", command: command, value: value, expanded: exp};
+  if (!curSec) {
+    if (dumpData.sections.length === 0) {
+      dumpData.manualNC.push(rec);
+    } else {
+      dumpData.sections[dumpData.sections.length - 1].postManualNC.push(rec);
+    }
+  } else {
+    curSec.events.push(rec);
+  }
 };
 
 onRapid = function(x, y, z) {

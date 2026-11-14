@@ -272,7 +272,18 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         self.assertIn("shank rubbed into raw stock", shank_cols[0].description)
 
     def test_pure_z_plus_retract_air_promotion(self):
-        """Pure vertical Z+ retract move reaching clearance height is promoted."""
+        """Pure vertical Z+ retract out of an already-carved bore to clearance is promoted."""
+        plunge_cut = _make_segment(
+            seg_id=39,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(5.0, 5.0, 15.0),
+            end=Vector3D(5.0, 5.0, -2.0),
+            feedrate=300.0,
+            metadata={"z_clearance_mm": 10.0},
+        )
+        plunge_res = self.verifier.step(plunge_cut)
+        self.assertFalse(plunge_res.is_air_move)
+
         retract_move = _make_segment(
             seg_id=40,
             motion=MotionKind.LINEAR,
@@ -283,6 +294,22 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         eval_res = self.verifier.step(retract_move)
         self.assertTrue(eval_res.is_air_move)
         self.assertEqual(len(eval_res.collisions), 0)
+        self.assertIn((0, 40), self.verifier.promoted_events)
+
+    def test_pure_z_plus_cutting_uncut_stock_is_not_promoted(self):
+        """A Z+ move whose tool footprint intersects uncarved upper stock must NOT promote."""
+        cut_z_plus = _make_segment(
+            seg_id=41,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(5.0, 5.0, -2.0),
+            end=Vector3D(5.0, 5.0, 15.0),
+            feedrate=300.0,
+            metadata={"z_clearance_mm": 10.0},
+        )
+        eval_res = self.verifier.step(cut_z_plus)
+        self.assertFalse(eval_res.is_air_move)
+        self.assertGreater(eval_res.material_removed_mm3, 0.0)
+        self.assertNotIn((0, 41), self.verifier.promoted_events)
 
     def test_circular_arc_sweeping(self):
         """Circular arc move (G2/G3) in XY plane correctly carves arc channel."""
@@ -696,6 +723,17 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         )
         verifier.step(init_move)
 
+        # Carve pocket bore first before testing vertical Z+ retract
+        plunge_move = _make_segment(
+            seg_id=10,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(10.0, 10.0, 15.0),
+            end=Vector3D(10.0, 10.0, -5.0),
+            feedrate=500.0,
+            metadata={"z_clearance_mm": None},
+        )
+        verifier.step(plunge_move)
+
         # Pure vertical Z+ retract from inside pocket (Z=-5) to Z=15 with z_clearance_mm=None
         retract_move = _make_segment(
             seg_id=2,
@@ -854,6 +892,78 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         self.assertEqual(len(self.verifier.collisions), 2)
         self.assertEqual(len(res.collisions), 2)
         self.assertNotIn((0, 502), self.verifier.promoted_events)
+
+    def test_sloped_ramp_carves_endpoint_disk_before_vertical_retract(self):
+        """Sloped 3D ramp at large coordinates carves its full endpoint disk before Z+ retract."""
+        large_wp = WorkpieceDefinition(
+            stock=BoxStock3D(
+                x_min=1150.0,
+                x_max=1250.0,
+                y_min=750.0,
+                y_max=850.0,
+                z_min=-20.0,
+                z_max=0.0,
+            )
+        )
+        verifier = MillHeightfieldVerifier(cell_size_mm=0.5, pad_mm=5.0, promote_margin_mm=0.5)
+        verifier.reset(large_wp)
+        verifier.load_tool(self.tool)
+
+        ramp_move = _make_segment(
+            seg_id=601,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(1170.0, 800.0, 0.5),
+            end=Vector3D(1200.0, 800.0, -4.0),
+            feedrate=400.0,
+            metadata={"z_clearance_mm": 10.0},
+        )
+        res_ramp = verifier.step(ramp_move)
+        self.assertGreater(res_ramp.material_removed_mm3, 0.0)
+
+        retract_move = _make_segment(
+            seg_id=602,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(1200.0, 800.0, -4.0),
+            end=Vector3D(1200.0, 800.0, 15.0),
+            feedrate=400.0,
+            metadata={"z_clearance_mm": 10.0},
+        )
+        res_retract = verifier.step(retract_move)
+        self.assertAlmostEqual(res_retract.material_removed_mm3, 0.0, places=6)
+        self.assertTrue(res_retract.is_air_move)
+        self.assertIn((0, 602), verifier.promoted_events)
+
+    def test_tilted_or_multiaxis_move_does_not_carve_heightfield(self):
+        """Moves marked tilted_section or multi_axis skip +Z carving, collisions, and promotion."""
+        self.verifier.reset(self.workpiece)
+        self.verifier.load_tool(self.tool)
+
+        tilted_seg = _make_segment(
+            seg_id=701,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(-10.0, 0.0, -3.0),
+            end=Vector3D(10.0, 0.0, -3.0),
+            feedrate=400.0,
+            metadata={"tilted_section": True},
+        )
+        multi_seg = _make_segment(
+            seg_id=702,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(10.0, 0.0, -3.0),
+            end=Vector3D(-10.0, 0.0, -3.0),
+            feedrate=400.0,
+            metadata={"multi_axis": True},
+        )
+        r1 = self.verifier.step(tilted_seg)
+        r2 = self.verifier.step(multi_seg)
+        self.assertEqual(r1.material_removed_mm3, 0.0)
+        self.assertEqual(r2.material_removed_mm3, 0.0)
+        self.assertEqual(r1.collisions, [])
+        self.assertEqual(r2.collisions, [])
+
+        rep = self.verifier.generate_report()
+        self.assertEqual(rep.total_volume_removed_mm3, 0.0)
+        self.assertEqual(rep.promoted_events, set())
 
 
 if __name__ == "__main__":

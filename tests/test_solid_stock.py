@@ -330,15 +330,18 @@ class TestSolidMeshStock(unittest.TestCase):
         grid = HeightfieldGrid(cell_size_mm=1.0, pad_mm=5.0)
         grid.reset_from_mesh(verts, tris, tol_pad_z_mm=0.0)
 
-        # Check height at X=10: cell center is at (10.5, 10.5), so height is 0.5 * 10.5 = 5.25 mm
+        # Check height at X=10 and X=30 against exact cell center along the sloped plane Z = 0.5 * X
         c_10 = int((10.0 - grid.grid_x_min) / grid.cell_size_mm)
         r_10 = int((10.0 - grid.grid_y_min) / grid.cell_size_mm)
-        self.assertAlmostEqual(grid.H[r_10, c_10], 5.25, places=2)
+        x_c10 = grid.grid_x_min + (c_10 + 0.5) * grid.cell_size_mm
+        self.assertLess(abs(x_c10 - 10.0), grid.cell_size_mm)
+        self.assertAlmostEqual(grid.H[r_10, c_10], 0.5 * x_c10, places=2)
 
-        # Check height at X=30: cell center is at (30.5, 10.5), so height is 0.5 * 30.5 = 15.25 mm
         c_30 = int((30.0 - grid.grid_x_min) / grid.cell_size_mm)
         r_30 = int((10.0 - grid.grid_y_min) / grid.cell_size_mm)
-        self.assertAlmostEqual(grid.H[r_30, c_30], 15.25, places=2)
+        x_c30 = grid.grid_x_min + (c_30 + 0.5) * grid.cell_size_mm
+        self.assertLess(abs(x_c30 - 30.0), grid.cell_size_mm)
+        self.assertAlmostEqual(grid.H[r_30, c_30], 0.5 * x_c30, places=2)
 
     def test_mill_heightfield_verifier_with_solid_stock(self):
         """Verify MillHeightfieldVerifier executes toolpath verification on SolidMeshStock3D."""

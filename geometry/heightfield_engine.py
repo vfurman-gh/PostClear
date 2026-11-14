@@ -94,14 +94,17 @@ class HeightfieldGrid:
         self.stock_z_min = float(stock.z_min)
         self.stock_z_max = float(stock.z_max)
 
-        self.grid_x_min = self.stock_x_min - self.pad_mm
-        self.grid_x_max = self.stock_x_max + self.pad_mm
-        self.grid_y_min = self.stock_y_min - self.pad_mm
-        self.grid_y_max = self.stock_y_max + self.pad_mm
+        span_x = (self.stock_x_max - self.stock_x_min) + 2.0 * self.pad_mm
+        span_y = (self.stock_y_max - self.stock_y_min) + 2.0 * self.pad_mm
+        self.nx = max(2, int(math.ceil(span_x / self.cell_size_mm)) + 1)
+        self.ny = max(2, int(math.ceil(span_y / self.cell_size_mm)) + 1)
+        cx = 0.5 * (self.stock_x_min + self.stock_x_max)
+        cy = 0.5 * (self.stock_y_min + self.stock_y_max)
+        self.grid_x_min = cx - 0.5 * self.nx * self.cell_size_mm
+        self.grid_x_max = cx + 0.5 * self.nx * self.cell_size_mm
+        self.grid_y_min = cy - 0.5 * self.ny * self.cell_size_mm
+        self.grid_y_max = cy + 0.5 * self.ny * self.cell_size_mm
         self.z_floor = self.stock_z_min
-
-        self.nx = max(2, int(math.ceil((self.grid_x_max - self.grid_x_min) / self.cell_size_mm)) + 1)
-        self.ny = max(2, int(math.ceil((self.grid_y_max - self.grid_y_min) / self.cell_size_mm)) + 1)
 
         # Allocate grid
         # Outside stock bounds: z_floor. Inside stock bounds: stock_z_max.
@@ -145,14 +148,17 @@ class HeightfieldGrid:
         self.stock_z_min = float(min_pt[2])
         self.stock_z_max = float(max_pt[2]) + tol_pad_z_mm
 
-        self.grid_x_min = self.stock_x_min - self.pad_mm
-        self.grid_x_max = self.stock_x_max + self.pad_mm
-        self.grid_y_min = self.stock_y_min - self.pad_mm
-        self.grid_y_max = self.stock_y_max + self.pad_mm
+        span_x = (self.stock_x_max - self.stock_x_min) + 2.0 * self.pad_mm
+        span_y = (self.stock_y_max - self.stock_y_min) + 2.0 * self.pad_mm
+        self.nx = max(2, int(math.ceil(span_x / self.cell_size_mm)) + 1)
+        self.ny = max(2, int(math.ceil(span_y / self.cell_size_mm)) + 1)
+        cx = 0.5 * (self.stock_x_min + self.stock_x_max)
+        cy = 0.5 * (self.stock_y_min + self.stock_y_max)
+        self.grid_x_min = cx - 0.5 * self.nx * self.cell_size_mm
+        self.grid_x_max = cx + 0.5 * self.nx * self.cell_size_mm
+        self.grid_y_min = cy - 0.5 * self.ny * self.cell_size_mm
+        self.grid_y_max = cy + 0.5 * self.ny * self.cell_size_mm
         self.z_floor = self.stock_z_min
-
-        self.nx = max(2, int(math.ceil((self.grid_x_max - self.grid_x_min) / self.cell_size_mm)) + 1)
-        self.ny = max(2, int(math.ceil((self.grid_y_max - self.grid_y_min) / self.cell_size_mm)) + 1)
 
         # Allocate grid to floor
         self.H = np.full((self.ny, self.nx), self.z_floor, dtype=np.float32)
@@ -193,8 +199,8 @@ class HeightfieldGrid:
         row_max: int,
     ) -> Tuple[Any, Any]:
         """Construct 2D spatial coordinate grids (X, Y) at cell centers for a subgrid window."""
-        xs = self.grid_x_min + (np.arange(col_min, col_max, dtype=np.float32) + np.float32(0.5)) * self.cell_size_mm
-        ys = self.grid_y_min + (np.arange(row_min, row_max, dtype=np.float32) + np.float32(0.5)) * self.cell_size_mm
+        xs = self.grid_x_min + (np.arange(col_min, col_max, dtype=np.float64) + 0.5) * self.cell_size_mm
+        ys = self.grid_y_min + (np.arange(row_min, row_max, dtype=np.float64) + 0.5) * self.cell_size_mm
         return np.meshgrid(xs, ys)
 
 
@@ -427,11 +433,11 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         if L2 < 1e-10:
             # Pure vertical or dwell motion
             dist_xy = np.sqrt((X - x1) ** 2 + (Y - y1) ** 2)
-            t_param = np.zeros_like(dist_xy, dtype=np.float32)
+            t_param = np.zeros_like(dist_xy, dtype=np.float64)
             mask = dist_xy <= (tool_r + 1e-5)
             z_tip = min(z1, z2)
             z_rel = evaluate_tool_bottom_profile(dist_xy, tool_r, corner_r, taper_deg)
-            z_sweep = np.float32(z_tip) + z_rel
+            z_sweep = (np.float32(z_tip) + z_rel).astype(np.float32)
             return mask, z_sweep, t_param, dist_xy
 
         # Linear motion in XY
@@ -444,9 +450,43 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         dist_xy = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
 
         mask = dist_xy <= (tool_r + 1e-5)
-        z_tip = z1 + t_param * (z2 - z1)
-        z_rel = evaluate_tool_bottom_profile(dist_xy, tool_r, corner_r, taper_deg)
-        z_sweep = z_tip + z_rel
+        dz = z2 - z1
+        if abs(dz) <= 1e-9:
+            z_rel = evaluate_tool_bottom_profile(dist_xy, tool_r, corner_r, taper_deg)
+            z_sweep = (np.float32(z1) + z_rel).astype(np.float32)
+            return mask, z_sweep, t_param, dist_xy
+
+        # Sloped 3D segment: a cell (X, Y) inside mask is swept over parameter interval
+        # [t_enter, t_exit] subset [0, 1] where ||(X, Y) - p(t)|| <= tool_r.
+        L = math.sqrt(L2)
+        u_par = (wx * vx + wy * vy) / L
+        d_line_sq = np.maximum(0.0, (wx * wx + wy * wy) - u_par * u_par)
+        r_eff = tool_r + 1e-5
+        half_chord = np.sqrt(np.maximum(0.0, r_eff * r_eff - d_line_sq))
+        t_enter = np.clip((u_par - half_chord) / L, 0.0, 1.0)
+        t_exit = np.clip((u_par + half_chord) / L, 0.0, 1.0)
+
+        if corner_r <= 1e-4 and taper_deg <= 0.01:
+            # Flat endmill: z_rel == 0 everywhere inside mask, so z_tip(t) = z1 + t * dz
+            # achieves its exact minimum at t_exit (if dz < 0) or t_enter (if dz > 0).
+            t_opt = t_exit if dz < 0.0 else t_enter
+            z_sweep = (z1 + t_opt * dz).astype(np.float32)
+        else:
+            # Bull-nose, ball, or tapered cutter: sample [t_enter, t_closest, t_exit] + midpoints
+            t_m1 = 0.5 * (t_enter + t_param)
+            t_m2 = 0.5 * (t_param + t_exit)
+            z_sweep = (
+                z1 + t_param * dz + evaluate_tool_bottom_profile(dist_xy, tool_r, corner_r, taper_deg)
+            ).astype(np.float32)
+            for t_cand in (t_enter, t_m1, t_m2, t_exit):
+                d_cand = np.sqrt(d_line_sq + (u_par - t_cand * L) ** 2)
+                valid_c = d_cand <= r_eff
+                z_cand = (
+                    z1
+                    + t_cand * dz
+                    + evaluate_tool_bottom_profile(np.minimum(d_cand, tool_r), tool_r, corner_r, taper_deg)
+                ).astype(np.float32)
+                z_sweep = np.where(valid_c & (z_cand < z_sweep), z_cand, z_sweep)
 
         return mask, z_sweep, t_param, dist_xy
 
@@ -459,6 +499,24 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         self.total_machining_time_sec += max(0.0, float(move.duration_sec))
 
         v_key_str = move.vector_key.to_wrapper_str()
+
+        meta = move.metadata or {}
+        if bool(meta.get("tilted_section", False)) or bool(meta.get("multi_axis", False)):
+            sec_idx = meta.get("sec_idx", move.sec_id)
+            event_idx = meta.get("event_idx")
+            if event_idx is None:
+                event_idx = move.segment_id
+            self.record_event_evaluation(move, is_air_move=False, collisions=[])
+            return MoveEvaluation(
+                segment_id=move.segment_id,
+                vector_key=v_key_str,
+                is_air_move=False,
+                material_removed_mm3=0.0,
+                instantaneous_mrr=0.0,
+                collisions=[],
+                sec_idx=sec_idx,
+                event_idx=event_idx,
+            )
 
         # Handle circular arcs by discretizing into linear sub-segments
         if move.is_arc and move.arc_center is not None:
@@ -720,7 +778,15 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         if clearance_z is None:
             clearance_z = self._sec_clearance_mm.get(sec_id)
 
-        is_retract_air = (not in_cycle) and is_pure_z_plus and (clearance_z is not None) and (p2.z >= (clearance_z - self.z_tol_mm))
+        is_retract_air = (
+            (not in_cycle)
+            and is_pure_z_plus
+            and (not cuts_material)
+            and (not move_collisions)
+            and self.has_valid_stock
+            and (clearance_z is not None)
+            and (p2.z >= (clearance_z - self.z_tol_mm))
+        )
 
         is_air_move = False
         if is_retract_air:
@@ -742,9 +808,25 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                 mask_clearance = dist_cutter <= (clearance_r + 1e-5)
                 if np.any(mask_clearance):
                     if L2 < 1e-10:
-                        z_tip_c = min(p1.z, p2.z)
+                        z_tip_c = np.float32(min(p1.z, p2.z))
                     else:
-                        z_tip_c = p1.z + t_param * (p2.z - p1.z)
+                        dz_c = p2.z - p1.z
+                        if abs(dz_c) <= 1e-9:
+                            z_tip_c = p1.z + t_param * dz_c
+                        else:
+                            L_c = math.sqrt(L2)
+                            wx_c = X_sub - p1.x
+                            wy_c = Y_sub - p1.y
+                            u_par_c = (wx_c * vx + wy_c * vy) / L_c
+                            d_line_sq_c = np.maximum(0.0, (wx_c * wx_c + wy_c * wy_c) - u_par_c * u_par_c)
+                            r_clr = clearance_r + 1e-5
+                            half_chord_c = np.sqrt(np.maximum(0.0, r_clr * r_clr - d_line_sq_c))
+                            t_deep = (
+                                np.clip((u_par_c + half_chord_c) / L_c, 0.0, 1.0)
+                                if dz_c < 0.0
+                                else np.clip((u_par_c - half_chord_c) / L_c, 0.0, 1.0)
+                            )
+                            z_tip_c = np.minimum(p1.z + t_param * dz_c, p1.z + t_deep * dz_c)
                     z_effective = z_tip_c + evaluate_tool_bottom_profile(
                         np.minimum(dist_cutter, tool_r), tool_r, corner_r, taper_deg
                     )

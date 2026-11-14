@@ -908,23 +908,28 @@ class PipelineOrchestrator:
                         reasons.append(str(fm["error"]))
                     reason_str = ", ".join(reasons) if reasons else "frame mismatch"
                     frame_warnings.append(f"{fm_op}: {reason_str}; rapid promotion disabled")
+                multi_axis_replay_sec_indices: Set[int] = set()
                 for ma in replay_diag.get("multiAxisSections", []) or []:
                     if not isinstance(ma, dict):
                         continue
+                    ma_sec_idx = ma.get("secIdx")
+                    if isinstance(ma_sec_idx, int):
+                        multi_axis_replay_sec_indices.add(ma_sec_idx)
                     ma_op = str(ma.get("op") or f"Section_{ma.get('id', ma.get('secIdx', '?'))}")
                     if ma_op not in report.multi_axis_ops:
                         report.multi_axis_ops.append(ma_op)
 
-                if frame_mismatch_sec_indices:
+                replay_blocked_sec_indices = frame_mismatch_sec_indices | multi_axis_replay_sec_indices
+                if replay_blocked_sec_indices:
                     if report.promoted_events:
                         report.promoted_events = {
                             ev for ev in report.promoted_events
-                            if ev[0] not in frame_mismatch_sec_indices
+                            if ev[0] not in replay_blocked_sec_indices
                         }
                     restored_count = sum(
                         1
                         for s_i, sec in enumerate(combined_ctx.get("sections", []))
-                        if s_i not in frame_mismatch_sec_indices
+                        if s_i not in replay_blocked_sec_indices
                         for ev in sec.get("events", [])
                         if ev.get("promote")
                     )

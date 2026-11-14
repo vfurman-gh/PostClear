@@ -6,3 +6,4 @@ packages/
 .venv/
 Screenshot*.png
 dist/
+corpus/
