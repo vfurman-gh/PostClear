@@ -417,6 +417,11 @@ onParameter = function(name, value) {
 };
 
 onSection = function() {
+  if (typeof cancelTransformation === "function") {
+    try {
+      cancelTransformation();
+    } catch (e) {}
+  }
   var t = {};
   for (var k in tool) {
     if (typeof tool[k] !== "function" && k !== "shaft" && k !== "holder") {
@@ -438,6 +443,23 @@ onSection = function() {
   t._holderSVG = tool.getHolderProfileAsSVGPath ? tool.getHolderProfileAsSVGPath() : "";
   t._compDisplacement = tool.getCompensationDisplacement ? serializeVector(tool.getCompensationDisplacement()) : {x: 0, y: 0, z: 0};
   t._toolTypeName = (typeof getToolTypeName === "function" && tool.type !== undefined) ? getToolTypeName(tool.type) : "";
+
+  function _serializeToolSections(secObj) {
+    var secs = [];
+    try {
+      if (secObj && (typeof secObj.hasSections !== "function" || secObj.hasSections())) {
+        var n = (typeof secObj.getNumberOfSections === "function") ? secObj.getNumberOfSections() : 0;
+        for (var idx = 0; idx < n; ++idx) {
+          var sLen = (typeof secObj.getLength === "function") ? secObj.getLength(idx) : 0;
+          var sDia = (typeof secObj.getDiameter === "function") ? secObj.getDiameter(idx) : 0;
+          secs.push({length: sLen, diameter: sDia});
+        }
+      }
+    } catch (e) {}
+    return secs;
+  }
+  t._holderSections = _serializeToolSections(tool.holder);
+  t._shaftSections = _serializeToolSections(tool.shaft);
 
   var secMaxRpm = 0;
   if (typeof tool.maximumSpindleSpeed === "number" && tool.maximumSpindleSpeed > 0) {
@@ -484,11 +506,15 @@ onSection = function() {
     strategy: currentSection.strategy,
     initialPosition: serializeVector(currentSection.getInitialPosition()),
     globalInitialPosition: serializeVector(
-      currentSection.getGlobalInitialPosition ? currentSection.getGlobalInitialPosition() : currentSection.getInitialPosition()
+      currentSection.getGlobalPosition
+        ? currentSection.getGlobalPosition(currentSection.getInitialPosition())
+        : (currentSection.getGlobalInitialPosition ? currentSection.getGlobalInitialPosition() : currentSection.getInitialPosition())
     ),
     finalPosition: serializeVector(currentSection.getFinalPosition()),
     globalFinalPosition: serializeVector(
-      currentSection.getGlobalFinalPosition ? currentSection.getGlobalFinalPosition() : currentSection.getFinalPosition()
+      currentSection.getGlobalPosition
+        ? currentSection.getGlobalPosition(currentSection.getFinalPosition())
+        : (currentSection.getGlobalFinalPosition ? currentSection.getGlobalFinalPosition() : currentSection.getFinalPosition())
     ),
     initialToolAxis: currentSection.getInitialToolAxis ? serializeVector(currentSection.getInitialToolAxis()) : {x: 0, y: 0, z: 1},
     globalInitialToolAxis: currentSection.getGlobalInitialToolAxis ? serializeVector(currentSection.getGlobalInitialToolAxis()) : {x: 0, y: 0, z: 1},
@@ -581,6 +607,20 @@ onLinear = function(x, y, z, feed) {
     return;
   }
   curSec.events.push(obj);
+};
+
+onRapid5D = function(x, y, z, a, b, c) {
+  if (curSec) {
+    curSec.has5DMoves = true;
+    curSec.events.push({type: "onRapid5D", x: x, y: y, z: z, a: a, b: b, c: c});
+  }
+};
+
+onLinear5D = function(x, y, z, a, b, c, feed) {
+  if (curSec) {
+    curSec.has5DMoves = true;
+    curSec.events.push({type: "onLinear5D", x: x, y: y, z: z, a: a, b: b, c: c, feed: feed});
+  }
 };
 
 onCircular = function(cw, cx, cy, cz, x, y, z, feed) {
@@ -687,9 +727,14 @@ onSectionEnd = function() {
   curSec.endSpindleSpeed = spindleSpeed;
   if (typeof currentSection !== "undefined" && currentSection) {
     if (currentSection.getFinalPosition) {
-      curSec.finalPosition = serializeVector(currentSection.getFinalPosition());
-    }
-    if (currentSection.getGlobalFinalPosition) {
+      var fpEnd = currentSection.getFinalPosition();
+      curSec.finalPosition = serializeVector(fpEnd);
+      if (currentSection.getGlobalPosition) {
+        curSec.globalFinalPosition = serializeVector(currentSection.getGlobalPosition(fpEnd));
+      } else if (currentSection.getGlobalFinalPosition) {
+        curSec.globalFinalPosition = serializeVector(currentSection.getGlobalFinalPosition());
+      }
+    } else if (currentSection.getGlobalFinalPosition) {
       curSec.globalFinalPosition = serializeVector(currentSection.getGlobalFinalPosition());
     }
     if (currentSection.getFinalToolAxis) {

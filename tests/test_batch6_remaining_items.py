@@ -94,7 +94,7 @@ def reference_rasterize(grid, vertices, indices, tol_pad_z_mm=0.05):
     nx = grid.nx
     ny = grid.ny
 
-    t_verts = vertices[indices]
+    t_verts = vertices[indices].astype(np.float64, copy=False)
 
     v_cols = np.clip(np.floor((vertices[:, 0] - gx_min) / cell_size).astype(int), 0, nx - 1)
     v_rows = np.clip(np.floor((vertices[:, 1] - gy_min) / cell_size).astype(int), 0, ny - 1)
@@ -107,10 +107,17 @@ def reference_rasterize(grid, vertices, indices, tol_pad_z_mm=0.05):
         x0, y0, z0 = v0
         x1, y1, z1 = v1
         x2, y2, z2 = v2
+        z_min = min(z0, z1, z2)
+        z_max = max(z0, z1, z2)
 
         nx_val = (y1 - y0) * (z2 - z0) - (z1 - z0) * (y2 - y0)
         ny_val = (z1 - z0) * (x2 - x0) - (x1 - x0) * (z2 - z0)
         nz_val = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+        max_e2 = max(
+            (x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2,
+            (x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2,
+            (x0 - x2) ** 2 + (y0 - y2) ** 2 + (z0 - z2) ** 2,
+        )
 
         t_min_x = min(x0, x1, x2)
         t_max_x = max(x0, x1, x2)
@@ -126,12 +133,12 @@ def reference_rasterize(grid, vertices, indices, tol_pad_z_mm=0.05):
             continue
 
         if c_min == c_max and r_min == r_max:
-            top_z = max(z0, z1, z2) + tol_pad_z_mm
+            top_z = z_max + tol_pad_z_mm
             if top_z > grid.H[r_min, c_min]:
                 grid.H[r_min, c_min] = top_z
             continue
 
-        if abs(nz_val) < 1e-7:
+        if abs(nz_val) <= 1e-5 * max_e2:
             for pa, pb in ((v0, v1), (v1, v2), (v2, v0)):
                 dx = pb[0] - pa[0]
                 dy = pb[1] - pa[1]
@@ -160,12 +167,13 @@ def reference_rasterize(grid, vertices, indices, tol_pad_z_mm=0.05):
         e12 = (x2 - x1) * (Y - y1) - (y2 - y1) * (X - x1)
         e20 = (x0 - x2) * (Y - y2) - (y0 - y2) * (X - x2)
 
-        eps = 1e-4
+        eps = 1e-5 * abs(nz_val)
         inside = ((e01 >= -eps) & (e12 >= -eps) & (e20 >= -eps)) | ((e01 <= eps) & (e12 <= eps) & (e20 <= eps))
         if not np.any(inside):
             continue
 
-        Z = z0 - (nx_val * (X - x0) + ny_val * (Y - y0)) / nz_val + tol_pad_z_mm
+        Z_plane = z0 - (nx_val * (X - x0) + ny_val * (Y - y0)) / nz_val
+        Z = np.where(np.isfinite(Z_plane), np.clip(Z_plane, z_min, z_max), z_max) + tol_pad_z_mm
         sub_h = grid.H[r_min : r_max + 1, c_min : c_max + 1]
         mask = inside & (Z > sub_h)
         sub_h[mask] = Z[mask]

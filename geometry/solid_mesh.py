@@ -373,7 +373,7 @@ def rasterize_triangles_to_grid(
         c_end = min(c_start + chunk_size, total_tris)
         idx_chunk = indices[c_start:c_end]
 
-        t_verts = vertices[idx_chunk]  # (M, 3, 3)
+        t_verts = vertices[idx_chunk].astype(np.float64, copy=False)  # (M, 3, 3)
         v0 = t_verts[:, 0, :]
         v1 = t_verts[:, 1, :]
         v2 = t_verts[:, 2, :]
@@ -382,9 +382,17 @@ def rasterize_triangles_to_grid(
         x1, y1, z1 = v1[:, 0], v1[:, 1], v1[:, 2]
         x2, y2, z2 = v2[:, 0], v2[:, 1], v2[:, 2]
 
+        tri_z_min = np.minimum(np.minimum(z0, z1), z2)
+        tri_z_max = np.maximum(np.maximum(z0, z1), z2)
+
         nx_val = (y1 - y0) * (z2 - z0) - (z1 - z0) * (y2 - y0)
         ny_val = (z1 - z0) * (x2 - x0) - (x1 - x0) * (z2 - z0)
         nz_val = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+
+        e01_sq = (x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2
+        e12_sq = (x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2
+        e20_sq = (x0 - x2) ** 2 + (y0 - y2) ** 2 + (z0 - z2) ** 2
+        max_e2 = np.maximum(np.maximum(e01_sq, e12_sq), e20_sq)
 
         t_min_x = np.minimum(np.minimum(x0, x1), x2)
         t_max_x = np.maximum(np.maximum(x0, x1), x2)
@@ -406,11 +414,11 @@ def rasterize_triangles_to_grid(
         # Fast path 1: Single-cell triangles
         single_mask = valid & (dr == 0) & (dc == 0)
         if np.any(single_mask):
-            top_z = np.maximum(np.maximum(z0[single_mask], z1[single_mask]), z2[single_mask]) + tol_pad_z_mm
+            top_z = tri_z_max[single_mask] + tol_pad_z_mm
             np.maximum.at(grid.H, (r_min[single_mask], c_min[single_mask]), top_z)
 
-        # Fast path 2: Small multi-cell non-vertical triangles (dr < 6, dc < 6, not single cell)
-        is_vert = np.abs(nz_val) < 1e-7
+        # Fast path 2: Small multi-cell non-vertical/non-sliver triangles (dr < 6, dc < 6, not single cell)
+        is_vert = np.abs(nz_val) <= (1e-5 * max_e2)
         small_multi = valid & ~single_mask & ~is_vert & (dr < 6) & (dc < 6)
 
         if np.any(small_multi):
@@ -422,6 +430,8 @@ def rasterize_triangles_to_grid(
             sub_x0, sub_y0, sub_z0 = x0[small_multi], y0[small_multi], z0[small_multi]
             sub_x1, sub_y1 = x1[small_multi], y1[small_multi]
             sub_x2, sub_y2 = x2[small_multi], y2[small_multi]
+            sub_zmin = tri_z_min[small_multi]
+            sub_zmax = tri_z_max[small_multi]
             sub_nx = nx_val[small_multi]
             sub_ny = ny_val[small_multi]
             sub_nz = nz_val[small_multi]
@@ -449,6 +459,8 @@ def rasterize_triangles_to_grid(
                     sx0, sy0, sz0 = sub_x0[cell_mask], sub_y0[cell_mask], sub_z0[cell_mask]
                     sx1, sy1 = sub_x1[cell_mask], sub_y1[cell_mask]
                     sx2, sy2 = sub_x2[cell_mask], sub_y2[cell_mask]
+                    s_zmin = sub_zmin[cell_mask]
+                    s_zmax = sub_zmax[cell_mask]
                     snx = sub_nx[cell_mask]
                     sny = sub_ny[cell_mask]
                     snz = sub_nz[cell_mask]
@@ -457,15 +469,20 @@ def rasterize_triangles_to_grid(
                     e12 = (sx2 - sx1) * (gy - sy1) - (sy2 - sy1) * (gx - sx1)
                     e20 = (sx0 - sx2) * (gy - sy2) - (sy0 - sy2) * (gx - sx2)
 
-                    eps = 1e-4
+                    eps = 1e-5 * np.abs(snz)
                     inside = ((e01 >= -eps) & (e12 >= -eps) & (e20 >= -eps)) | ((e01 <= eps) & (e12 <= eps) & (e20 <= eps))
                     if not np.any(inside):
                         continue
 
-                    Z = sz0[inside] - (snx[inside] * (gx[inside] - sx0[inside]) + sny[inside] * (gy[inside] - sy0[inside])) / snz[inside] + tol_pad_z_mm
-                    np.maximum.at(grid.H, (r_c[inside], c_cells[inside]), Z)
+                    Z_plane = sz0[inside] - (snx[inside] * (gx[inside] - sx0[inside]) + sny[inside] * (gy[inside] - sy0[inside])) / snz[inside]
+                    Z_clamped = np.where(
+                        np.isfinite(Z_plane),
+                        np.clip(Z_plane, s_zmin[inside], s_zmax[inside]),
+                        s_zmax[inside],
+                    ) + tol_pad_z_mm
+                    np.maximum.at(grid.H, (r_c[inside], c_cells[inside]), Z_clamped)
 
-        # Conservative fallback: Vertical or large triangles (dr >= 6 or dc >= 6)
+        # Conservative fallback: Vertical/sliver or large triangles (dr >= 6 or dc >= 6)
         fallback_mask = valid & ~single_mask & (is_vert | (dr >= 6) | (dc >= 6))
         if np.any(fallback_mask):
             fb_indices = np.where(fallback_mask)[0]
@@ -473,13 +490,15 @@ def rasterize_triangles_to_grid(
                 x0_i, y0_i, z0_i = x0[i], y0[i], z0[i]
                 x1_i, y1_i, z1_i = x1[i], y1[i], z1[i]
                 x2_i, y2_i, z2_i = x2[i], y2[i], z2[i]
+                z_min_i = tri_z_min[i]
+                z_max_i = tri_z_max[i]
                 c_min_i = int(c_min[i])
                 c_max_i = int(c_max[i])
                 r_min_i = int(r_min[i])
                 r_max_i = int(r_max[i])
                 nz_i = nz_val[i]
 
-                if abs(nz_i) < 1e-7:
+                if is_vert[i]:
                     for pa, pb in (((x0_i, y0_i, z0_i), (x1_i, y1_i, z1_i)),
                                    ((x1_i, y1_i, z1_i), (x2_i, y2_i, z2_i)),
                                    ((x2_i, y2_i, z2_i), (x0_i, y0_i, z0_i))):
@@ -510,15 +529,20 @@ def rasterize_triangles_to_grid(
                 e12 = (x2_i - x1_i) * (Y - y1_i) - (y2_i - y1_i) * (X - x1_i)
                 e20 = (x0_i - x2_i) * (Y - y2_i) - (y0_i - y2_i) * (X - x2_i)
 
-                eps = 1e-4
+                eps = 1e-5 * abs(nz_i)
                 inside = ((e01 >= -eps) & (e12 >= -eps) & (e20 >= -eps)) | ((e01 <= eps) & (e12 <= eps) & (e20 <= eps))
                 if not np.any(inside):
                     continue
 
-                Z = z0_i - (nx_val[i] * (X - x0_i) + ny_val[i] * (Y - y0_i)) / nz_i + tol_pad_z_mm
+                Z_plane = z0_i - (nx_val[i] * (X - x0_i) + ny_val[i] * (Y - y0_i)) / nz_i
+                Z_clamped = np.where(
+                    np.isfinite(Z_plane),
+                    np.clip(Z_plane, z_min_i, z_max_i),
+                    z_max_i,
+                ) + tol_pad_z_mm
                 sub_h = grid.H[r_min_i : r_max_i + 1, c_min_i : c_max_i + 1]
-                mask = inside & (Z > sub_h)
-                sub_h[mask] = Z[mask]
+                mask = inside & (Z_clamped > sub_h)
+                sub_h[mask] = Z_clamped[mask]
 
 
 def revolve_mesh_to_lathe_stock(

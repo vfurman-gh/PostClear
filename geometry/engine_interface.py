@@ -80,17 +80,19 @@ class BaseVerificationEngine(IVerificationEngine):
     vector occurrence gating, MRR spike detection, and report compilation.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, min_mrr_duration_sec: float = 0.05) -> None:
         self.workpiece: Optional[WorkpieceDefinition] = None
         self.active_tool: Optional[ToolAssembly] = None
         self.current_time_sec: float = 0.0
         self.total_machining_time_sec: float = 0.0
         self.total_volume_removed_mm3: float = 0.0
+        self.min_mrr_duration_sec: float = max(1e-4, float(min_mrr_duration_sec))
         self.collisions: List[CollisionRecord] = []
         self.mrr_timeline: List[MRRSample] = []
         self.promoted_events: Set[PromotedEventKey] = set()
         self._blocked_events: Set[PromotedEventKey] = set()
         self.operation_names: List[str] = []
+        self.holder_unchecked_ops: Set[str] = set()
 
     def _reset_base_state(self, workpiece: WorkpieceDefinition) -> None:
         """Reset the shared timing, collision, MRR, and vector occurrence collections."""
@@ -104,6 +106,7 @@ class BaseVerificationEngine(IVerificationEngine):
         self.promoted_events.clear()
         self._blocked_events.clear()
         self.operation_names.clear()
+        self.holder_unchecked_ops.clear()
 
     def _promotion_blocked(self, move: MotionSegment) -> bool:
         """
@@ -159,14 +162,15 @@ class BaseVerificationEngine(IVerificationEngine):
         op_id: str = "",
     ) -> MRRSample:
         """Record volumetric removal rate sample in timeline."""
-        dur = max(1e-4, float(duration_sec))
-        mrr_rate = (volume_removed_mm3 / dur) * 60.0
+        raw_dur = max(1e-4, float(duration_sec))
+        eff_dur = max(self.min_mrr_duration_sec, raw_dur)
+        mrr_rate = (volume_removed_mm3 / eff_dur) * 60.0
         # self.current_time_sec has been advanced by dur at the beginning of step();
         # compute start time so timestamp_sec reflects the actual beginning of the cut.
         t_sample_start = max(0.0, self.current_time_sec - max(0.0, float(duration_sec)))
         sample = MRRSample(
             timestamp_sec=t_sample_start,
-            duration_sec=dur,
+            duration_sec=raw_dur,
             segment_id=segment_id,
             tool_id=self.active_tool.tool_id if self.active_tool else 0,
             volume_removed_mm3=volume_removed_mm3,
@@ -202,7 +206,51 @@ class BaseVerificationEngine(IVerificationEngine):
                 op_vol = sum(s.volume_removed_mm3 for s in op_samples)
                 op_mean_mrr = (op_vol / op_dur) * 60.0 if op_dur > 0.0 else 0.0
                 threshold = op_mean_mrr * 2.5
-                op_spikes = [s for s in op_samples if s.mrr_rate_mm3_per_min > threshold]
+
+                # Aggregate consecutive sub-floor samples into windows >= min_mrr_duration_sec
+                # so short ~0.1 ms moves cannot generate unphysical spike rates.
+                op_spikes: List[MRRSample] = []
+                win_samples: List[MRRSample] = []
+                win_dur = 0.0
+                win_vol = 0.0
+
+                def _flush_window() -> None:
+                    nonlocal win_samples, win_dur, win_vol
+                    if not win_samples:
+                        return
+                    if win_dur >= self.min_mrr_duration_sec:
+                        win_rate = (win_vol / win_dur) * 60.0
+                        if win_rate > threshold:
+                            rep = max(win_samples, key=lambda x: x.volume_removed_mm3)
+                            op_spikes.append(
+                                MRRSample(
+                                    timestamp_sec=win_samples[0].timestamp_sec,
+                                    duration_sec=win_dur,
+                                    segment_id=rep.segment_id,
+                                    tool_id=rep.tool_id,
+                                    volume_removed_mm3=win_vol,
+                                    mrr_rate_mm3_per_min=win_rate,
+                                    depth_of_cut_mm=max(x.depth_of_cut_mm for x in win_samples),
+                                    op_id=rep.op_id,
+                                )
+                            )
+                    win_samples = []
+                    win_dur = 0.0
+                    win_vol = 0.0
+
+                for s in op_samples:
+                    if s.duration_sec >= self.min_mrr_duration_sec:
+                        _flush_window()
+                        if s.mrr_rate_mm3_per_min > threshold:
+                            op_spikes.append(s)
+                    else:
+                        win_samples.append(s)
+                        win_dur += s.duration_sec
+                        win_vol += s.volume_removed_mm3
+                        if win_dur >= self.min_mrr_duration_sec:
+                            _flush_window()
+                _flush_window()
+
                 sorted_op = sorted(op_spikes, key=lambda s: s.mrr_rate_mm3_per_min, reverse=True)[:3]
                 top_spikes.extend(sorted_op)
 
@@ -217,4 +265,5 @@ class BaseVerificationEngine(IVerificationEngine):
             mrr_timeline=list(self.mrr_timeline),
             mrr_spikes=spikes,
             operation_names=list(getattr(self, "operation_names", [])),
+            holder_unchecked_ops=sorted(str(x) for x in getattr(self, "holder_unchecked_ops", ())),
         )

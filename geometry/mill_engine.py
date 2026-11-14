@@ -20,6 +20,7 @@ __all__ = [
 ]
 from .models import (
     CollisionRecord,
+    MillToolGeometry,
     MotionKind,
     MotionSegment,
     MoveEvaluation,
@@ -54,6 +55,7 @@ class MillClearanceVerifier(IVerificationEngine):
         self.all_collisions: List[CollisionRecord] = []
         self.promoted_events: Set[PromotedEventKey] = set()
         self._blocked_events: Set[PromotedEventKey] = set()
+        self.holder_unchecked_ops: Set[str] = set()
 
     def reset(self, workpiece: WorkpieceDefinition) -> None:
         """Initialize or reset the workpiece state and per-section clearance cache."""
@@ -67,6 +69,7 @@ class MillClearanceVerifier(IVerificationEngine):
         self.all_collisions.clear()
         self.promoted_events.clear()
         self._blocked_events.clear()
+        self.holder_unchecked_ops.clear()
 
     def reset_workpiece(self, workpiece: WorkpieceDefinition) -> None:
         """Alias for reset() for backwards compatibility."""
@@ -153,6 +156,15 @@ class MillClearanceVerifier(IVerificationEngine):
         sec_idx = meta.get("sec_idx", segment.sec_id)
         event_idx = meta.get("event_idx", segment.segment_id)
 
+        active_tool = tool if tool is not None else self.active_tool
+        geom = getattr(active_tool, "geometry", None)
+        if isinstance(geom, MillToolGeometry):
+            raw_sections = getattr(geom, "holder_sections", None) or []
+            has_sections = any(float(s[0]) >= 0.0 and float(s[1]) > 0.0 for s in raw_sections)
+            if not has_sections and float(geom.holder_diameter) <= 0.0:
+                op_label = segment.op_id if segment.op_id else f"Section_{segment.sec_id}"
+                self.holder_unchecked_ops.add(op_label)
+
         if segment.motion == MotionKind.RAPID:
             top_z = max(segment.start.z, segment.end.z)
             prev_z = self._sec_clearance_mm.get(segment.sec_id)
@@ -216,6 +228,7 @@ class MillClearanceVerifier(IVerificationEngine):
             promoted_events=set(self.promoted_events),
             mrr_timeline=[],
             mrr_spikes=[],
+            holder_unchecked_ops=sorted(str(x) for x in getattr(self, "holder_unchecked_ops", ())),
         )
 
     def verify_toolpath(

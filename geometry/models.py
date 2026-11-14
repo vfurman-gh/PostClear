@@ -185,6 +185,10 @@ class MillToolGeometry:
     taper_angle_deg: float = 0.0
     holder_diameter: float = 40.0
     holder_length: float = 60.0
+    body_length: float = 0.0       # mm, length below holder; <=0 unknown -> fall back to overall_length
+    shoulder_length: float = 0.0
+    shaft_diameter: float = 0.0    # <=0 -> same as cutter diameter
+    holder_sections: Optional[List[Tuple[float, float]]] = None  # [(length_mm, diameter_mm)] stacked upward from holder bottom
 
 
 ToolGeometry = Union[LatheToolGeometry, MillToolGeometry]
@@ -272,3 +276,8 @@ class VerificationReport:
     toolpath_bounding_box: Optional[str] = None
     dog_leg_warning: Optional[str] = None
     fixture_warning: Optional[str] = None
+    frame_warnings: List[str] = field(default_factory=list)
+    frame_mismatch_ops: List[str] = field(default_factory=list)
+    tilted_ops: List[str] = field(default_factory=list)
+    multi_axis_ops: List[str] = field(default_factory=list)
+    holder_unchecked_ops: List[str] = field(default_factory=list)

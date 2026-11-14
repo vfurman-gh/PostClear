@@ -475,8 +475,8 @@ def generate_mill_verification_plot(
         cy = float(np.clip(col.contact_point.y * scale, sy_min - pad_y, sy_max + pad_y))
         cz = float(col.contact_point.z * scale)
         if grid is not None and hasattr(grid, "H") and grid.H is not None:
-            c_idx = int(round((cx / scale - grid.grid_x_min) / grid.cell_size_mm))
-            r_idx = int(round((cy / scale - grid.grid_y_min) / grid.cell_size_mm))
+            c_idx = int(math.floor((cx / scale - grid.grid_x_min) / grid.cell_size_mm))
+            r_idx = int(math.floor((cy / scale - grid.grid_y_min) / grid.cell_size_mm))
             if 0 <= r_idx < grid.ny and 0 <= c_idx < grid.nx:
                 cz = max(cz, float(grid.H[r_idx, c_idx] * scale))
 
@@ -504,8 +504,8 @@ def generate_mill_verification_plot(
 
             # Query the actual surface depth in the heightfield grid at this cut location:
             if grid is not None and hasattr(grid, "H") and grid.H is not None:
-                c_idx = int(round((mx / scale - grid.grid_x_min) / grid.cell_size_mm))
-                r_idx = int(round((my / scale - grid.grid_y_min) / grid.cell_size_mm))
+                c_idx = int(math.floor((mx / scale - grid.grid_x_min) / grid.cell_size_mm))
+                r_idx = int(math.floor((my / scale - grid.grid_y_min) / grid.cell_size_mm))
                 if 0 <= r_idx < grid.ny and 0 <= c_idx < grid.nx:
                     surf_z = float(grid.H[r_idx, c_idx] * scale)
                     mz = max(float(seg.end.z * scale), surf_z)

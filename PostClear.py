@@ -90,6 +90,18 @@ def _SetDebugLogEnabled(enabled: bool) -> None:
     """Enable or disable diagnostic file logging to _LOG_PATH."""
     global _debug_log_enabled
     _debug_log_enabled = bool(enabled)
+    # Ensure sibling modules (`from PostClear import _dbg_global`) resolve to this
+    # live add-in module instance even when Fusion loads the entry script under a
+    # dynamic loader module name rather than "PostClear".
+    cur_mod = sys.modules.get(__name__)
+    if cur_mod is not None:
+        existing = sys.modules.get("PostClear")
+        if existing is not None and existing is not cur_mod:
+            try:
+                existing._debug_log_enabled = _debug_log_enabled
+            except Exception:
+                pass
+        sys.modules["PostClear"] = cur_mod
 
 
 def _RotateLogIfNeeded(log_path: str = _LOG_PATH, max_bytes: int = _MAX_LOG_SIZE_BYTES) -> None:
@@ -115,6 +127,10 @@ def _dbg_global(msg):
             f.flush()
     except Exception:
         pass
+
+
+if __name__ != "PostClear" and __name__ in sys.modules:
+    sys.modules.setdefault("PostClear", sys.modules[__name__])
 
 
 def _ReadAddinManifestVersion() -> str:
@@ -4059,16 +4075,27 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
             except Exception:
                 pass
 
+        extra_warnings = []
         if getattr(report, "fixture_warning", None):
-            _dbg(f"Pass 2: WARNING: {report.fixture_warning} in setup {setup.name}!")
+            extra_warnings.append(report.fixture_warning)
+        for fw in (getattr(report, "frame_warnings", None) or []):
+            extra_warnings.append(fw)
+        tilted_ops = getattr(report, "tilted_ops", None) or []
+        if tilted_ops:
+            extra_warnings.append(f"Tilted work plane not verified: {', '.join(tilted_ops)}")
+        multi_axis_ops = getattr(report, "multi_axis_ops", None) or []
+        if multi_axis_ops:
+            extra_warnings.append(f"Multi-axis simultaneous not verified: {', '.join(multi_axis_ops)}")
+        for ew in extra_warnings:
+            _dbg(f"Pass 2: WARNING: {ew} in setup {setup.name}!")
             try:
-                adsk.core.Application.get().log(f"[PostClear] WARNING: {report.fixture_warning} in setup {setup.name}!")
+                adsk.core.Application.get().log(f"[PostClear] WARNING: {ew} in setup {setup.name}!")
             except Exception:
                 pass
-            if warning_msg:
-                warning_msg += f"; {report.fixture_warning}"
-            else:
-                warning_msg = report.fixture_warning
+            warning_msg = f"{warning_msg}; {ew}" if warning_msg else ew
+        holder_unchecked = getattr(report, "holder_unchecked_ops", None) or []
+        if holder_unchecked:
+            _dbg(f"Pass 2: NOTE: holder not checked for {', '.join(holder_unchecked)} in setup {setup.name}.")
 
         _notify_p("Setup completed.", 1.0)
 

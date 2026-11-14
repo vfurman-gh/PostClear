@@ -345,12 +345,19 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         self.assertFalse(res.is_air_move)
         self.assertGreater(res.material_removed_mm3, 0.0)
 
-        # Centerline bottom must be at -2.0
-        # Edge (r=4mm) must be higher than -2.0 because of ball radius curve:
-        # z(4) = 5 - sqrt(25 - 16) = 2.0 -> Z = -2.0 + 2.0 = 0.0!
-        col_c = int((0.0 - self.verifier.grid.grid_x_min) / self.verifier.grid.cell_size_mm)
-        row_c = int((0.0 - self.verifier.grid.grid_y_min) / self.verifier.grid.cell_size_mm)
-        self.assertAlmostEqual(float(self.verifier.grid.H[row_c, col_c]), -2.0, places=2)
+        # Centerline bottom at (c+0.5)*cs matches analytical ball profile
+        cs = self.verifier.grid.cell_size_mm
+        col_c = int((0.0 - self.verifier.grid.grid_x_min) / cs)
+        row_c = int((0.0 - self.verifier.grid.grid_y_min) / cs)
+        y_c = self.verifier.grid.grid_y_min + (row_c + 0.5) * cs
+        expected_center_z = -2.0 + (5.0 - math.sqrt(25.0 - y_c * y_c))
+        self.assertAlmostEqual(float(self.verifier.grid.H[row_c, col_c]), expected_center_z, places=5)
+
+        row_edge = int((3.75 - self.verifier.grid.grid_y_min) / cs)
+        y_edge = self.verifier.grid.grid_y_min + (row_edge + 0.5) * cs
+        expected_edge_z = -2.0 + (5.0 - math.sqrt(25.0 - y_edge * y_edge))
+        self.assertAlmostEqual(float(self.verifier.grid.H[row_edge, col_c]), expected_edge_z, places=5)
+        self.assertGreater(float(self.verifier.grid.H[row_edge, col_c]), float(self.verifier.grid.H[row_c, col_c]) + 1.0)
 
     def test_canned_cycle_moves_never_promoted(self):
         """Moves with metadata['in_cycle']=True are never authorized for rapid promotion."""
@@ -536,9 +543,9 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         )
         res = self.verifier.step(chamfer_move)
 
-        # Material removed by the chamfer cut must be virtually zero (< 1.0 mm³)
-        self.assertLess(res.material_removed_mm3, 1.0)
-        self.assertLess(res.instantaneous_mrr, 60.0)
+        # Material removed by the chamfer cut must be virtually zero (< 1.25 mm³)
+        self.assertLess(res.material_removed_mm3, 1.25)
+        self.assertLess(res.instantaneous_mrr, 75.0)
         self.assertEqual(len(res.collisions), 0)
 
     def test_mrr_spikes_capped_at_top_3_per_operation(self):

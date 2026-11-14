@@ -3534,6 +3534,376 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 PostClear.handlers[:] = saved_handlers
                 PostClear.settingsMgr = saved_settings_mgr
 
+    def test_dynamic_loader_module_name_routes_dbg_global(self):
+        """Verify _SetDebugLogEnabled registers the active module as sys.modules['PostClear'] when loaded under a dynamic name."""
+        import importlib.util
+        import context_parser
+        import pipeline
+        from geometry import solid_mesh
+
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        saved_mod = sys.modules.get("PostClear")
+        dyn_name = "_fusion_runner_PostClear_entry"
+        try:
+            sys.modules.pop("PostClear", None)
+            pc_path = os.path.join(repo_dir, "PostClear.py")
+            spec = importlib.util.spec_from_file_location(dyn_name, pc_path)
+            dyn_mod = importlib.util.module_from_spec(spec)
+            sys.modules[dyn_name] = dyn_mod
+            spec.loader.exec_module(dyn_mod)
+
+            # Even before _SetDebugLogEnabled, module load registers fallback alias
+            self.assertIs(sys.modules.get("PostClear"), dyn_mod)
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                temp_log = os.path.join(tmp_dir, "postclear_debug.log")
+                dyn_mod._LOG_PATH = temp_log
+                dyn_mod._SetDebugLogEnabled(True)
+
+                solid_mesh._dbg("dyn-mesh-trace")
+                context_parser.extract_workpiece_from_context({"stockMode": "default"})
+
+                dummy_post = os.path.join(tmp_dir, "post_stub")
+                dummy_dump = os.path.join(tmp_dir, "dump.json")
+                with open(dummy_post, "w", encoding="utf-8") as f:
+                    f.write("stub")
+                with open(dummy_dump, "w", encoding="utf-8") as f:
+                    json.dump({"unit": 1, "workpiece": {"lower": {"x": 0, "y": 0, "z": -5}, "upper": {"x": 10, "y": 10, "z": 0}}, "sections": []}, f)
+                orch = pipeline.PipelineOrchestrator(post_bin=dummy_post)
+                with patch.object(orch, "replay_combined_context", return_value="M30\n"):
+                    orch.run(context_dump_paths=[dummy_dump], base_post_path=dummy_post, bootstrap_cnc_path=dummy_post)
+
+                self.assertTrue(os.path.isfile(temp_log))
+                with open(temp_log, "r", encoding="utf-8") as f:
+                    text = f.read()
+                self.assertIn("dyn-mesh-trace", text)
+                self.assertIn("extract_workpiece_from_context:", text)
+                self.assertIn("PipelineOrchestrator.run: workpiece stock=", text)
+        finally:
+            sys.modules.pop(dyn_name, None)
+            if saved_mod is not None:
+                sys.modules["PostClear"] = saved_mod
+
+    def test_patterned_rotated_section_stl_overlap_and_3axis_replay(self):
+        """Regression test for patterned 180-deg Z-rotated operations (ButtRouter Bottom setup) with STL stock and 3-axis setRotation replay."""
+        import struct
+        from pipeline import PipelineOrchestrator, find_autodesk_post_binary
+
+        def _write_box_stl(path: str, x0: float, x1: float, y0: float, y1: float, z0: float, z1: float) -> None:
+            verts = [
+                (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+                (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+            ]
+            tris = [
+                (0, 2, 1), (0, 3, 2),
+                (4, 5, 6), (4, 6, 7),
+                (0, 1, 5), (0, 5, 4),
+                (2, 3, 7), (2, 7, 6),
+                (0, 4, 7), (0, 7, 3),
+                (1, 2, 6), (1, 6, 5),
+            ]
+            with open(path, "wb") as f:
+                f.write(b"\x00" * 80)
+                f.write(struct.pack("<I", len(tris)))
+                for i0, i1, i2 in tris:
+                    f.write(struct.pack("<3f", 0.0, 0.0, 0.0))
+                    for idx in (i0, i1, i2):
+                        f.write(struct.pack("<3f", *verts[idx]))
+                    f.write(struct.pack("<H", 0))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            stl_path = os.path.join(tmp_dir, "Bottom_stock.stl")
+            # Inches STL matching ButtRouter stock: [-0.5, 25.5] x [-0.231, 5.268] x [-0.1, 0.865] in
+            _write_box_stl(stl_path, -0.5, 25.5, -0.231, 5.268, -0.1, 0.865)
+
+            tool_dict = {
+                "number": 1,
+                "type": 9,
+                "diameter": 0.5,
+                "fluteLength": 1.25,
+                "bodyLength": 1.75,
+                "overallLength": 3.0,
+                "shaftDiameter": 0.5,
+                "cornerRadius": 0.0,
+                "spindleRPM": 18000,
+                "clockwise": True,
+            }
+            ctx_data = {
+                "unit": 0,  # inches
+                "stockUnit": "in",
+                "stockMode": "previous-setup",
+                "stockPath": stl_path,
+                "workpieceHint": {
+                    "lower": {"x": -0.5, "y": -0.231, "z": -0.1},
+                    "upper": {"x": 25.5, "y": 5.268, "z": 0.865},
+                },
+                "workpiece": {
+                    "lower": {"x": -0.5, "y": -0.231, "z": -0.1},
+                    "upper": {"x": 25.5, "y": 5.268, "z": 0.865},
+                },
+                "programName": "Bottom",
+                "programComment": "",
+                "globalParams": {},
+                "comments": [],
+                "sections": [
+                    {
+                        "id": 0,
+                        "type": 0,
+                        "workOffset": 1,
+                        "wcs": "G54",
+                        "workOrigin": {"x": 0.0, "y": 0.0, "z": 0.0},
+                        "workPlane": {
+                            "right": {"x": 1.0, "y": 0.0, "z": 0.0},
+                            "up": {"x": 0.0, "y": 1.0, "z": 0.0},
+                            "forward": {"x": 0.0, "y": 0.0, "z": 1.0},
+                        },
+                        "initialPosition": {"x": 0.5, "y": 0.5, "z": 1.465},
+                        "finalPosition": {"x": 11.4817, "y": 5.0, "z": 1.465},
+                        "endPos": {"x": 11.4817, "y": 5.0, "z": 1.465},
+                        "initSpindleSpeed": 18000,
+                        "endSpindleSpeed": 18000,
+                        "initMovement": 0,
+                        "initRadiusComp": 0,
+                        "params": {"operation-comment": "2D Contour1", "operation:zClearance": 1.465},
+                        "tool": tool_dict,
+                        "postComments": [],
+                        "events": [
+                            {"type": "onLinear", "sx": 0.5, "sy": 0.5, "sz": 1.465, "x": 0.5, "y": 0.5, "z": -0.1, "feed": 54.0, "movement": 3, "rc": 0, "rpm": 18000},
+                            {"type": "onLinear", "sx": 0.5, "sy": 0.5, "sz": -0.1, "x": 11.4817, "y": 5.0, "z": -0.1, "feed": 90.0, "movement": 1, "rc": 0, "rpm": 18000},
+                            {"type": "onLinear", "sx": 11.4817, "sy": 5.0, "sz": -0.1, "x": 11.4817, "y": 5.0, "z": 1.465, "feed": 90.0, "movement": 0, "rc": 0, "rpm": 18000},
+                        ],
+                    },
+                    {
+                        "id": 1,
+                        "type": 0,
+                        "workOffset": 1,
+                        "wcs": "G54",
+                        "isPatterned": True,
+                        "patternId": 1,
+                        "numberOfPatternInstances": 2,
+                        "workOrigin": {"x": 0.0, "y": 0.0, "z": 0.0},
+                        "workPlane": {
+                            "right": {"x": -1.0, "y": 0.0, "z": 0.0},
+                            "up": {"x": 0.0, "y": -1.0, "z": 0.0},
+                            "forward": {"x": 0.0, "y": 0.0, "z": 1.0},
+                        },
+                        "initialPosition": {"x": -11.5109, "y": 0.0243, "z": 1.465},
+                        "finalPosition": {"x": -23.3052, "y": -5.0, "z": 1.465},
+                        "endPos": {"x": -23.3052, "y": -5.0, "z": 1.465},
+                        "initSpindleSpeed": 18000,
+                        "endSpindleSpeed": 18000,
+                        "initMovement": 0,
+                        "initRadiusComp": 0,
+                        "params": {"operation-comment": "2D Contour1", "operation:zClearance": 1.465},
+                        "tool": tool_dict,
+                        "postComments": [],
+                        "events": [
+                            {"type": "onLinear", "sx": -11.5109, "sy": 0.0243, "sz": 1.465, "x": -11.5109, "y": 0.0243, "z": 1.1, "feed": 90.0, "movement": 0, "rc": 0, "rpm": 18000},
+                            {"type": "onLinear", "sx": -11.5109, "sy": 0.0243, "sz": 1.1, "x": -11.5109, "y": 0.0243, "z": -0.1, "feed": 54.0, "movement": 3, "rc": 0, "rpm": 18000},
+                            {"type": "onCircular", "cw": True, "sx": -11.5109, "sy": 0.0243, "sz": -0.1, "cx": -12.0, "cy": 0.0243, "cz": -0.1, "x": -12.0, "y": -0.4648, "z": -0.1, "feed": 90.0, "plane": 0, "radius": 0.4891, "sweep": 1.5708, "nx": 0.0, "ny": 0.0, "nz": 1.0, "fullCircle": False, "helical": False, "spiral": False, "movement": 1, "rc": 0, "rpm": 18000, "linearizedMoves": []},
+                            {"type": "onCircular", "cw": False, "sx": -12.0, "sy": -0.4648, "sz": -0.1, "cx": -12.1, "cy": -0.4648, "cz": -0.1, "x": -12.1, "y": -0.4648, "z": 0.0, "feed": 90.0, "plane": 1, "radius": 0.1, "sweep": 1.5708, "nx": 0.0, "ny": 1.0, "nz": 0.0, "fullCircle": False, "helical": False, "spiral": False, "movement": 5, "rc": 0, "rpm": 18000, "linearizedMoves": [{"x": -12.0707, "y": -0.4648, "z": -0.0293, "feed": 90.0, "movement": 5}, {"x": -12.1, "y": -0.4648, "z": 0.0, "feed": 90.0, "movement": 5}]},
+                            {"type": "onLinear", "sx": -12.1, "sy": -0.4648, "sz": 0.0, "x": -23.3052, "y": -5.0, "z": 0.0, "feed": 90.0, "movement": 1, "rc": 0, "rpm": 18000},
+                            {"type": "onLinear", "sx": -23.3052, "sy": -5.0, "sz": 0.0, "x": -23.3052, "y": -5.0, "z": 1.465, "feed": 90.0, "movement": 0, "rc": 0, "rpm": 18000},
+                        ],
+                    },
+                ],
+            }
+            ctx_path = os.path.join(tmp_dir, "bottom_ctx.json")
+            with open(ctx_path, "w", encoding="utf-8") as f:
+                json.dump(ctx_data, f)
+
+            # Minimal 3-axis vendor post mirroring shopbot.cps/defineWorkPlane.cpi setRotation(currentSection.workPlane)
+            vendor_3ax_cps = os.path.join(tmp_dir, "vendor_3ax.cps")
+            with open(vendor_3ax_cps, "w", encoding="utf-8") as f:
+                f.write(
+                    'description = "Vendor3Axis";\n'
+                    'vendor = "Test";\n'
+                    'certificationLevel = 2;\n'
+                    'extension = "sbp";\n'
+                    'capabilities = CAPABILITY_MILLING;\n'
+                    'allowedCircularPlanes = undefined;\n'
+                    'var fmt = createFormat({decimals: 4});\n'
+                    'function onSection() {\n'
+                    '  setRotation(currentSection.workPlane);\n'
+                    '  var ip = getFramePosition(currentSection.getInitialPosition());\n'
+                    '  writeln("INIT," + fmt.format(ip.x) + "," + fmt.format(ip.y) + "," + fmt.format(ip.z));\n'
+                    '}\n'
+                    'function onRapid(x, y, z) { writeln("J3," + fmt.format(x) + "," + fmt.format(y) + "," + fmt.format(z)); }\n'
+                    'function onLinear(x, y, z, feed) { writeln("M3," + fmt.format(x) + "," + fmt.format(y) + "," + fmt.format(z)); }\n'
+                    'function onCircular(cw, cx, cy, cz, x, y, z, feed) {\n'
+                    '  if (getCircularPlane() === PLANE_XY) {\n'
+                    '    var s = getCurrentPosition();\n'
+                    '    writeln("CG," + fmt.format(x) + "," + fmt.format(y) + "," + fmt.format(cx - s.x) + "," + fmt.format(cy - s.y) + "," + (cw ? 1 : -1));\n'
+                    '  } else {\n'
+                    '    linearize(0.002);\n'
+                    '  }\n'
+                    '}\n'
+                )
+
+            # 3+2 tilted-workplane vendor post (G68.2 without setRotation) must keep section-local coordinates
+            vendor_twp_cps = os.path.join(tmp_dir, "vendor_twp.cps")
+            with open(vendor_twp_cps, "w", encoding="utf-8") as f:
+                f.write(
+                    'description = "VendorTWP";\n'
+                    'vendor = "Test";\n'
+                    'certificationLevel = 2;\n'
+                    'extension = "nc";\n'
+                    'capabilities = CAPABILITY_MILLING;\n'
+                    'var fmt = createFormat({decimals: 4});\n'
+                    'function onSection() {\n'
+                    '  cancelTransformation();\n'
+                    '  writeln("G68.2");\n'
+                    '}\n'
+                    'function onRapid(x, y, z) { writeln("G0 X" + fmt.format(x) + " Y" + fmt.format(y) + " Z" + fmt.format(z)); }\n'
+                    'function onLinear(x, y, z, feed) { writeln("G1 X" + fmt.format(x) + " Y" + fmt.format(y) + " Z" + fmt.format(z)); }\n'
+                    'function onCircular(cw, cx, cy, cz, x, y, z, feed) { linearize(0.002); }\n'
+                )
+
+            repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            post_bin = find_autodesk_post_binary()
+            bootstrap_cnc = os.path.join(repo_dir, "tests", "fixtures", "milling_drill_test.cnc")
+            if post_bin and os.path.isfile(bootstrap_cnc):
+                orch = PipelineOrchestrator(
+                    post_bin=post_bin,
+                    dumper_cps=os.path.join(repo_dir, "universal_dumper.cps"),
+                    replayer_cps=os.path.join(repo_dir, "universal_replayer.cps"),
+                )
+                out_3ax = os.path.join(tmp_dir, "Bottom.sbp")
+                report, nc_text = orch.run(
+                    context_dump_paths=[ctx_path],
+                    base_post_path=vendor_3ax_cps,
+                    bootstrap_cnc_path=bootstrap_cnc,
+                    final_cnc_path=out_3ax,
+                    promote=True,
+                )
+                self.assertGreater(report.total_volume_removed_mm3, 0.0)
+                # Both sec 0 retract and sec 1 high air approach + retract should promote cleanly
+                self.assertIn((0, 2), report.promoted_events)
+                self.assertIn((1, 0), report.promoted_events)
+                self.assertIn((1, 5), report.promoted_events)
+
+                # Verify 3-axis output has rotated positive Setup WCS coordinates matching INIT
+                self.assertIn("INIT,11.5109,-0.0243,1.465", nc_text)
+                self.assertIn("J3,11.5109,-0.0243,1.1", nc_text)
+                self.assertIn("CG,12,0.4648,0.4891,0,1", nc_text)
+                self.assertIn("M3,12.0707,0.4648,-0.0293", nc_text)
+                self.assertIn("J3,23.3052,5,1.465", nc_text)
+                self.assertNotIn("-11.5109", nc_text)
+                self.assertNotIn("-23.3052", nc_text)
+
+                # R1 fail-closed: G68.2 post calling cancelTransformation() sets post rotation=I while
+                # section workPlane is 180-deg rotated, so promotions are suppressed and frame_warnings recorded.
+                out_twp = os.path.join(tmp_dir, "Bottom_twp.nc")
+                twp_report, twp_text = orch.run(
+                    context_dump_paths=[ctx_path],
+                    base_post_path=vendor_twp_cps,
+                    bootstrap_cnc_path=bootstrap_cnc,
+                    final_cnc_path=out_twp,
+                    promote=True,
+                )
+                self.assertIn("G1 X-11.5109 Y0.0243 Z1.1", twp_text)
+                self.assertIn("G1 X-23.3052 Y-5 Z1.465", twp_text)
+                self.assertGreaterEqual(len(getattr(twp_report, "frame_warnings", [])), 1)
+            else:
+                # Offline/CI fallback without Autodesk post binary: verify PipelineOrchestrator H4 + IPW promotion
+                dummy_post = os.path.join(tmp_dir, "post_stub")
+                with open(dummy_post, "w", encoding="utf-8") as f:
+                    f.write("stub")
+                orch = PipelineOrchestrator(post_bin=dummy_post)
+                with patch.object(orch, "replay_combined_context", return_value="M30\n"):
+                    report, _ = orch.run(
+                        context_dump_paths=[ctx_path],
+                        base_post_path=vendor_3ax_cps,
+                        bootstrap_cnc_path=vendor_3ax_cps,
+                        promote=True,
+                    )
+                self.assertGreater(report.total_volume_removed_mm3, 0.0)
+                self.assertIn((1, 0), report.promoted_events)
+
+    def test_asymmetric_90deg_rotation_and_work_origin_transform(self):
+        """Verify non-symmetric 90-deg Z rotation + workOrigin translation on rapid, linear, circular (ZX->YZ + cw flip), cycle, and dwell."""
+        from context_parser import parse_context_dump
+        from geometry.models import MotionKind
+
+        # 90 deg CCW Z rotation: right=(0,1,0), up=(-1,0,0), forward=(0,0,1)
+        # p_wcs = [(-y + 100), (x + 200), (z + 50)]
+        ctx = {
+            "unit": 1,  # mm
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "workOrigin": {"x": 100.0, "y": 200.0, "z": 50.0},
+                    "workPlane": {
+                        "right": {"x": 0.0, "y": 1.0, "z": 0.0},
+                        "up": {"x": -1.0, "y": 0.0, "z": 0.0},
+                        "forward": {"x": 0.0, "y": 0.0, "z": 1.0},
+                    },
+                    "initialPosition": {"x": 10.0, "y": 20.0, "z": 5.0},
+                    "params": {"operation-comment": "Rot90Op", "operation:zClearance": 15.0},
+                    "tool": {"number": 1, "type": 9, "diameter": 6.0},
+                    "events": [
+                        {"type": "onDwell", "sec": 0.5},
+                        {"type": "onRapid", "sx": 10.0, "sy": 20.0, "sz": 5.0, "x": 10.0, "y": 20.0, "z": 2.0, "rpm": 12000},
+                        {"type": "onLinear", "sx": 10.0, "sy": 20.0, "sz": 2.0, "x": 30.0, "y": 20.0, "z": -1.0, "feed": 500.0, "rpm": 12000},
+                        # ZX arc with nx=0, ny=1, nz=0, cw=False -> rotated normal is (-1,0,0) -> YZ plane with cw flipped to True!
+                        {
+                            "type": "onCircular",
+                            "cw": False,
+                            "sx": 30.0, "sy": 20.0, "sz": -1.0,
+                            "cx": 31.0, "cy": 20.0, "cz": -1.0,
+                            "x": 31.0, "y": 20.0, "z": 0.0,
+                            "feed": 500.0,
+                            "plane": 1,
+                            "radius": 1.0,
+                            "sweep": 1.5708,
+                            "nx": 0.0, "ny": 1.0, "nz": 0.0,
+                        },
+                        {
+                            "type": "onCyclePoint",
+                            "x": 10.0, "y": 20.0, "z": -5.0,
+                            "sx": 31.0, "sy": 20.0, "sz": 5.0,
+                            "expandedMoves": [
+                                {"type": "onRapid", "sx": 31.0, "sy": 20.0, "sz": 5.0, "x": 10.0, "y": 20.0, "z": 5.0, "rpm": 12000},
+                                {"type": "onLinear", "sx": 10.0, "sy": 20.0, "sz": 5.0, "x": 10.0, "y": 20.0, "z": -5.0, "feed": 200.0, "rpm": 12000},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+        segs = parse_context_dump(ctx)
+        self.assertEqual(len(segs), 6)
+
+        # 0: onDwell at initialPosition (10, 20, 5) -> (-20+100, 10+200, 5+50) = (80, 210, 55)
+        self.assertEqual(segs[0].motion, MotionKind.DWELL)
+        self.assertAlmostEqual(segs[0].start.x, 80.0)
+        self.assertAlmostEqual(segs[0].start.y, 210.0)
+        self.assertAlmostEqual(segs[0].start.z, 55.0)
+
+        # 1: onRapid to (10, 20, 2) -> (80, 210, 52), z_clearance_mm = 15 + 50 = 65
+        self.assertAlmostEqual(segs[1].end.x, 80.0)
+        self.assertAlmostEqual(segs[1].end.y, 210.0)
+        self.assertAlmostEqual(segs[1].end.z, 52.0)
+        self.assertAlmostEqual(segs[1].metadata["z_clearance_mm"], 65.0)
+
+        # 2: onLinear to (30, 20, -1) -> (80, 230, 49)
+        self.assertAlmostEqual(segs[2].end.x, 80.0)
+        self.assertAlmostEqual(segs[2].end.y, 230.0)
+        self.assertAlmostEqual(segs[2].end.z, 49.0)
+
+        # 3: onCircular ZX cw=False -> YZ cw=True (ARC_CW), center (31,20,-1) -> (80, 231, 49)
+        self.assertEqual(segs[3].motion, MotionKind.ARC_CW)
+        self.assertEqual(segs[3].arc_plane, "YZ")
+        self.assertAlmostEqual(segs[3].arc_center.x, 80.0)
+        self.assertAlmostEqual(segs[3].arc_center.y, 231.0)
+        self.assertAlmostEqual(segs[3].arc_center.z, 49.0)
+
+        # 4-5: expanded cycle moves -> (80, 210, 45)
+        self.assertAlmostEqual(segs[5].end.x, 80.0)
+        self.assertAlmostEqual(segs[5].end.y, 210.0)
+        self.assertAlmostEqual(segs[5].end.z, 45.0)
+
 
 if __name__ == "__main__":
     unittest.main()

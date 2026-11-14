@@ -163,11 +163,143 @@ function makeSection(s, idx, allRawSections) {
     getStrategy: function() { return s.strategy; },
     getTool: function() { return toolObj; },
     getInitialPosition: function() { return toVec(s.initialPosition); },
-    getGlobalInitialPosition: function() { return toVec(s.globalInitialPosition || s.initialPosition); },
+    getGlobalInitialPosition: function() {
+      var ip = toVec(s.initialPosition);
+      var calcGlobal = Vector.sum(wp.multiply(ip), wo);
+      if (s.globalInitialPosition) {
+        var gip = toVec(s.globalInitialPosition);
+        // Legacy dumps before getGlobalPosition() fix stored raw initialPosition in globalInitialPosition;
+        // prefer calculated global position if globalInitialPosition equals raw initialPosition under a non-trivial frame.
+        if (Vector.diff(gip, ip).length > 1e-6 || Vector.diff(calcGlobal, ip).length <= 1e-6) {
+          return gip;
+        }
+      }
+      return calcGlobal;
+    },
     getFinalPosition: function() { return toVec(s.finalPosition || s.endPos || s.initialPosition); },
-    getGlobalFinalPosition: function() { return toVec(s.globalFinalPosition || s.finalPosition || s.endPos || s.globalInitialPosition || s.initialPosition); },
+    getGlobalFinalPosition: function() {
+      var fp = toVec(s.finalPosition || s.endPos || s.initialPosition);
+      var calcGlobal = Vector.sum(wp.multiply(fp), wo);
+      if (s.globalFinalPosition) {
+        var gfp = toVec(s.globalFinalPosition);
+        if (Vector.diff(gfp, fp).length > 1e-6 || Vector.diff(calcGlobal, fp).length <= 1e-6) {
+          return gfp;
+        }
+      }
+      return calcGlobal;
+    },
     getFirstPosition: function() { return toVec(s.initialPosition); },
-    getGlobalPosition: function() { return toVec(s.globalInitialPosition || s.initialPosition); },
+    getGlobalPosition: function(v) {
+      if (!v) return Vector.sum(wp.multiply(toVec(s.initialPosition)), wo);
+      return Vector.sum(wp.multiply(v), wo);
+    },
+    getWorkPosition: function(v) {
+      if (!v) return new Vector(0, 0, 0);
+      return wp.getTransposed().multiply(Vector.diff(v, wo));
+    },
+    getBoundingBox: function() {
+      var ip = toVec(s.initialPosition);
+      var minX = ip.x, minY = ip.y, minZ = ip.z;
+      var maxX = ip.x, maxY = ip.y, maxZ = ip.z;
+      function _expandPt(px, py, pz) {
+        if (typeof px === "number" && typeof py === "number" && typeof pz === "number") {
+          if (px < minX) minX = px;
+          if (py < minY) minY = py;
+          if (pz < minZ) minZ = pz;
+          if (px > maxX) maxX = px;
+          if (py > maxY) maxY = py;
+          if (pz > maxZ) maxZ = pz;
+        }
+      }
+      var evs = s.events || [];
+      for (var bi = 0; bi < evs.length; ++bi) {
+        var bev = evs[bi];
+        if (!bev) continue;
+        _expandPt(bev.sx, bev.sy, bev.sz);
+        _expandPt(bev.x, bev.y, bev.z);
+        if (bev.type === "onCircular") {
+          var lms = bev.linearizedMoves;
+          if (lms && lms.length > 0) {
+            for (var lmi = 0; lmi < lms.length; ++lmi) {
+              var lm = lms[lmi];
+              if (lm) {
+                _expandPt(lm.sx, lm.sy, lm.sz);
+                _expandPt(lm.x, lm.y, lm.z);
+              }
+            }
+          } else if (typeof bev.cx === "number" && typeof bev.cy === "number" && typeof bev.cz === "number") {
+            var r = (typeof bev.radius === "number" && bev.radius > 0) ? bev.radius : 0;
+            var plane = bev.plane;
+            if (plane === undefined || plane === null || plane === -1) {
+              var nx = (typeof bev.nx === "number") ? Math.abs(bev.nx) : 0;
+              var ny = (typeof bev.ny === "number") ? Math.abs(bev.ny) : 0;
+              var nz = (typeof bev.nz === "number") ? Math.abs(bev.nz) : 1;
+              if (nx < 1e-5 && ny < 1e-5 && Math.abs(nz - 1) < 1e-4) plane = 0;
+              else if (nx < 1e-5 && nz < 1e-5 && Math.abs(ny - 1) < 1e-4) plane = 1;
+              else if (ny < 1e-5 && nz < 1e-5 && Math.abs(nx - 1) < 1e-4) plane = 2;
+              else plane = -1;
+            }
+            if (r <= 0 && typeof bev.sx === "number" && typeof bev.sy === "number" && typeof bev.sz === "number") {
+              var dx = bev.sx - bev.cx, dy = bev.sy - bev.cy, dz = bev.sz - bev.cz;
+              r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            if (r > 0) {
+              if (plane === 0) {
+                _expandPt(bev.cx - r, bev.cy - r, bev.cz);
+                _expandPt(bev.cx + r, bev.cy + r, bev.cz);
+              } else if (plane === 1) {
+                _expandPt(bev.cx - r, bev.cy, bev.cz - r);
+                _expandPt(bev.cx + r, bev.cy, bev.cz + r);
+              } else if (plane === 2) {
+                _expandPt(bev.cx, bev.cy - r, bev.cz - r);
+                _expandPt(bev.cx, bev.cy + r, bev.cz + r);
+              } else {
+                _expandPt(bev.cx - r, bev.cy - r, bev.cz - r);
+                _expandPt(bev.cx + r, bev.cy + r, bev.cz + r);
+              }
+            }
+          }
+        } else if (bev.type === "onCyclePoint") {
+          var ems = bev.expandedMoves;
+          if (ems && ems.length > 0) {
+            for (var emi = 0; emi < ems.length; ++emi) {
+              var em = ems[emi];
+              if (em) {
+                _expandPt(em.sx, em.sy, em.sz);
+                _expandPt(em.x, em.y, em.z);
+              }
+            }
+          }
+        }
+      }
+      return new BoundingBox(new Vector(minX, minY, minZ), new Vector(maxX, maxY, maxZ));
+    },
+    getGlobalBoundingBox: function() {
+      var lbb = this.getBoundingBox();
+      var corners = [
+        new Vector(lbb.lower.x, lbb.lower.y, lbb.lower.z),
+        new Vector(lbb.upper.x, lbb.lower.y, lbb.lower.z),
+        new Vector(lbb.lower.x, lbb.upper.y, lbb.lower.z),
+        new Vector(lbb.upper.x, lbb.upper.y, lbb.lower.z),
+        new Vector(lbb.lower.x, lbb.lower.y, lbb.upper.z),
+        new Vector(lbb.upper.x, lbb.lower.y, lbb.upper.z),
+        new Vector(lbb.lower.x, lbb.upper.y, lbb.upper.z),
+        new Vector(lbb.upper.x, lbb.upper.y, lbb.upper.z)
+      ];
+      var g0 = Vector.sum(wp.multiply(corners[0]), wo);
+      var minX = g0.x, minY = g0.y, minZ = g0.z;
+      var maxX = g0.x, maxY = g0.y, maxZ = g0.z;
+      for (var ci = 1; ci < corners.length; ++ci) {
+        var gc = Vector.sum(wp.multiply(corners[ci]), wo);
+        if (gc.x < minX) minX = gc.x;
+        if (gc.y < minY) minY = gc.y;
+        if (gc.z < minZ) minZ = gc.z;
+        if (gc.x > maxX) maxX = gc.x;
+        if (gc.y > maxY) maxY = gc.y;
+        if (gc.z > maxZ) maxZ = gc.z;
+      }
+      return new BoundingBox(new Vector(minX, minY, minZ), new Vector(maxX, maxY, maxZ));
+    },
     getInitialToolAxis: function() { return toVec(s.initialToolAxis || {x: 0, y: 0, z: 1}); },
     getGlobalInitialToolAxis: function() { return toVec(s.globalInitialToolAxis || s.initialToolAxis || {x: 0, y: 0, z: 1}); },
     getInitialToolAxisABC: function() { return toVec(s.initialToolAxisABC || {x: 0, y: 0, z: 0}); },
@@ -294,10 +426,70 @@ function onClose() {
     }
   }
 
-  var curPos = new Vector(0, 0, 0);
+  var curLocalPos = new Vector(0, 0, 0);
   var curEv = null;
   var curCyclePoints = [];
   var curSync = false;
+
+  function _fp(x, y, z) {
+    var v = new Vector(x, y, z);
+    return (typeof getFramePosition === "function") ? getFramePosition(v) : v;
+  }
+  function _fpVec(v) {
+    var vec = toVec(v);
+    return (typeof getFramePosition === "function") ? getFramePosition(vec) : vec;
+  }
+  function _invFpVec(v) {
+    var vec = toVec(v);
+    var t = (typeof getTranslation === "function") ? getTranslation() : new Vector(0, 0, 0);
+    var shifted = Vector.diff(vec, t);
+    if (typeof getRotation === "function") {
+      var r = getRotation();
+      if (r && typeof r.getTransposed === "function") {
+        return r.getTransposed().multiply(shifted);
+      }
+    }
+    return shifted;
+  }
+  function _fd(x, y, z) {
+    var v = new Vector(x, y, z);
+    return (typeof getFrameDirection === "function") ? getFrameDirection(v) : v;
+  }
+  function _rotDet() {
+    if (typeof getRotation !== "function") return 1;
+    var m = getRotation();
+    if (!m || !m.right || !m.up || !m.forward) return 1;
+    return (
+      m.right.x * (m.up.y * m.forward.z - m.up.z * m.forward.y) -
+      m.up.x * (m.right.y * m.forward.z - m.right.z * m.forward.y) +
+      m.forward.x * (m.right.y * m.up.z - m.right.z * m.up.y)
+    );
+  }
+  function _transformCircular(ev) {
+    var nx0 = (ev && typeof ev.nx === "number") ? ev.nx : 0;
+    var ny0 = (ev && typeof ev.ny === "number") ? ev.ny : 0;
+    var nz0 = (ev && typeof ev.nz === "number") ? ev.nz : 1;
+    var n = _fd(nx0, ny0, nz0);
+    var cw = !!(ev && ev.cw);
+    if (_rotDet() < 0) {
+      cw = !cw;
+    }
+    var plane = -1;
+    if (Math.abs(n.x) < 1e-5 && Math.abs(n.y) < 1e-5 && Math.abs(Math.abs(n.z) - 1) < 1e-4) {
+      if (n.z < 0) cw = !cw;
+      n = new Vector(0, 0, 1);
+      plane = 0;
+    } else if (Math.abs(n.x) < 1e-5 && Math.abs(n.z) < 1e-5 && Math.abs(Math.abs(n.y) - 1) < 1e-4) {
+      if (n.y < 0) cw = !cw;
+      n = new Vector(0, 1, 0);
+      plane = 1;
+    } else if (Math.abs(n.y) < 1e-5 && Math.abs(n.z) < 1e-5 && Math.abs(Math.abs(n.x) - 1) < 1e-4) {
+      if (n.x < 0) cw = !cw;
+      n = new Vector(1, 0, 0);
+      plane = 2;
+    }
+    return { cw: cw, normal: n, plane: plane };
+  }
 
   getToolTable = function() {
     return {
@@ -314,6 +506,12 @@ function onClose() {
     return Object.prototype.hasOwnProperty.call(data.globalParams, name) ? data.globalParams[name] : def;
   };
   getWorkpiece = function() { return toBox(data.workpiece); };
+  getGlobalPosition = function(v) {
+    if (currentSection && typeof currentSection.getGlobalPosition === "function") {
+      return currentSection.getGlobalPosition(v);
+    }
+    return toVec(v);
+  };
 
   var nextEvIsMotion = true;
   getNextRecord = function() {
@@ -321,17 +519,17 @@ function onClose() {
       isMotion: function() { return nextEvIsMotion; }
     };
   };
-  getCurrentPosition = function() { return curPos; };
-  setCurrentPosition = function(v) { curPos = new Vector(v.x, v.y, v.z); };
+  getCurrentPosition = function() { return _fpVec(curLocalPos); };
+  setCurrentPosition = function(v) { curLocalPos = _invFpVec(v); };
   isSpeedFeedSynchronizationActive = function() { return curSync; };
 
-  getCircularPlane = function() { return curEv.plane; };
+  getCircularPlane = function() { return _transformCircular(curEv).plane; };
   getCircularRadius = function() { return curEv.radius; };
   getCircularSweep = function() { return curEv.sweep; };
-  getCircularNormal = function() { return new Vector(curEv.nx, curEv.ny, curEv.nz); };
-  getCircularStart = function() { return new Vector(curEv.sx, curEv.sy, curEv.sz); };
-  getCircularCenter = function() { return new Vector(curEv.cx, curEv.cy, curEv.cz); };
-  getCircularEnd = function() { return new Vector(curEv.x, curEv.y, curEv.z); };
+  getCircularNormal = function() { return _transformCircular(curEv).normal; };
+  getCircularStart = function() { return _fp(curEv.sx, curEv.sy, curEv.sz); };
+  getCircularCenter = function() { return _fp(curEv.cx, curEv.cy, curEv.cz); };
+  getCircularEnd = function() { return _fp(curEv.x, curEv.y, curEv.z); };
   isFullCircle = function() { return !!curEv.fullCircle; };
   isHelical = function() { return !!curEv.helical; };
   isSpiral = function() { return !!curEv.spiral; };
@@ -339,10 +537,11 @@ function onClose() {
   isFirstCyclePoint = function() { return !!curEv.first; };
   isLastCyclePoint = function() { return !!curEv.last; };
   getNumberOfCyclePoints = function() { return curCyclePoints.length; };
-  getCyclePoint = function(i) { return toVec(curCyclePoints[i]); };
+  getCyclePoint = function(i) { return _fpVec(curCyclePoints[i]); };
 
   __getCurEv = function() { return curEv; };
-  __setPos = function(v) { curPos = v; };
+  __fp = _fp;
+  __setLocalPos = function(v) { curLocalPos = new Vector(v.x, v.y, v.z); };
 
   unit = data.unit;
   if (data.highFeedrate) {
@@ -511,12 +710,14 @@ function onClose() {
     "    for (var m = 0; m < cEv.linearizedMoves.length; ++m) {\n" +
     "      var mv = cEv.linearizedMoves[m];\n" +
     "      if (mv.movement !== undefined) movement = mv.movement;\n" +
-    "      onLinear(mv.x, mv.y, mv.z, mv.feed);\n" +
-    "      __setPos(new Vector(mv.x, mv.y, mv.z));\n" +
+    "      var p = __fp(mv.x, mv.y, mv.z);\n" +
+    "      onLinear(p.x, p.y, p.z, mv.feed);\n" +
+    "      __setLocalPos(mv);\n" +
     "    }\n" +
     "  } else if (cEv) {\n" +
-    "    onLinear(cEv.x, cEv.y, cEv.z, cEv.feed);\n" +
-    "    __setPos(new Vector(cEv.x, cEv.y, cEv.z));\n" +
+    "    var p2 = __fp(cEv.x, cEv.y, cEv.z);\n" +
+    "    onLinear(p2.x, p2.y, p2.z, cEv.feed);\n" +
+    "    __setLocalPos(cEv);\n" +
     "  }\n" +
     "}\n" +
     "function expandCyclePoint(x, y, z) {\n" +
@@ -528,11 +729,13 @@ function onClose() {
     "      var mv = list[m];\n" +
     "      if (mv.movement !== undefined) movement = mv.movement;\n" +
     "      if (mv.type === 'onRapid') {\n" +
-    "        onRapid(mv.x, mv.y, mv.z);\n" +
-    "        __setPos(new Vector(mv.x, mv.y, mv.z));\n" +
+    "        var pr = __fp(mv.x, mv.y, mv.z);\n" +
+    "        onRapid(pr.x, pr.y, pr.z);\n" +
+    "        __setLocalPos(mv);\n" +
     "      } else if (mv.type === 'onLinear') {\n" +
-    "        onLinear(mv.x, mv.y, mv.z, mv.feed);\n" +
-    "        __setPos(new Vector(mv.x, mv.y, mv.z));\n" +
+    "        var pl = __fp(mv.x, mv.y, mv.z);\n" +
+    "        onLinear(pl.x, pl.y, pl.z, mv.feed);\n" +
+    "        __setLocalPos(mv);\n" +
     "      } else if (mv.type === 'onDwell') {\n" +
     "        if (typeof onDwell === 'function') onDwell(mv.sec);\n" +
     "      }\n" +
@@ -547,11 +750,13 @@ function onClose() {
     "      var mv = cEv.reposMoves[m];\n" +
     "      if (mv.movement !== undefined) movement = mv.movement;\n" +
     "      if (mv.type === 'onRapid') {\n" +
-    "        onRapid(mv.x, mv.y, mv.z);\n" +
-    "        __setPos(new Vector(mv.x, mv.y, mv.z));\n" +
+    "        var pr = __fp(mv.x, mv.y, mv.z);\n" +
+    "        onRapid(pr.x, pr.y, pr.z);\n" +
+    "        __setLocalPos(mv);\n" +
     "      } else if (mv.type === 'onLinear') {\n" +
-    "        onLinear(mv.x, mv.y, mv.z, mv.feed);\n" +
-    "        __setPos(new Vector(mv.x, mv.y, mv.z));\n" +
+    "        var pl = __fp(mv.x, mv.y, mv.z);\n" +
+    "        onLinear(pl.x, pl.y, pl.z, mv.feed);\n" +
+    "        __setLocalPos(mv);\n" +
     "      }\n" +
     "    }\n" +
     "  }\n" +
@@ -675,6 +880,11 @@ function onClose() {
     });
   }
 
+  if (typeof cancelTransformation === "function") {
+    try {
+      cancelTransformation();
+    } catch (e) {}
+  }
   if (vendor.onOpen) vendor.onOpen();
 
   function checkVendorDogLeg() {
@@ -736,12 +946,28 @@ function onClose() {
     if (vendor.onComment) vendor.onComment(data.comments[ci]);
   }
 
+  function _matricesApproxEqual(a, b, tol) {
+    if (!a || !b || !a.right || !a.up || !a.forward || !b.right || !b.up || !b.forward) {
+      return false;
+    }
+    return (
+      Vector.diff(a.right, b.right).length <= tol &&
+      Vector.diff(a.up, b.up).length <= tol &&
+      Vector.diff(a.forward, b.forward).length <= tol
+    );
+  }
+
   var restoredCount = 0;
   var inCycle = false;
+  var frameMismatchSections = [];
+  var multiAxisSections = [];
 
   for (var si = 0; si < sections.length; ++si) {
     var sec = sections[si];
     var rawSec = data.sections[si];
+    var opName = (rawSec.params && rawSec.params["operation-comment"])
+      ? String(rawSec.params["operation-comment"])
+      : ("Section_" + (rawSec.id !== undefined ? rawSec.id : si));
 
     for (var pk in rawSec.params) {
       if (vendor.onParameter) vendor.onParameter(pk, rawSec.params[pk]);
@@ -762,10 +988,53 @@ function onClose() {
       cycleType: "",
       cycleExpanded: false
     });
-    curPos = sec.getInitialPosition();
+    // R5: First section starts at its initialPosition; subsequent sections inherit
+    // the previous section's local end position (mapped by current frame in getCurrentPosition).
+    if (si === 0) {
+      curLocalPos = sec.getInitialPosition();
+    }
     inCycle = false;
 
     if (vendor.onSection) vendor.onSection();
+
+    // R1: Verify vendor post's active kernel frame (R, T) matches verifier's (workPlane, workOrigin).
+    var sectionFrameConsistent = true;
+    try {
+      var curR = (typeof getRotation === "function") ? getRotation() : new Matrix();
+      var curT = (typeof getTranslation === "function") ? getTranslation() : new Vector(0, 0, 0);
+      var expW = sec.getWorkPlane();
+      var expO = sec.getWorkOrigin();
+      var rOk = _matricesApproxEqual(curR, expW, 1e-4);
+      var tOk = Vector.diff(curT, expO).length <= 1e-4;
+      if (!rOk || !tOk) {
+        sectionFrameConsistent = false;
+        frameMismatchSections.push({
+          secIdx: si,
+          id: rawSec.id !== undefined ? rawSec.id : si,
+          op: opName,
+          rOk: rOk,
+          tOk: tOk
+        });
+      }
+    } catch (e) {
+      sectionFrameConsistent = false;
+      frameMismatchSections.push({
+        secIdx: si,
+        id: rawSec.id !== undefined ? rawSec.id : si,
+        op: opName,
+        error: String(e)
+      });
+    }
+
+    // R8: Fail closed on simultaneous multi-axis sections.
+    var isMultiAxisSec = !!(rawSec.isMultiAxis || rawSec.has5DMoves);
+    if (isMultiAxisSec) {
+      multiAxisSections.push({
+        secIdx: si,
+        id: rawSec.id !== undefined ? rawSec.id : si,
+        op: opName
+      });
+    }
 
     for (var ei = 0; ei < rawSec.events.length; ++ei) {
       var ev = rawSec.events[ei];
@@ -813,17 +1082,23 @@ function onClose() {
         case "onCommand":
           if (vendor.onCommand) vendor.onCommand(ev.cmd);
           break;
-        case "onRapid":
-          curPos = new Vector(ev.sx, ev.sy, ev.sz);
+        case "onRapid": {
+          curLocalPos = new Vector(ev.sx, ev.sy, ev.sz);
+          var rEnd = _fp(ev.x, ev.y, ev.z);
           vendor.setState({movement: ev.movement, radiusCompensation: ev.rc, spindleSpeed: ev.rpm});
-          if (vendor.onRapid) vendor.onRapid(ev.x, ev.y, ev.z);
-          curPos = new Vector(ev.x, ev.y, ev.z);
+          if (vendor.onRapid) vendor.onRapid(rEnd.x, rEnd.y, rEnd.z);
+          curLocalPos = new Vector(ev.x, ev.y, ev.z);
           break;
-        case "onLinear":
-          curPos = new Vector(ev.sx, ev.sy, ev.sz);
+        }
+        case "onLinear": {
+          curLocalPos = new Vector(ev.sx, ev.sy, ev.sz);
+          var lEnd = _fp(ev.x, ev.y, ev.z);
           curSync = !!ev.sync;
           vendor.setState({movement: ev.movement, radiusCompensation: ev.rc, spindleSpeed: ev.rpm});
           var shouldPromote = !!ev.promote;
+          if (shouldPromote && (!sectionFrameConsistent || isMultiAxisSec)) {
+            shouldPromote = false;
+          }
           if (shouldPromote && vendorDogLeg.isDogLeg) {
             shouldPromote = false;
             if (!dogLegCommentLogged) {
@@ -839,35 +1114,42 @@ function onClose() {
               ? vendor.formatComment("Rapid restored")
               : "(Rapid restored)";
             try {
-              if (vendor.onRapid) vendor.onRapid(ev.x, ev.y, ev.z);
+              if (vendor.onRapid) vendor.onRapid(lEnd.x, lEnd.y, lEnd.z);
             } finally {
               _promoCommentSuffix = "";
             }
           } else {
-            if (vendor.onLinear) vendor.onLinear(ev.x, ev.y, ev.z, ev.feed);
+            if (vendor.onLinear) vendor.onLinear(lEnd.x, lEnd.y, lEnd.z, ev.feed);
           }
-          curPos = new Vector(ev.x, ev.y, ev.z);
+          curLocalPos = new Vector(ev.x, ev.y, ev.z);
           curSync = false;
           break;
-        case "onCircular":
-          curPos = new Vector(ev.sx, ev.sy, ev.sz);
+        }
+        case "onCircular": {
+          curLocalPos = new Vector(ev.sx, ev.sy, ev.sz);
+          var cCenter = _fp(ev.cx, ev.cy, ev.cz);
+          var cEnd = _fp(ev.x, ev.y, ev.z);
+          var cInfo = _transformCircular(ev);
           vendor.setState({movement: ev.movement, radiusCompensation: ev.rc, spindleSpeed: ev.rpm});
           if (vendor.onCircular) {
-            vendor.onCircular(ev.cw, ev.cx, ev.cy, ev.cz, ev.x, ev.y, ev.z, ev.feed);
+            vendor.onCircular(cInfo.cw, cCenter.x, cCenter.y, cCenter.z, cEnd.x, cEnd.y, cEnd.z, ev.feed);
           }
-          curPos = new Vector(ev.x, ev.y, ev.z);
+          curLocalPos = new Vector(ev.x, ev.y, ev.z);
           break;
+        }
         case "onCycle":
           inCycle = true;
           curCyclePoints = ev.points || [];
           vendor.setState({cycleType: ev.cycleType, cycle: hydrateCycle(ev.cycle), cycleExpanded: false});
           if (vendor.onCycle) vendor.onCycle();
           break;
-        case "onCyclePoint":
-          curPos = new Vector(ev.sx, ev.sy, ev.sz);
-          if (vendor.onCyclePoint) vendor.onCyclePoint(ev.x, ev.y, ev.z);
-          curPos = new Vector(ev.x, ev.y, ev.z);
+        case "onCyclePoint": {
+          curLocalPos = new Vector(ev.sx, ev.sy, ev.sz);
+          var cpEnd = _fp(ev.x, ev.y, ev.z);
+          if (vendor.onCyclePoint) vendor.onCyclePoint(cpEnd.x, cpEnd.y, cpEnd.z);
+          curLocalPos = new Vector(ev.x, ev.y, ev.z);
           break;
+        }
         case "onCycleEnd":
           if (vendor.onCycleEnd) vendor.onCycleEnd();
           vendor.setState({cycle: undefined, cycleType: "", cycleExpanded: false});
@@ -877,12 +1159,18 @@ function onClose() {
       }
     }
 
-    curPos = toVec(rawSec.endPos);
+    if (rawSec.endPos) {
+      curLocalPos = toVec(rawSec.endPos);
+    } else if (rawSec.finalPosition) {
+      curLocalPos = toVec(rawSec.finalPosition);
+    }
     vendor.setState({spindleSpeed: rawSec.endSpindleSpeed});
     if (vendor.onSectionEnd) vendor.onSectionEnd();
 
-    for (var pci = 0; pci < rawSec.postComments.length; ++pci) {
-      if (vendor.onComment) vendor.onComment(rawSec.postComments[pci]);
+    if (rawSec.postComments) {
+      for (var pci = 0; pci < rawSec.postComments.length; ++pci) {
+        if (vendor.onComment) vendor.onComment(rawSec.postComments[pci]);
+      }
     }
   }
 
@@ -891,6 +1179,29 @@ function onClose() {
   if (restoredCount > 0 && vendor.writeComment) {
     try {
       vendor.writeComment("UNIVERSAL WRAPPER: RESTORED " + restoredCount + " G0 RAPID MOVES");
+    } catch (e) {}
+  }
+
+  var replayDiag = {
+    frameMismatches: frameMismatchSections,
+    multiAxisSections: multiAxisSections
+  };
+  var diagPath = "";
+  try {
+    diagPath = getEnvironmentVariable("REPLAY_DIAG_JSON");
+  } catch (e) {}
+  var diagWritten = false;
+  if (diagPath) {
+    try {
+      var tf = new TextFile(diagPath, true, "utf-8");
+      tf.writeln(JSON.stringify(replayDiag));
+      tf.close();
+      diagWritten = true;
+    } catch (e) {}
+  }
+  if (!diagWritten && (frameMismatchSections.length > 0 || multiAxisSections.length > 0 || diagPath)) {
+    try {
+      _origWriteln("(POSTCLEAR_REPLAY_DIAG:" + JSON.stringify(replayDiag) + ")");
     } catch (e) {}
   }
 }

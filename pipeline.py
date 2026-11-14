@@ -27,7 +27,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from geometry.models import (
     MotionKind,
@@ -370,6 +370,8 @@ class PipelineOrchestrator:
         with open(output_json_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    _REPLAY_DIAG_MARKER_RE = re.compile(r"(?m)^\(POSTCLEAR_REPLAY_DIAG:(\{.*\})\)\r?\n?")
+
     def replay_combined_context(
         self,
         combined_context: Union[str, Dict],
@@ -382,6 +384,7 @@ class PipelineOrchestrator:
         against `combined_context` (path or dict) and write the native machine program
         to `final_cnc_path`.
         """
+        self.last_replay_diag: Optional[Dict[str, Any]] = None
         with tempfile.TemporaryDirectory() as tmp_dir:
             if isinstance(combined_context, dict):
                 ctx_path = os.path.join(tmp_dir, "combined_context.json")
@@ -393,6 +396,11 @@ class PipelineOrchestrator:
             env = os.environ.copy()
             env["BASE_POST"] = os.path.abspath(base_post_path)
             env["CONTEXT_JSON"] = os.path.abspath(ctx_path)
+            if "REPLAY_DIAG_JSON" in env:
+                diag_path = env["REPLAY_DIAG_JSON"]
+            else:
+                diag_path = os.path.join(tmp_dir, "replay_diag.json")
+                env["REPLAY_DIAG_JSON"] = diag_path
 
             cmd = [self.post_bin, "--quiet", self.replayer_cps, bootstrap_cnc_path, final_cnc_path]
             try:
@@ -406,7 +414,35 @@ class PipelineOrchestrator:
                 raise RuntimeError(f"Universal post replayer execution failed: {err_detail}")
 
             with open(final_cnc_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
+                gcode_text = f.read()
+
+            diag_data: Optional[Dict[str, Any]] = None
+            if diag_path and os.path.isfile(diag_path):
+                try:
+                    with open(diag_path, "r", encoding="utf-8") as df:
+                        raw_diag = df.read().strip()
+                    if raw_diag:
+                        diag_data = json.loads(raw_diag)
+                except Exception:
+                    diag_data = None
+
+            marker_match = self._REPLAY_DIAG_MARKER_RE.search(gcode_text)
+            if marker_match:
+                if diag_data is None:
+                    try:
+                        diag_data = json.loads(marker_match.group(1))
+                    except Exception:
+                        diag_data = None
+                cleaned_gcode = self._REPLAY_DIAG_MARKER_RE.sub("", gcode_text)
+                if cleaned_gcode != gcode_text:
+                    gcode_text = cleaned_gcode
+                    with open(final_cnc_path, "w", encoding="utf-8") as f:
+                        f.write(gcode_text)
+
+            if diag_data is None:
+                diag_data = {"diagMissing": True, "frameMismatches": [], "multiAxisSections": []}
+            self.last_replay_diag = diag_data
+            return gcode_text
 
     def run(
         self,
@@ -569,6 +605,22 @@ class PipelineOrchestrator:
             if is_turning and not tools_by_op:
                 raise ValueError("No lathe operations with valid tools found in context dump.")
 
+            for sec_idx, sec in enumerate(combined_ctx.get("sections", [])):
+                params = sec.get("params") or {}
+                op_name = params.get("operation-comment", f"Section_{sec.get('id', sec_idx)}")
+                wp = sec.get("workPlane") or {}
+                wp_r = wp.get("right") or {}
+                wp_u = wp.get("up") or {}
+                wp_f = wp.get("forward") or {}
+                wo = sec.get("workOrigin") or {}
+                _dbg_pipe(
+                    f"Section {sec_idx} ({op_name}): "
+                    f"workPlane right=({float(wp_r.get('x', 1.0)):.4f},{float(wp_r.get('y', 0.0)):.4f},{float(wp_r.get('z', 0.0)):.4f}) "
+                    f"up=({float(wp_u.get('x', 0.0)):.4f},{float(wp_u.get('y', 1.0)):.4f},{float(wp_u.get('z', 0.0)):.4f}) "
+                    f"forward=({float(wp_f.get('x', 0.0)):.4f},{float(wp_f.get('y', 0.0)):.4f},{float(wp_f.get('z', 1.0)):.4f}) "
+                    f"workOrigin=({float(wo.get('x', 0.0)):.4f},{float(wo.get('y', 0.0)):.4f},{float(wo.get('z', 0.0)):.4f})"
+                )
+
             segments = parse_context_dump(combined_ctx)
 
             # -----------------------------------------------------------------
@@ -696,6 +748,64 @@ class PipelineOrchestrator:
                     segments,
                     min_len_mm=eff_min_promote_len,
                 )
+
+            # R2 (tilted sections) & R8 (multi-axis simultaneous): fail closed — drop promotions and record ops
+            tilted_sec_indices: Set[int] = set()
+            tilted_ops: List[str] = []
+            multi_axis_sec_indices: Set[int] = set()
+            multi_axis_ops: List[str] = []
+
+            for sec_idx, sec in enumerate(combined_ctx.get("sections", [])):
+                params = sec.get("params") or {}
+                op_name = params.get("operation-comment", f"Section_{sec.get('id', sec_idx)}")
+                sec_type = sec.get("type", 0)
+                wp_f = (sec.get("workPlane") or {}).get("forward") or {}
+                fx = float(wp_f.get("x", 0.0))
+                fy = float(wp_f.get("y", 0.0))
+                fz = float(wp_f.get("z", 1.0))
+                if sec_type != 1 and not (abs(fx) < 1e-5 and abs(fy) < 1e-5 and abs(fz - 1.0) < 1e-5):
+                    tilted_sec_indices.add(sec_idx)
+                    if op_name not in tilted_ops:
+                        tilted_ops.append(op_name)
+                if sec.get("isMultiAxis") or sec.get("has5DMoves"):
+                    multi_axis_sec_indices.add(sec_idx)
+                    if op_name not in multi_axis_ops:
+                        multi_axis_ops.append(op_name)
+
+            for seg in segments:
+                s_meta = getattr(seg, "metadata", None) or {}
+                sec_i = s_meta.get("sec_idx", seg.sec_id)
+                if s_meta.get("tilted_section"):
+                    tilted_sec_indices.add(sec_i)
+                    if seg.op_id and seg.op_id not in tilted_ops:
+                        tilted_ops.append(seg.op_id)
+                if s_meta.get("multi_axis"):
+                    multi_axis_sec_indices.add(sec_i)
+                    if seg.op_id and seg.op_id not in multi_axis_ops:
+                        multi_axis_ops.append(seg.op_id)
+
+            blocked_sec_indices = tilted_sec_indices | multi_axis_sec_indices
+            if blocked_sec_indices and report.promoted_events:
+                report.promoted_events = {
+                    ev for ev in report.promoted_events
+                    if ev[0] not in blocked_sec_indices
+                }
+
+            report.tilted_ops = tilted_ops
+            report.multi_axis_ops = multi_axis_ops
+
+            v_unchecked = getattr(verifier, "holder_unchecked_ops", None) or getattr(report, "holder_unchecked_ops", None)
+            report.holder_unchecked_ops = sorted(str(x) for x in v_unchecked) if v_unchecked else []
+            report.frame_warnings = []
+            report.frame_mismatch_ops = []
+
+            if tilted_ops:
+                _dbg_pipe(f"PipelineOrchestrator.run: tilted sections (not verified): {tilted_ops}")
+            if multi_axis_ops:
+                _dbg_pipe(f"PipelineOrchestrator.run: multi-axis simultaneous sections (not verified): {multi_axis_ops}")
+            if report.holder_unchecked_ops:
+                _dbg_pipe(f"PipelineOrchestrator.run: holder not checked for ops: {report.holder_unchecked_ops}")
+
             if tp_box_log and st_box_log:
                 report.stock_bounding_box = st_box_log
                 report.toolpath_bounding_box = tp_box_log
@@ -762,12 +872,67 @@ class PipelineOrchestrator:
                     bf.write(b"")
 
             effective_final_cnc = final_cnc_path or os.path.join(tmp_dir, "replayed_output.cnc")
+            self.last_replay_diag = None
             final_gcode = self.replay_combined_context(
                 combined_context=combined_ctx,
                 bootstrap_cnc_path=bootstrap_cnc,
                 base_post_path=base_post_path,
                 final_cnc_path=effective_final_cnc,
             )
+
+            # Reconcile R1/R8 diagnostics emitted by universal_replayer.cps
+            replay_diag = getattr(self, "last_replay_diag", None)
+            if isinstance(replay_diag, dict):
+                frame_warnings: List[str] = []
+                frame_mismatch_ops: List[str] = []
+                frame_mismatch_sec_indices: Set[int] = set()
+                if replay_diag.get("diagMissing") and os.path.basename(self.replayer_cps) == "universal_replayer.cps":
+                    frame_warnings.append(
+                        "Frame consistency diagnostics missing from replayer output; rapid promotions could not be verified."
+                    )
+                for fm in replay_diag.get("frameMismatches", []) or []:
+                    if not isinstance(fm, dict):
+                        continue
+                    fm_op = str(fm.get("op") or f"Section_{fm.get('id', fm.get('secIdx', '?'))}")
+                    fm_sec_idx = fm.get("secIdx")
+                    if isinstance(fm_sec_idx, int):
+                        frame_mismatch_sec_indices.add(fm_sec_idx)
+                    if fm_op not in frame_mismatch_ops:
+                        frame_mismatch_ops.append(fm_op)
+                    reasons = []
+                    if fm.get("rOk") is False:
+                        reasons.append("rotation R != workPlane")
+                    if fm.get("tOk") is False:
+                        reasons.append("translation T != workOrigin")
+                    if fm.get("error"):
+                        reasons.append(str(fm["error"]))
+                    reason_str = ", ".join(reasons) if reasons else "frame mismatch"
+                    frame_warnings.append(f"{fm_op}: {reason_str}; rapid promotion disabled")
+                for ma in replay_diag.get("multiAxisSections", []) or []:
+                    if not isinstance(ma, dict):
+                        continue
+                    ma_op = str(ma.get("op") or f"Section_{ma.get('id', ma.get('secIdx', '?'))}")
+                    if ma_op not in report.multi_axis_ops:
+                        report.multi_axis_ops.append(ma_op)
+
+                if frame_mismatch_sec_indices:
+                    if report.promoted_events:
+                        report.promoted_events = {
+                            ev for ev in report.promoted_events
+                            if ev[0] not in frame_mismatch_sec_indices
+                        }
+                    restored_count = sum(
+                        1
+                        for s_i, sec in enumerate(combined_ctx.get("sections", []))
+                        if s_i not in frame_mismatch_sec_indices
+                        for ev in sec.get("events", [])
+                        if ev.get("promote")
+                    )
+
+                report.frame_warnings = frame_warnings
+                report.frame_mismatch_ops = frame_mismatch_ops
+                for fw in frame_warnings:
+                    _dbg_pipe(f"PipelineOrchestrator.run: frame warning: {fw}")
 
             # -----------------------------------------------------------------
             # Step 6: Generate Summary Report & Verification Plot
@@ -861,6 +1026,42 @@ class PipelineOrchestrator:
                 f"> **Warning**: {report.fixture_warning}",
             ])
 
+        frame_warnings = list(getattr(report, "frame_warnings", None) or [])
+        if frame_warnings:
+            lines.append(f"- **Frame Consistency Warnings**: {len(frame_warnings)}")
+            for fw in frame_warnings:
+                lines.extend([
+                    "",
+                    f"> **Warning (Frame Mismatch)**: {fw}",
+                ])
+
+        tilted_ops = list(getattr(report, "tilted_ops", None) or [])
+        if tilted_ops:
+            tilted_str = ", ".join(tilted_ops)
+            lines.append(f"- **Tilted Work Plane**: {tilted_str} — not verified (tilted work plane); rapid promotion disabled.")
+            lines.extend([
+                "",
+                f"> **Note**: `{tilted_str}` — not verified (tilted work plane); rapid promotion disabled.",
+            ])
+
+        multi_axis_ops = list(getattr(report, "multi_axis_ops", None) or [])
+        if multi_axis_ops:
+            ma_str = ", ".join(multi_axis_ops)
+            lines.append(f"- **Multi-Axis Simultaneous**: {ma_str} — not verified (multi-axis); rapid promotion disabled.")
+            lines.extend([
+                "",
+                f"> **Warning (Multi-Axis)**: `{ma_str}` — multi-axis simultaneous toolpath is not verified; rapid promotion disabled.",
+            ])
+
+        holder_unchecked = list(getattr(report, "holder_unchecked_ops", None) or [])
+        if holder_unchecked:
+            hu_str = ", ".join(holder_unchecked)
+            lines.append(f"- **Holder Check**: holder not checked for {hu_str}.")
+            lines.extend([
+                "",
+                f"> **Note**: Holder collision check skipped (**holder not checked**) for `{hu_str}`.",
+            ])
+
         if getattr(report, "stock_bounding_box", None) and getattr(report, "toolpath_bounding_box", None):
             lines.extend([
                 "",
@@ -884,17 +1085,49 @@ class PipelineOrchestrator:
         for op in cols_by_op.keys():
             if op not in all_ops:
                 all_ops.append(op)
+        for op_list in (tilted_ops, multi_axis_ops, holder_unchecked, getattr(report, "frame_mismatch_ops", None) or []):
+            for op in op_list:
+                if op not in all_ops:
+                    all_ops.append(op)
         if not all_ops:
             all_ops = list(cols_by_op.keys()) or ["All Operations"]
 
+        frame_mismatch_ops = set(getattr(report, "frame_mismatch_ops", None) or [])
+        tilted_set = set(tilted_ops)
+        multi_axis_set = set(multi_axis_ops)
+        holder_unchecked_set = set(holder_unchecked)
+
+        def _op_notes(op_name: str) -> List[str]:
+            notes: List[str] = []
+            if op_name in tilted_set:
+                notes.append("not verified (tilted work plane)")
+            if op_name in multi_axis_set:
+                notes.append("not verified (multi-axis)")
+            if op_name in frame_mismatch_ops:
+                notes.append("frame mismatch (promotions disabled)")
+            if op_name in holder_unchecked_set:
+                notes.append("holder not checked")
+            return notes
+
         if collision_count == 0:
-            lines.append("✅ **Zero collisions detected.** All rapid moves and holder clearances are verified safe across all operations.")
+            if not (tilted_ops or multi_axis_ops or holder_unchecked or frame_warnings):
+                lines.append("✅ **Zero collisions detected.** All rapid moves and holder clearances are verified safe across all operations.")
+            else:
+                lines.append("✅ **Zero collisions detected** (see verification notes above for unverified or unchecked items).")
             lines.append("")
             lines.append("### Operations Verification Summary")
             lines.append("| Operation | Status | Collisions | Details by Type |")
             lines.append("| :--- | :--- | :--- | :--- |")
             for op in all_ops:
-                lines.append(f"| {op} | ✅ Safe | 0 | None |")
+                notes = _op_notes(op)
+                if op in tilted_set or op in multi_axis_set:
+                    status_str = "⚠️ Not verified"
+                elif notes:
+                    status_str = "⚠️ Warning"
+                else:
+                    status_str = "✅ Safe"
+                detail_str = "; ".join(notes) if notes else "None"
+                lines.append(f"| {op} | {status_str} | 0 | {detail_str} |")
         else:
             affected_ops = [op for op, clist in cols_by_op.items() if len(clist) > 0]
             lines.append(
@@ -907,15 +1140,25 @@ class PipelineOrchestrator:
             lines.append("| :--- | :--- | :--- | :--- |")
             for op in all_ops:
                 op_cols = cols_by_op.get(op, [])
+                notes = _op_notes(op)
                 if op_cols:
                     type_counts: Dict[str, int] = {}
                     for c in op_cols:
                         k_name = c.kind.name if hasattr(c.kind, "name") else str(c.kind)
                         type_counts[k_name] = type_counts.get(k_name, 0) + 1
                     type_str = ", ".join(f"`{k}` ({n})" for k, n in sorted(type_counts.items()))
+                    if notes:
+                        type_str = f"{type_str}; {'; '.join(notes)}"
                     lines.append(f"| **{op}** | ⚠️ **Collision** | **{len(op_cols)}** | {type_str} |")
                 else:
-                    lines.append(f"| {op} | ✅ Safe | 0 | None |")
+                    if op in tilted_set or op in multi_axis_set:
+                        status_str = "⚠️ Not verified"
+                    elif notes:
+                        status_str = "⚠️ Warning"
+                    else:
+                        status_str = "✅ Safe"
+                    detail_str = "; ".join(notes) if notes else "None"
+                    lines.append(f"| {op} | {status_str} | 0 | {detail_str} |")
             lines.append(f"| **Total** | | **{collision_count}** | |")
             lines.append("")
 
