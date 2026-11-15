@@ -43,6 +43,63 @@ def classify_stock_mode(raw: Any) -> str:
     return "unknown"
 
 
+def is_turning_section(sec: Dict[str, Any]) -> bool:
+    """Return True if a context section dictionary represents turning."""
+    if not isinstance(sec, dict):
+        return False
+    tool_info = sec.get("tool")
+    return (sec.get("type", 0) == 1) or bool(isinstance(tool_info, dict) and tool_info.get("_isTurningTool", False))
+
+
+def is_turning_context(ctx_data: Dict[str, Any]) -> bool:
+    """Return True if any section in a context dump represents turning."""
+    if not isinstance(ctx_data, dict):
+        return False
+    return any(is_turning_section(sec) for sec in (ctx_data.get("sections") or []))
+
+
+def _bbox_dict_to_mm(
+    box: Any,
+    unit: Any,
+) -> Optional[Tuple[float, float, float, float, float, float]]:
+    """Convert a `{"lower": {x,y,z}, "upper": {x,y,z}}` box dict in `unit` to mm bounds."""
+    if not isinstance(box, dict):
+        return None
+    lo = box.get("lower")
+    hi = box.get("upper")
+    if not isinstance(lo, dict) or not isinstance(hi, dict):
+        return None
+    try:
+        scale = 25.4 if int(unit if unit is not None else 0) == 0 else 1.0
+        x0, x1 = float(lo["x"]) * scale, float(hi["x"]) * scale
+        y0, y1 = float(lo["y"]) * scale, float(hi["y"]) * scale
+        z0, z1 = float(lo["z"]) * scale, float(hi["z"]) * scale
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (x1 > x0 + 1e-6 and y1 > y0 + 1e-6 and z1 > z0 + 1e-6):
+        return None
+    return (x0, x1, y0, y1, z0, z1)
+
+
+def extract_workpiece_hint_bbox_mm(
+    ctx_data: Dict[str, Any],
+) -> Optional[Tuple[float, float, float, float, float, float]]:
+    """Return `workpieceHint` bounds `(x_min, x_max, y_min, y_max, z_min, z_max)` in mm, or None."""
+    if not isinstance(ctx_data, dict):
+        return None
+    return _bbox_dict_to_mm(ctx_data.get("workpieceHint"), ctx_data.get("unit", 0))
+
+
+def _as_context_dict(source: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Read-only context accessor: load JSON if `source` is a path, or return `dict` as-is."""
+    if isinstance(source, str):
+        with open(source, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if isinstance(source, dict):
+        return source
+    raise TypeError(f"Expected file path or dict, got {type(source)}")
+
+
 def load_context_dump(source: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Load a JSON context dump from a file path or return a deep copy of a dict."""
     if isinstance(source, str):
@@ -61,41 +118,74 @@ def merge_context_dumps(sources: Sequence[Union[str, Dict[str, Any]]]) -> Dict[s
     if not sources:
         raise ValueError("merge_context_dumps requires at least one source dump")
 
-    dumps = [load_context_dump(s) for s in sources]
-    merged = copy.deepcopy(dumps[0])
+    loaded: List[Tuple[Dict[str, Any], bool]] = []
+    for s in sources:
+        if isinstance(s, str):
+            with open(s, "r", encoding="utf-8") as f:
+                loaded.append((json.load(f), True))
+        elif isinstance(s, dict):
+            loaded.append((s, False))
+        else:
+            raise TypeError(f"Expected file path or dict, got {type(s)}")
+
+    first_dump, first_fresh = loaded[0]
+    merged: Dict[str, Any] = {
+        k: (v if first_fresh else copy.deepcopy(v))
+        for k, v in first_dump.items()
+        if k != "sections"
+    }
     merged["sections"] = []
+    if not isinstance(merged.get("globalParams"), dict):
+        merged["globalParams"] = {}
 
     if not merged.get("maximumSpindleSpeed"):
-        for d in dumps:
+        for d, _ in loaded:
             if d.get("maximumSpindleSpeed"):
                 merged["maximumSpindleSpeed"] = d["maximumSpindleSpeed"]
                 break
 
     if "rapidMode" not in merged:
-        for d in dumps:
+        for d, is_fresh in loaded:
             if "rapidMode" in d:
-                merged["rapidMode"] = copy.deepcopy(d["rapidMode"])
+                merged["rapidMode"] = d["rapidMode"] if is_fresh else copy.deepcopy(d["rapidMode"])
                 break
 
     if not merged.get("workpieceHint"):
-        for d in dumps:
+        for d, is_fresh in loaded:
             if d.get("workpieceHint"):
-                merged["workpieceHint"] = copy.deepcopy(d["workpieceHint"])
+                merged["workpieceHint"] = d["workpieceHint"] if is_fresh else copy.deepcopy(d["workpieceHint"])
                 break
 
     global_sec_id = 0
-    for d in dumps:
-        for k, v in d.get("globalParams", {}).items():
+    for d, is_fresh in loaded:
+        for k, v in (d.get("globalParams") or {}).items():
             if k not in merged["globalParams"]:
-                merged["globalParams"][k] = v
+                merged["globalParams"][k] = v if is_fresh else copy.deepcopy(v)
 
         for sec in d.get("sections", []):
-            sec_copy = copy.deepcopy(sec)
+            sec_copy = sec if is_fresh else copy.deepcopy(sec)
             sec_copy["id"] = global_sec_id
             merged["sections"].append(sec_copy)
             global_sec_id += 1
 
     return merged
+
+
+def _classify_arc_normal(
+    nx: float,
+    ny: float,
+    nz: float,
+    cw: bool,
+    default_plane: str,
+) -> Tuple[str, bool, bool]:
+    """Map an arc plane normal vector to `("XY"|"ZX"|"YZ", cw_flipped, tilted_arc)`."""
+    if abs(nx) < 1e-5 and abs(ny) < 1e-5 and abs(abs(nz) - 1.0) < 1e-4:
+        return "XY", (not cw if nz < 0.0 else cw), False
+    if abs(nx) < 1e-5 and abs(nz) < 1e-5 and abs(abs(ny) - 1.0) < 1e-4:
+        return "ZX", (not cw if ny < 0.0 else cw), False
+    if abs(ny) < 1e-5 and abs(nz) < 1e-5 and abs(abs(nx) - 1.0) < 1e-4:
+        return "YZ", (not cw if nx < 0.0 else cw), False
+    return default_plane, cw, True
 
 
 def parse_context_dump(
@@ -106,7 +196,7 @@ def parse_context_dump(
     Translate a single or merged `universal_dumper.cps` JSON context dump into a
     normalized metric `List[MotionSegment]` for `IVerificationEngine`.
     """
-    data = load_context_dump(source)
+    data = _as_context_dict(source)
     # In CAM360/post: IN = 0, MM = 1
     unit = data.get("unit", 0)
     scale = 25.4 if unit == 0 else 1.0
@@ -125,7 +215,7 @@ def parse_context_dump(
         sec_type = sec.get("type", 0)  # 0 = TYPE_MILLING, 1 = TYPE_TURNING
         feed_mode = sec.get("feedMode", 0)
 
-        is_turning = (sec_type == 1) or bool(tool_info.get("_isTurningTool", False))
+        is_turning = is_turning_section(sec)
         is_css = is_turning and (
             tool_info.get("_spindleMode") == 1
             or tool_info.get("spindleMode") == 1
@@ -210,12 +300,7 @@ def parse_context_dump(
         # R8: Simultaneous multi-axis sections are not supported by 3-axis IPW verification.
         is_multi_axis = bool(sec.get("isMultiAxis", False)) or bool(sec.get("has5DMoves", False))
 
-        def _append_segment(seg: MotionSegment) -> None:
-            if is_tilted_section:
-                seg.metadata["tilted_section"] = True
-            if is_multi_axis:
-                seg.metadata["multi_axis"] = True
-            segments.append(seg)
+        default_plane = "ZX" if sec_type == 1 else "XY"
 
         def _to_wcs_pos(x_raw: float, y_raw: float, z_raw: float) -> Vector3D:
             if not has_sec_transform:
@@ -226,27 +311,20 @@ def parse_context_dump(
                 (wp_rz * x_raw + wp_uz * y_raw + wp_fz * z_raw + wo_z) * scale,
             )
 
-        z_clearance_mm = None
-        if not has_sec_transform or is_z_aligned_wp:
-            for k in ("operation:zClearance", "operation:clearanceHeight_value"):
+        def _resolve_z_param(keys: Tuple[str, ...]) -> Optional[float]:
+            if has_sec_transform and not is_z_aligned_wp:
+                return None
+            for k in keys:
                 if k in params and params[k] is not None:
                     try:
-                        raw_zc = float(params[k])
-                        z_clearance_mm = (raw_zc + wo_z) * scale if has_sec_transform else raw_zc * scale
-                        break
+                        raw_z = float(params[k])
+                        return (raw_z + wo_z) * scale if has_sec_transform else raw_z * scale
                     except (TypeError, ValueError):
                         pass
+            return None
 
-        z_retract_mm = None
-        if not has_sec_transform or is_z_aligned_wp:
-            for k in ("operation:zRetract", "operation:retractHeight_value", "clearance"):
-                if k in params and params[k] is not None:
-                    try:
-                        raw_zr = float(params[k])
-                        z_retract_mm = (raw_zr + wo_z) * scale if has_sec_transform else raw_zr * scale
-                        break
-                    except (TypeError, ValueError):
-                        pass
+        z_clearance_mm = _resolve_z_param(("operation:zClearance", "operation:clearanceHeight_value"))
+        z_retract_mm = _resolve_z_param(("operation:zRetract", "operation:retractHeight_value", "clearance"))
 
         def _calc_move_feed_and_rpm(
             raw_feed: float,
@@ -285,6 +363,54 @@ def parse_context_dump(
         in_cycle_active = False
 
         for ev_idx, ev in enumerate(sec.get("events", [])):
+            def _emit_segment(
+                motion: MotionKind,
+                start: Vector3D,
+                end: Vector3D,
+                feedrate_mmpm: float,
+                rpm: float,
+                duration_sec: float,
+                *,
+                in_cycle: bool,
+                is_arc: bool = False,
+                arc_center: Optional[Vector3D] = None,
+                arc_plane: Optional[str] = None,
+                extra_meta: Optional[Dict[str, Any]] = None,
+            ) -> None:
+                nonlocal segment_id
+                segment_id += 1
+                meta: Dict[str, Any] = {
+                    "in_cycle": in_cycle,
+                    "sec_idx": sec_idx,
+                    "event_idx": ev_idx,
+                    "z_clearance_mm": z_clearance_mm,
+                    "z_retract_mm": z_retract_mm,
+                    "sec_type": sec_type,
+                }
+                if extra_meta:
+                    meta.update(extra_meta)
+                if is_tilted_section:
+                    meta["tilted_section"] = True
+                if is_multi_axis:
+                    meta["multi_axis"] = True
+                segments.append(
+                    MotionSegment(
+                        segment_id=segment_id,
+                        op_id=op_name,
+                        sec_id=sec_id,
+                        motion=motion,
+                        start=start,
+                        end=end,
+                        feedrate_mmpm=feedrate_mmpm,
+                        spindle_rpm=rpm,
+                        duration_sec=duration_sec,
+                        is_arc=is_arc,
+                        arc_center=arc_center,
+                        arc_plane=arc_plane if arc_plane is not None else default_plane,
+                        metadata=meta,
+                    )
+                )
+
             ev_type = ev.get("type")
             if ev_type == "onCycle":
                 in_cycle_active = True
@@ -317,30 +443,14 @@ def parse_context_dump(
                 if dist < 1e-9:
                     continue
                 duration = (dist / max(1.0, default_rapid_feed_mmpm)) * 60.0
-                segment_id += 1
-                _append_segment(
-                    MotionSegment(
-                        segment_id=segment_id,
-                        op_id=op_name,
-                        sec_id=sec_id,
-                        motion=MotionKind.RAPID,
-                        start=start_pos,
-                        end=end_pos,
-                        feedrate_mmpm=default_rapid_feed_mmpm,
-                        spindle_rpm=float(ev.get("rpm", spindle_rpm) or spindle_rpm),
-                        duration_sec=duration,
-                        is_arc=False,
-                        arc_center=None,
-                        arc_plane="ZX" if sec_type == 1 else "XY",
-                        metadata={
-                            "in_cycle": in_cycle_active,
-                            "sec_idx": sec_idx,
-                            "event_idx": ev_idx,
-                            "z_clearance_mm": z_clearance_mm,
-                            "z_retract_mm": z_retract_mm,
-                            "sec_type": sec_type,
-                        },
-                    )
+                _emit_segment(
+                    MotionKind.RAPID,
+                    start_pos,
+                    end_pos,
+                    default_rapid_feed_mmpm,
+                    float(ev.get("rpm", spindle_rpm) or spindle_rpm),
+                    duration,
+                    in_cycle=in_cycle_active,
                 )
 
             elif ev_type == "onLinear":
@@ -364,34 +474,21 @@ def parse_context_dump(
                 raw_ev_rpm = float(ev.get("rpm", 0.0)) if ev.get("rpm") else None
                 feed_mmpm, rpm = _calc_move_feed_and_rpm(float(ev.get("feed", 0.0)), start_pos, end_pos, raw_ev_rpm)
                 duration = (dist / max(1.0, feed_mmpm)) * 60.0 if feed_mmpm > 0 else 0.0
-                segment_id += 1
-                _append_segment(
-                    MotionSegment(
-                        segment_id=segment_id,
-                        op_id=op_name,
-                        sec_id=sec_id,
-                        motion=MotionKind.LINEAR,
-                        start=start_pos,
-                        end=end_pos,
-                        feedrate_mmpm=feed_mmpm,
-                        spindle_rpm=rpm,
-                        duration_sec=duration,
-                        is_arc=False,
-                        arc_center=None,
-                        arc_plane="ZX" if sec_type == 1 else "XY",
-                        metadata={
-                            "in_cycle": in_cycle_active or bool(ev.get("sync", False)),
-                            "sync": bool(ev.get("sync", False)),
-                            "movement": ev.get("movement", 1),
-                            "sec_idx": sec_idx,
-                            "event_idx": ev_idx,
-                            "z_clearance_mm": z_clearance_mm,
-                            "z_retract_mm": z_retract_mm,
-                            "sec_type": sec_type,
-                            "rc": cur_rc,
-                            "rc_transition": is_rc_transition,
-                        },
-                    )
+                is_sync = bool(ev.get("sync", False))
+                _emit_segment(
+                    MotionKind.LINEAR,
+                    start_pos,
+                    end_pos,
+                    feed_mmpm,
+                    rpm,
+                    duration,
+                    in_cycle=in_cycle_active or is_sync,
+                    extra_meta={
+                        "sync": is_sync,
+                        "movement": ev.get("movement", 1),
+                        "rc": cur_rc,
+                        "rc_transition": is_rc_transition,
+                    },
                 )
 
             elif ev_type == "onCircular":
@@ -419,54 +516,28 @@ def parse_context_dump(
                 duration = (dist / max(1.0, feed_mmpm)) * 60.0 if feed_mmpm > 0 else 0.0
                 cw = bool(ev.get("cw", True))
                 plane_idx = int(ev.get("plane", 0))
-                plane_str = {0: "XY", 1: "ZX", 2: "YZ"}.get(plane_idx, "ZX" if sec_type == 1 else "XY")
+                plane_str = {0: "XY", 1: "ZX", 2: "YZ"}.get(plane_idx, default_plane)
                 tilted_arc = False
-                if sec_type != 1:
-                    if has_sec_transform:
-                        if "nx" in ev and "ny" in ev and "nz" in ev:
+                if sec_type != 1 and (has_sec_transform or plane_idx not in (0, 1, 2)):
+                    has_explicit_normal = "nx" in ev and "ny" in ev and "nz" in ev
+                    if not has_sec_transform and not has_explicit_normal:
+                        tilted_arc = True
+                    else:
+                        if has_explicit_normal:
                             nx0, ny0, nz0 = float(ev["nx"]), float(ev["ny"]), float(ev["nz"])
                         else:
                             nx0, ny0, nz0 = {0: (0.0, 0.0, 1.0), 1: (0.0, 1.0, 0.0), 2: (1.0, 0.0, 0.0)}.get(
                                 plane_idx, (0.0, 0.0, 1.0)
                             )
-                        nx = wp_rx * nx0 + wp_ux * ny0 + wp_fx * nz0
-                        ny = wp_ry * nx0 + wp_uy * ny0 + wp_fy * nz0
-                        nz = wp_rz * nx0 + wp_uz * ny0 + wp_fz * nz0
-                        if wp_det < 0.0:
-                            cw = not cw
-                        if abs(nx) < 1e-5 and abs(ny) < 1e-5 and abs(abs(nz) - 1.0) < 1e-4:
-                            plane_str = "XY"
-                            if nz < 0.0:
-                                cw = not cw
-                        elif abs(nx) < 1e-5 and abs(nz) < 1e-5 and abs(abs(ny) - 1.0) < 1e-4:
-                            plane_str = "ZX"
-                            if ny < 0.0:
-                                cw = not cw
-                        elif abs(ny) < 1e-5 and abs(nz) < 1e-5 and abs(abs(nx) - 1.0) < 1e-4:
-                            plane_str = "YZ"
-                            if nx < 0.0:
+                        if has_sec_transform:
+                            nx = wp_rx * nx0 + wp_ux * ny0 + wp_fx * nz0
+                            ny = wp_ry * nx0 + wp_uy * ny0 + wp_fy * nz0
+                            nz = wp_rz * nx0 + wp_uz * ny0 + wp_fz * nz0
+                            if wp_det < 0.0:
                                 cw = not cw
                         else:
-                            tilted_arc = True
-                    elif plane_idx not in (0, 1, 2):
-                        if "nx" in ev and "ny" in ev and "nz" in ev:
-                            nx, ny, nz = float(ev["nx"]), float(ev["ny"]), float(ev["nz"])
-                            if abs(nx) < 1e-5 and abs(ny) < 1e-5 and abs(abs(nz) - 1.0) < 1e-4:
-                                plane_str = "XY"
-                                if nz < 0.0:
-                                    cw = not cw
-                            elif abs(nx) < 1e-5 and abs(nz) < 1e-5 and abs(abs(ny) - 1.0) < 1e-4:
-                                plane_str = "ZX"
-                                if ny < 0.0:
-                                    cw = not cw
-                            elif abs(ny) < 1e-5 and abs(nz) < 1e-5 and abs(abs(nx) - 1.0) < 1e-4:
-                                plane_str = "YZ"
-                                if nx < 0.0:
-                                    cw = not cw
-                            else:
-                                tilted_arc = True
-                        else:
-                            tilted_arc = True
+                            nx, ny, nz = nx0, ny0, nz0
+                        plane_str, cw, tilted_arc = _classify_arc_normal(nx, ny, nz, cw, plane_str)
 
                 if tilted_arc and ev.get("linearizedMoves"):
                     prev_pt = start_pos
@@ -483,60 +554,30 @@ def parse_context_dump(
                             float(lin_mv.get("feed", ev.get("feed", 0.0))), prev_pt, nxt_pt, raw_ev_rpm
                         )
                         sub_dur = (sub_d / max(1.0, sub_f)) * 60.0 if sub_f > 0 else 0.0
-                        segment_id += 1
-                        _append_segment(
-                            MotionSegment(
-                                segment_id=segment_id,
-                                op_id=op_name,
-                                sec_id=sec_id,
-                                motion=MotionKind.LINEAR,
-                                start=prev_pt,
-                                end=nxt_pt,
-                                feedrate_mmpm=sub_f,
-                                spindle_rpm=sub_rpm,
-                                duration_sec=sub_dur,
-                                is_arc=False,
-                                arc_center=None,
-                                arc_plane="ZX" if sec_type == 1 else "XY",
-                                metadata={
-                                    "in_cycle": True,
-                                    "movement": lin_mv.get("movement", ev.get("movement")),
-                                    "sec_idx": sec_idx,
-                                    "event_idx": ev_idx,
-                                    "z_clearance_mm": z_clearance_mm,
-                                    "z_retract_mm": z_retract_mm,
-                                    "sec_type": sec_type,
-                                },
-                            )
+                        _emit_segment(
+                            MotionKind.LINEAR,
+                            prev_pt,
+                            nxt_pt,
+                            sub_f,
+                            sub_rpm,
+                            sub_dur,
+                            in_cycle=True,
+                            extra_meta={"movement": lin_mv.get("movement", ev.get("movement"))},
                         )
                         prev_pt = nxt_pt
                 else:
-                    motion = MotionKind.ARC_CW if cw else MotionKind.ARC_CCW
-                    segment_id += 1
-                    _append_segment(
-                        MotionSegment(
-                            segment_id=segment_id,
-                            op_id=op_name,
-                            sec_id=sec_id,
-                            motion=motion,
-                            start=start_pos,
-                            end=end_pos,
-                            feedrate_mmpm=feed_mmpm,
-                            spindle_rpm=rpm,
-                            duration_sec=duration,
-                            is_arc=True,
-                            arc_center=center_pos,
-                            arc_plane=plane_str,
-                            metadata={
-                                "in_cycle": in_cycle_active,
-                                "movement": ev.get("movement"),
-                                "sec_idx": sec_idx,
-                                "event_idx": ev_idx,
-                                "z_clearance_mm": z_clearance_mm,
-                                "z_retract_mm": z_retract_mm,
-                                "sec_type": sec_type,
-                            },
-                        )
+                    _emit_segment(
+                        MotionKind.ARC_CW if cw else MotionKind.ARC_CCW,
+                        start_pos,
+                        end_pos,
+                        feed_mmpm,
+                        rpm,
+                        duration,
+                        in_cycle=in_cycle_active,
+                        is_arc=True,
+                        arc_center=center_pos,
+                        arc_plane=plane_str,
+                        extra_meta={"movement": ev.get("movement")},
                     )
 
             elif ev_type == "onCyclePoint":
@@ -580,27 +621,14 @@ def parse_context_dump(
                         f_mmpm, rpm = _calc_move_feed_and_rpm(float(sub_mv.get("feed", 0.0)), s_pos, e_pos, raw_ev_rpm)
                     dist = math.hypot(e_pos.x - s_pos.x, e_pos.y - s_pos.y, e_pos.z - s_pos.z)
                     duration = (dist / max(1.0, f_mmpm)) * 60.0 if f_mmpm > 0 else 0.0
-                    segment_id += 1
-                    _append_segment(
-                        MotionSegment(
-                            segment_id=segment_id,
-                            op_id=op_name,
-                            sec_id=sec_id,
-                            motion=MotionKind.RAPID if is_rap else MotionKind.LINEAR,
-                            start=s_pos,
-                            end=e_pos,
-                            feedrate_mmpm=f_mmpm,
-                            spindle_rpm=rpm,
-                            duration_sec=duration,
-                            is_arc=False,
-                            arc_center=None,
-                            arc_plane="ZX" if sec_type == 1 else "XY",
-                            metadata={
-                                "in_cycle": True,
-                                "sec_idx": sec_idx,
-                                "event_idx": ev_idx,
-                            },
-                        )
+                    _emit_segment(
+                        MotionKind.RAPID if is_rap else MotionKind.LINEAR,
+                        s_pos,
+                        e_pos,
+                        f_mmpm,
+                        rpm,
+                        duration,
+                        in_cycle=True,
                     )
 
             elif ev_type == "onDwell":
@@ -610,26 +638,15 @@ def parse_context_dump(
                 else:
                     init_p = sec.get("initialPosition", {"x": 0.0, "y": 0.0, "z": 0.0})
                     cur_p = _to_wcs_pos(float(init_p["x"]), float(init_p["y"]), float(init_p["z"]))
-                segment_id += 1
-                _append_segment(
-                    MotionSegment(
-                        segment_id=segment_id,
-                        op_id=op_name,
-                        sec_id=sec_id,
-                        motion=MotionKind.DWELL,
-                        start=cur_p,
-                        end=cur_p,
-                        feedrate_mmpm=0.0,
-                        spindle_rpm=spindle_rpm,
-                        duration_sec=dwell_sec,
-                        is_arc=False,
-                        arc_center=None,
-                        metadata={
-                            "in_cycle": in_cycle_active,
-                            "sec_idx": sec_idx,
-                            "event_idx": ev_idx,
-                        },
-                    )
+                _emit_segment(
+                    MotionKind.DWELL,
+                    cur_p,
+                    cur_p,
+                    0.0,
+                    spindle_rpm,
+                    dwell_sec,
+                    in_cycle=in_cycle_active,
+                    arc_plane="XY",
                 )
 
     return segments
@@ -739,6 +756,7 @@ def extract_workpiece_from_context(
     - Turning: AxisymmetricStock2D with AxisymmetricChuckObstacle fixtures.
     - Milling: BoxStock3D (prismatic stock bounding box).
     """
+    context_data = _as_context_dict(context_data)
     from geometry.models import (
         AxisymmetricChuckObstacle,
         AxisymmetricStock2D,
@@ -805,14 +823,13 @@ def extract_workpiece_from_context(
                     is_inch = (context_data.get("unit", 0) == 0)
 
                 # Cross-check against workpieceHint if captured
-                hint = context_data.get("workpieceHint")
-                if hint and isinstance(hint, dict) and "lower" in hint and "upper" in hint:
-                    hint_lower = hint["lower"]
-                    hint_upper = hint["upper"]
+                wh_mm = extract_workpiece_hint_bbox_mm(context_data)
+                if wh_mm is not None:
+                    dump_scale = 25.4 if int(context_data.get("unit", 0) or 0) == 0 else 1.0
                     hint_extents = np.array([
-                        abs(float(hint_upper.get("x", 0.0)) - float(hint_lower.get("x", 0.0))),
-                        abs(float(hint_upper.get("y", 0.0)) - float(hint_lower.get("y", 0.0))),
-                        abs(float(hint_upper.get("z", 0.0)) - float(hint_lower.get("z", 0.0))),
+                        (wh_mm[1] - wh_mm[0]) / dump_scale,
+                        (wh_mm[3] - wh_mm[2]) / dump_scale,
+                        (wh_mm[5] - wh_mm[4]) / dump_scale,
                     ], dtype=np.float64)
 
                     candidate_scales = [1.0, 25.4, 1.0 / 25.4]
@@ -851,10 +868,7 @@ def extract_workpiece_from_context(
 
                 turning_mode = is_turning
                 if turning_mode is None:
-                    turning_mode = any(
-                        sec.get("type") == 1 or bool(sec.get("tool", {}).get("_isTurningTool", False))
-                        for sec in context_data.get("sections", [])
-                    )
+                    turning_mode = is_turning_context(context_data)
                 fb_fixtures = getattr(fallback_workpiece, "fixtures", None) if fallback_workpiece else None
                 _dbg_ctx(f"extract_workpiece_from_context: loading stock from exported STL '{stl_path}' (turning={turning_mode}, inch={is_inch})")
 
@@ -920,21 +934,13 @@ def extract_workpiece_from_context(
     scale = 25.4 if unit == 0 else 1.0
 
     if is_turning is None:
-        # Auto-detect turning if any section is turning type (1) or has turning tool
-        is_turning = any(
-            sec.get("type") == 1 or bool(sec.get("tool", {}).get("_isTurningTool", False))
-            for sec in context_data.get("sections", [])
-        )
+        is_turning = is_turning_context(context_data)
 
     if not is_turning:
-        x_min = float(lower.get("x", 0.0)) * scale
-        x_max = float(upper.get("x", 0.0)) * scale
-        y_min = float(lower.get("y", 0.0)) * scale
-        y_max = float(upper.get("y", 0.0)) * scale
-        z_min = float(lower.get("z", 0.0)) * scale
-        z_max = float(upper.get("z", 0.0)) * scale
-        if x_max <= x_min + 1e-6 or y_max <= y_min + 1e-6 or z_max <= z_min + 1e-6:
+        box_mm = _bbox_dict_to_mm(wp, unit)
+        if box_mm is None:
             return fallback_workpiece
+        x_min, x_max, y_min, y_max, z_min, z_max = box_mm
         return WorkpieceDefinition(
             stock=BoxStock3D(
                 x_min=x_min,
@@ -1016,6 +1022,7 @@ def extract_tools_from_context(
     - Turning operations: LatheToolGeometry using 2D SVG profiles (_cutterSVG / _holderSVG).
     - Milling operations: MillToolGeometry using parametric tool dimensions.
     """
+    context_data = _as_context_dict(context_data)
     from geometry.models import (
         LatheToolGeometry,
         MillToolGeometry,
@@ -1037,7 +1044,7 @@ def extract_tools_from_context(
         cutter_svg = t.get("_cutterSVG", "")
         holder_svg = t.get("_holderSVG", "")
 
-        is_turning_tool = bool(t.get("_isTurningTool", False)) or (sec_type == 1)
+        is_turning_tool = is_turning_section(sec)
         if is_turning is False:
             is_turning_tool = False
         elif is_turning is True:
@@ -1106,25 +1113,19 @@ def extract_tools_from_context(
                 if holder_l <= 0.0:
                     holder_l = sum(l for l, _ in holder_sections)
 
-            mill_kwargs: Dict[str, Any] = {
-                "diameter": dia,
-                "corner_radius": cr,
-                "flute_length": flute_l,
-                "overall_length": overall_l,
-                "taper_angle_deg": taper_a,
-                "holder_diameter": holder_d,
-                "holder_length": holder_l,
-            }
-            known_fields = getattr(MillToolGeometry, "__dataclass_fields__", {})
-            for extra_k, extra_v in (
-                ("body_length", body_l),
-                ("shoulder_length", shoulder_l),
-                ("shaft_diameter", shaft_d),
-                ("holder_sections", holder_sections),
-            ):
-                if extra_k in known_fields:
-                    mill_kwargs[extra_k] = extra_v
-            mill_geom = MillToolGeometry(**mill_kwargs)
+            mill_geom = MillToolGeometry(
+                diameter=dia,
+                corner_radius=cr,
+                flute_length=flute_l,
+                overall_length=overall_l,
+                taper_angle_deg=taper_a,
+                holder_diameter=holder_d,
+                holder_length=holder_l,
+                body_length=body_l,
+                shoulder_length=shoulder_l,
+                shaft_diameter=shaft_d,
+                holder_sections=holder_sections,
+            )
             tools_by_op[op_name] = ToolAssembly(
                 tool_id=int(t.get("number", 0) or 0),
                 name=op_name,
@@ -1349,8 +1350,7 @@ def check_dumped_sections_capability(
         if not jp or not os.path.isfile(jp):
             continue
         try:
-            with open(jp, "r", encoding="utf-8") as jf:
-                dump_data = json.load(jf)
+            dump_data = _as_context_dict(jp)
         except Exception:
             continue
         if not isinstance(dump_data, dict):

@@ -543,11 +543,7 @@ def harvest_setup(
         enum_cls = getattr(adsk.cam, "PostOutputUnitOptions", None)
         mm_opt = getattr(enum_cls, "MillimetersOutput", 2) if enum_cls else 2
         in_opt = getattr(enum_cls, "InchesOutput", 1) if enum_cls else 1
-        try:
-            doc_settings = PostClear.loadSettings(doc) if hasattr(PostClear, "loadSettings") else {}
-        except Exception:
-            doc_settings = {}
-        units = PostClear._GetNCProgramOutputUnits(prog_obj, docSettings=doc_settings)
+        units = PostClear._GetNCProgramOutputUnits(prog_obj)
         dumper_unit = 1 if units == mm_opt else (0 if units == in_opt else None)
         stock_unit = PostClear._GetDocumentStockUnit(doc)
         is_prev_stock = any(k in stock_mode for k in ("previous", "preceding", "prev", "rest"))

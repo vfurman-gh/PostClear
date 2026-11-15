@@ -72,21 +72,54 @@ if (basePostPath && FileSystem.isFile(basePostPath)) {
   } catch (e) {}
 }
 
+function _setVendorProperty(name, val) {
+  try {
+    if (typeof properties === "object" && properties && Object.prototype.hasOwnProperty.call(properties, name)) {
+      if (properties[name] !== null && typeof properties[name] === "object") {
+        properties[name].value = val;
+        properties[name].current = val;
+      } else {
+        properties[name] = val;
+      }
+    }
+  } catch (e) {}
+}
+
+function _readVendorProperty(name, expectedType, validFn) {
+  function _ok(v) {
+    return (typeof v === expectedType) && (!validFn || validFn(v));
+  }
+  try {
+    if (typeof getProperty === "function") {
+      var gp = getProperty(name);
+      if (_ok(gp)) return gp;
+    }
+  } catch (e) {}
+  try {
+    if (typeof properties === "object" && properties && typeof properties[name] !== "undefined") {
+      var p = properties[name];
+      var val = (p !== null && typeof p === "object")
+        ? (("current" in p && p.current !== undefined) ? p.current : p.value)
+        : p;
+      if (_ok(val)) return val;
+    }
+  } catch (e) {}
+  try {
+    if (typeof _cfgProps === "object" && _cfgProps && _ok(_cfgProps[name])) {
+      return _cfgProps[name];
+    }
+  } catch (e) {}
+  return null;
+}
+
 var _cfgProps = {};
 try {
   var _dc = _getDumperConfig();
   if (_dc && _dc.postProperties && typeof _dc.postProperties === "object") {
     _cfgProps = _dc.postProperties;
-    if (typeof properties === "object" && properties) {
-      for (var _pk in _cfgProps) {
-        if (Object.prototype.hasOwnProperty.call(properties, _pk)) {
-          if (properties[_pk] !== null && typeof properties[_pk] === "object") {
-            properties[_pk].value = _cfgProps[_pk];
-            properties[_pk].current = _cfgProps[_pk];
-          } else {
-            properties[_pk] = _cfgProps[_pk];
-          }
-        }
+    for (var _pk in _cfgProps) {
+      if (Object.prototype.hasOwnProperty.call(_cfgProps, _pk)) {
+        _setVendorProperty(_pk, _cfgProps[_pk]);
       }
     }
   }
@@ -138,28 +171,7 @@ try {
 } catch (e) {}
 
 function _resolveUseG0() {
-  try {
-    if (typeof getProperty === "function") {
-      var ug = getProperty("useG0");
-      if (typeof ug === "boolean") {
-        return ug;
-      }
-    }
-  } catch (e) {}
-  try {
-    if (typeof properties === "object" && properties && typeof properties.useG0 !== "undefined") {
-      var val = (typeof properties.useG0 === "object" && properties.useG0 !== null) ? properties.useG0.value : properties.useG0;
-      if (typeof val === "boolean") {
-        return val;
-      }
-    }
-  } catch (e) {}
-  try {
-    if (typeof _cfgProps === "object" && _cfgProps && typeof _cfgProps.useG0 === "boolean") {
-      return _cfgProps.useG0;
-    }
-  } catch (e) {}
-  return null;
+  return _readVendorProperty("useG0", "boolean");
 }
 
 function _resolveHighFeedMapping() {
@@ -322,26 +334,11 @@ onOpen = function() {
   dumpData.programName = programName;
   dumpData.programComment = programComment;
   dumpData.stockMode = "";
-  dumpData.maximumSpindleSpeed = 0;
-  try {
-    if (typeof getProperty === "function") {
-      var pMax = getProperty("maximumSpindleSpeed");
-      if (typeof pMax === "number" && pMax > 0) {
-        dumpData.maximumSpindleSpeed = pMax;
-      }
-    }
-  } catch (e) {}
-  if (!dumpData.maximumSpindleSpeed && typeof properties === "object" && properties && properties.maximumSpindleSpeed) {
-    try {
-      var pVal = (typeof properties.maximumSpindleSpeed === "object") ? properties.maximumSpindleSpeed.value : properties.maximumSpindleSpeed;
-      if (typeof pVal === "number" && pVal > 0) {
-        dumpData.maximumSpindleSpeed = pVal;
-      }
-    } catch (e) {}
-  }
-  if (!dumpData.maximumSpindleSpeed && _cfgProps && typeof _cfgProps.maximumSpindleSpeed === "number" && _cfgProps.maximumSpindleSpeed > 0) {
-    dumpData.maximumSpindleSpeed = _cfgProps.maximumSpindleSpeed;
-  }
+  dumpData.maximumSpindleSpeed = _readVendorProperty(
+    "maximumSpindleSpeed",
+    "number",
+    function(v) { return v > 0; }
+  ) || 0;
   try {
     var cfg = _getDumperConfig();
     if (cfg && cfg.stockMode) {

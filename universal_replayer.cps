@@ -126,7 +126,20 @@ function makeSection(s, idx, allRawSections) {
   var toolObj = makeTool(s.tool);
   var wp = toMat(s.workPlane);
   var wo = toVec(s.workOrigin);
-  return {
+  function _globalSectionPos(rawPos, rawGlobalPos) {
+    var localP = toVec(rawPos);
+    var calcGlobal = Vector.sum(wp.multiply(localP), wo);
+    if (rawGlobalPos) {
+      var gp = toVec(rawGlobalPos);
+      // Legacy dumps before getGlobalPosition() fix stored raw position in globalPosition;
+      // prefer calculated global position if stored global matches raw under a non-trivial frame.
+      if (Vector.diff(gp, localP).length > 1e-6 || Vector.diff(calcGlobal, localP).length <= 1e-6) {
+        return gp;
+      }
+    }
+    return calcGlobal;
+  }
+  var sec = {
     id: idx,
     type: s.type,
     quality: s.quality || 0,
@@ -165,29 +178,11 @@ function makeSection(s, idx, allRawSections) {
     getTool: function() { return toolObj; },
     getInitialPosition: function() { return toVec(s.initialPosition); },
     getGlobalInitialPosition: function() {
-      var ip = toVec(s.initialPosition);
-      var calcGlobal = Vector.sum(wp.multiply(ip), wo);
-      if (s.globalInitialPosition) {
-        var gip = toVec(s.globalInitialPosition);
-        // Legacy dumps before getGlobalPosition() fix stored raw initialPosition in globalInitialPosition;
-        // prefer calculated global position if globalInitialPosition equals raw initialPosition under a non-trivial frame.
-        if (Vector.diff(gip, ip).length > 1e-6 || Vector.diff(calcGlobal, ip).length <= 1e-6) {
-          return gip;
-        }
-      }
-      return calcGlobal;
+      return _globalSectionPos(s.initialPosition, s.globalInitialPosition);
     },
     getFinalPosition: function() { return toVec(s.finalPosition || s.endPos || s.initialPosition); },
     getGlobalFinalPosition: function() {
-      var fp = toVec(s.finalPosition || s.endPos || s.initialPosition);
-      var calcGlobal = Vector.sum(wp.multiply(fp), wo);
-      if (s.globalFinalPosition) {
-        var gfp = toVec(s.globalFinalPosition);
-        if (Vector.diff(gfp, fp).length > 1e-6 || Vector.diff(calcGlobal, fp).length <= 1e-6) {
-          return gfp;
-        }
-      }
-      return calcGlobal;
+      return _globalSectionPos(s.finalPosition || s.endPos || s.initialPosition, s.globalFinalPosition);
     },
     getFirstPosition: function() { return toVec(s.initialPosition); },
     getGlobalPosition: function(v) {
@@ -350,18 +345,6 @@ function makeSection(s, idx, allRawSections) {
         }
       };
     },
-    getZRange: function() {
-      var minVal = (s.zRangeMin !== undefined) ? s.zRangeMin : 0;
-      var maxVal = (s.zRangeMax !== undefined) ? s.zRangeMax : 0;
-      return {
-        getMinimum: function() { return minVal; },
-        getMaximum: function() { return maxVal; },
-        expandToRange: function(other) {
-          if (other.getMinimum() < minVal) minVal = other.getMinimum();
-          if (other.getMaximum() > maxVal) maxVal = other.getMaximum();
-        }
-      };
-    },
     hasParameter: function(name) {
       return !!(s.params && Object.prototype.hasOwnProperty.call(s.params, name));
     },
@@ -373,6 +356,8 @@ function makeSection(s, idx, allRawSections) {
     },
     checkGroup: function() { return false; }
   };
+  sec.getZRange = sec.getGlobalZRange;
+  return sec;
 }
 
 function hydrateCycle(c) {
@@ -687,14 +672,6 @@ function onClose() {
     "  }\n" +
     "}\n" +
     "function __applyPostProp(name, val) {\n" +
-    "  if (typeof properties !== 'undefined' && properties && Object.prototype.hasOwnProperty.call(properties, name)) {\n" +
-    "    if (properties[name] !== null && typeof properties[name] === 'object') {\n" +
-    "      properties[name].value = val;\n" +
-    "      properties[name].current = val;\n" +
-    "    } else {\n" +
-    "      properties[name] = val;\n" +
-    "    }\n" +
-    "  }\n" +
     "  if (typeof setProperty === 'function') {\n" +
     "    try { setProperty(name, val); } catch (e) {}\n" +
     "  }\n" +
@@ -708,62 +685,43 @@ function onClose() {
     "if (typeof fourthAxisClamp !== 'undefined') this.fourthAxisClamp = fourthAxisClamp;\n" +
     "if (typeof fifthAxisClamp !== 'undefined') this.fifthAxisClamp = fifthAxisClamp;\n" +
     "if (typeof sixthAxisClamp !== 'undefined') this.sixthAxisClamp = sixthAxisClamp;\n" +
+    "function __replaySubMoves(moves, defaultType) {\n" +
+    "  if (!moves) return;\n" +
+    "  for (var m = 0; m < moves.length; ++m) {\n" +
+    "    var mv = moves[m];\n" +
+    "    if (mv.movement !== undefined) movement = mv.movement;\n" +
+    "    var mType = mv.type || defaultType;\n" +
+    "    if (mType === 'onRapid') {\n" +
+    "      var pr = __fp(mv.x, mv.y, mv.z);\n" +
+    "      if (typeof onRapid === 'function') onRapid(pr.x, pr.y, pr.z);\n" +
+    "      __setLocalPos(mv);\n" +
+    "    } else if (mType === 'onLinear') {\n" +
+    "      var pl = __fp(mv.x, mv.y, mv.z);\n" +
+    "      if (typeof onLinear === 'function') onLinear(pl.x, pl.y, pl.z, mv.feed);\n" +
+    "      __setLocalPos(mv);\n" +
+    "    } else if (mType === 'onDwell') {\n" +
+    "      if (typeof onDwell === 'function') onDwell(mv.sec);\n" +
+    "    }\n" +
+    "  }\n" +
+    "}\n" +
     "function linearize(tol) {\n" +
     "  var cEv = __getCurEv();\n" +
     "  if (cEv && cEv.linearizedMoves && cEv.linearizedMoves.length > 0) {\n" +
-    "    for (var m = 0; m < cEv.linearizedMoves.length; ++m) {\n" +
-    "      var mv = cEv.linearizedMoves[m];\n" +
-    "      if (mv.movement !== undefined) movement = mv.movement;\n" +
-    "      var p = __fp(mv.x, mv.y, mv.z);\n" +
-    "      onLinear(p.x, p.y, p.z, mv.feed);\n" +
-    "      __setLocalPos(mv);\n" +
-    "    }\n" +
+    "    __replaySubMoves(cEv.linearizedMoves, 'onLinear');\n" +
     "  } else if (cEv) {\n" +
-    "    var p2 = __fp(cEv.x, cEv.y, cEv.z);\n" +
-    "    onLinear(p2.x, p2.y, p2.z, cEv.feed);\n" +
-    "    __setLocalPos(cEv);\n" +
+    "    __replaySubMoves([{type: 'onLinear', x: cEv.x, y: cEv.y, z: cEv.z, feed: cEv.feed}], 'onLinear');\n" +
     "  }\n" +
     "}\n" +
     "function expandCyclePoint(x, y, z) {\n" +
     "  cycleExpanded = true;\n" +
     "  var cEv = __getCurEv();\n" +
     "  var list = cEv ? ((__didRepos && cEv.afterReposMoves) ? cEv.afterReposMoves : cEv.expandedMoves) : null;\n" +
-    "  if (list) {\n" +
-    "    for (var m = 0; m < list.length; ++m) {\n" +
-    "      var mv = list[m];\n" +
-    "      if (mv.movement !== undefined) movement = mv.movement;\n" +
-    "      if (mv.type === 'onRapid') {\n" +
-    "        var pr = __fp(mv.x, mv.y, mv.z);\n" +
-    "        onRapid(pr.x, pr.y, pr.z);\n" +
-    "        __setLocalPos(mv);\n" +
-    "      } else if (mv.type === 'onLinear') {\n" +
-    "        var pl = __fp(mv.x, mv.y, mv.z);\n" +
-    "        onLinear(pl.x, pl.y, pl.z, mv.feed);\n" +
-    "        __setLocalPos(mv);\n" +
-    "      } else if (mv.type === 'onDwell') {\n" +
-    "        if (typeof onDwell === 'function') onDwell(mv.sec);\n" +
-    "      }\n" +
-    "    }\n" +
-    "  }\n" +
+    "  __replaySubMoves(list);\n" +
     "}\n" +
     "function repositionToCycleClearance(cycle, x, y, z) {\n" +
     "  __didRepos = true;\n" +
     "  var cEv = __getCurEv();\n" +
-    "  if (cEv && cEv.reposMoves) {\n" +
-    "    for (var m = 0; m < cEv.reposMoves.length; ++m) {\n" +
-    "      var mv = cEv.reposMoves[m];\n" +
-    "      if (mv.movement !== undefined) movement = mv.movement;\n" +
-    "      if (mv.type === 'onRapid') {\n" +
-    "        var pr = __fp(mv.x, mv.y, mv.z);\n" +
-    "        onRapid(pr.x, pr.y, pr.z);\n" +
-    "        __setLocalPos(mv);\n" +
-    "      } else if (mv.type === 'onLinear') {\n" +
-    "        var pl = __fp(mv.x, mv.y, mv.z);\n" +
-    "        onLinear(pl.x, pl.y, pl.z, mv.feed);\n" +
-    "        __setLocalPos(mv);\n" +
-    "      }\n" +
-    "    }\n" +
-    "  }\n" +
+    "  __replaySubMoves(cEv ? cEv.reposMoves : null);\n" +
     "}\n" +
     "function expandManualNC(command, value) {\n" +
     "  var matched = null;\n" +

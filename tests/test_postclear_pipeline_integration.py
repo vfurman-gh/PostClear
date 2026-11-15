@@ -457,12 +457,10 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         self.assertIn("Kernel failed to solve", created_palettes[constNotificationPaletteId].html)
 
     def test_notification_event_handlers_and_action_urls(self):
-        """Verify that action:// navigation links and HTML events properly route to file opening."""
-        import urllib.parse
+        """Verify single-transport HTML events properly route to file opening without action:// navigation."""
         import PostClear
         from PostClear import (
             _BuildNotificationHTML,
-            _NotificationNavigationEventHandler,
             _NotificationHTMLEventHandler,
             constNotificationPaletteId,
         )
@@ -472,31 +470,18 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             ("Open Folder", "open_folder", "/tmp/test_dir"),
         ]
         html_out = _BuildNotificationHTML("Done", "success", "All good", "/tmp/test_dir", actions)
-        self.assertIn('action://open_file?path=', html_out)
-        self.assertIn('action://open_folder?path=', html_out)
+        self.assertNotIn('action://', html_out)
+        self.assertNotIn('window.location.href', html_out)
+        self.assertIn('href="#"', html_out)
         self.assertIn('sendAction(event, \'open_file\'', html_out)
+        self.assertFalse(hasattr(PostClear, "_NotificationNavigationEventHandler"))
 
         opened_files = []
         orig_open_file = PostClear._OpenFile
         try:
             PostClear._OpenFile = lambda p: opened_files.append(p)
 
-            # Test NavigationEventHandler
-            nav_handler = _NotificationNavigationEventHandler(constNotificationPaletteId)
-            mock_nav_args = type("NavArgs", (), {
-                "navigationURL": "action://open_file?path=%2Ftmp%2Ftest_dir%2Foutput.nc",
-                "launchExternally": True,
-                "preventDefault": False,
-            })()
-
-            # Temporarily make path exist
-            with tempfile.NamedTemporaryFile() as tf:
-                mock_nav_args.navigationURL = f"action://open_file?path={urllib.parse.quote(tf.name)}"
-                nav_handler.notify(mock_nav_args)
-                self.assertFalse(mock_nav_args.launchExternally, "Must prevent external browser opening")
-                self.assertIn(tf.name, opened_files)
-
-            # Test HTMLEventHandler
+            # Test HTMLEventHandler (single transport)
             html_handler = _NotificationHTMLEventHandler(constNotificationPaletteId)
             with tempfile.NamedTemporaryFile() as tf2:
                 mock_html_args = type("HTMLArgs", (), {
@@ -541,24 +526,18 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         self.assertEqual(fractions[-1], 1.0)
 
     def test_default_settings_and_manager_purged_del_options(self):
-        """Verify delFiles and delFolder are eliminated from defaults and purged by SettingsManager."""
+        """Verify delFiles and delFolder are eliminated from defaultSettings."""
         import PostClear
 
         self.assertNotIn("delFiles", PostClear.defaultSettings)
         self.assertNotIn("delFolder", PostClear.defaultSettings)
+        self.assertNotIn("splitSetup", PostClear.defaultSettings)
 
         mgr = PostClear.SettingsManager()
-        legacy_dst = {
-            "version": "1.0.0",
-            "delFiles": True,
-            "delFolder": True,
-            "splitSetup": True,
-            "restore_rapid": True,
-        }
-        mgr.UpdateSettings(PostClear.defaultSettings, legacy_dst)
-        self.assertNotIn("delFiles", legacy_dst)
-        self.assertNotIn("delFolder", legacy_dst)
-        self.assertNotIn("splitSetup", legacy_dst)
+        dst = {"version": "1.0.0", "restore_rapid": True}
+        mgr.UpdateSettings(PostClear.defaultSettings, dst)
+        self.assertEqual(dst["version"], PostClear.defaultSettings["version"])
+        self.assertTrue(dst["restore_rapid"])
 
     def test_perform_post_process_modal_overwrite_abort_on_no(self):
         """Verify modal prompt aborts before any progress dialog or posting if user selects No."""
@@ -634,7 +613,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                  patch("PostClear.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)):
 
                 doc_settings = dict(PostClear.defaultSettings)
-                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
+                PostClear.PerformPostProcess(doc_settings)
 
             self.assertEqual(len(msgbox_calls), 1, "Must prompt user with modal messageBox")
             prompt, title, btn_type, icon_type = msgbox_calls[0]
@@ -724,7 +703,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                  patch("PostClear._NotifyPostProcessResult"):
 
                 doc_settings = dict(PostClear.defaultSettings)
-                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
+                PostClear.PerformPostProcess(doc_settings)
 
             self.assertEqual(len(msgbox_calls), 1)
             self.assertEqual(len(post_setup_calls), 1, "Must execute PostProcessSetup when confirmed with Yes")
@@ -797,7 +776,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                  patch("PostClear._NotifyPostProcessResult"):
 
                 doc_settings = dict(PostClear.defaultSettings)
-                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
+                PostClear.PerformPostProcess(doc_settings)
 
             self.assertEqual(len(msgbox_calls), 0, "No modal messageBox should be shown when file does not exist")
             self.assertEqual(len(post_setup_calls), 1, "Must proceed directly to PostProcessSetup")
@@ -870,7 +849,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                  patch("PostClear.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)):
 
                 doc_settings = dict(PostClear.defaultSettings)
-                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
+                PostClear.PerformPostProcess(doc_settings)
 
             self.assertEqual(len(msgbox_calls), 1, "Must prompt user with modal messageBox")
             prompt, title, btn_type, icon_type = msgbox_calls[0]
@@ -953,7 +932,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                  patch("PostClear._NotifyPostProcessResult"):
 
                 doc_settings = dict(PostClear.defaultSettings)
-                PostClear.PerformPostProcess(doc_settings, setups=[mock_setup])
+                PostClear.PerformPostProcess(doc_settings)
 
             self.assertEqual(len(msgbox_calls), 1)
             self.assertEqual(len(post_setup_calls), 1, "Must proceed to PostProcessSetup on Yes")
@@ -1008,12 +987,11 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
 
         post_setup_calls = []
         with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
-             patch("PostClear.GetNcProgram", return_value=mock_prog), \
              patch("PostClear.GetNcProgramSetupsAndOperations", return_value=([mock_setup1, mock_setup2], {mock_setup1: [mock_op1], mock_setup2: [mock_op2]})), \
              patch("PostClear.PostProcessSetup", side_effect=lambda *args, **kwargs: post_setup_calls.append(args)):
 
             doc_settings = dict(PostClear.defaultSettings)
-            res = PostClear.PerformPostProcess(doc_settings, setups=[mock_setup1, mock_setup2])
+            res = PostClear.PerformPostProcess(doc_settings)
 
         self.assertIsNotNone(res, "PerformPostProcess must return an error string when multiple setups are detected")
         self.assertIn("Multiple setups detected", res)
@@ -1277,13 +1255,14 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         self.assertFalse(ctx["sections"][0]["events"][1].get("promote", False))
 
     def test_b1_verify_checkbox_removed_and_verification_always_runs(self):
-        """Verify that verifyGcode is removed from defaultSettings and obsolete settings cleaned up."""
+        """Verify that verifyGcode is removed from defaultSettings."""
         import PostClear
         self.assertNotIn("verifyGcode", PostClear.defaultSettings)
 
         mgr = PostClear.SettingsManager()
-        dst = {"version": 16, "verifyGcode": True, "restore_rapid": True}
+        dst = {"version": 16, "restore_rapid": True}
         mgr.UpdateSettings(PostClear.defaultSettings, dst)
+        self.assertEqual(dst["version"], PostClear.defaultSettings["version"])
         self.assertNotIn("verifyGcode", dst)
 
     def test_b2_progress_cancellation_aborts_pipeline(self):
@@ -1569,13 +1548,10 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             mock_docSettings = dict(PostClear.defaultSettings)
 
             with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
-                 patch("PostClear.GetNcProgram", return_value=mock_program), \
+                 patch("PostClear.GetSelectedNcPrograms", return_value=[mock_program]), \
                  patch("PostClear.GetNcProgramSetupsAndOperations", return_value=([], {})), \
                  patch("PostClear.settingsMgr", MagicMock()):
-                res = PostClear.PerformPostProcess(
-                    mock_docSettings,
-                    setups=[],
-                )
+                res = PostClear.PerformPostProcess(mock_docSettings)
                 self.assertIsNone(res)
                 self.assertTrue(os.path.isdir(nested_out))
 
@@ -1695,8 +1671,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         mock_ui = MagicMock()
         mock_ui.palettes.itemById.return_value = None
 
-        with patch("PostClear.adsk.core.Application.get", return_value=mock_app), \
-             patch("subprocess.check_output", return_value=b"0, 33, 1470, 923"):
+        with patch("PostClear.adsk.core.Application.get", return_value=mock_app):
             PostClear._NotifyPostProcessResult(
                 ui=mock_ui,
                 cntFiles=1,
@@ -2085,12 +2060,8 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         mock_prog_post.postParameters.itemByName.side_effect = lambda k: mock_post_param if k == "nc_program_unit" else None
         self.assertEqual(PostClear._GetNCProgramOutputUnits(mock_prog_post), mm_enum)
 
-        # 4. docSettings fallback
-        self.assertEqual(PostClear._GetNCProgramOutputUnits(None, {"outputUnits": "Millimeters"}), mm_enum)
-        self.assertEqual(PostClear._GetNCProgramOutputUnits(None, {"nc_program_unit": "Inches"}), in_enum)
-
-        # 5. Default fallback to DocumentUnitsOutput
-        self.assertEqual(PostClear._GetNCProgramOutputUnits(None, {}), doc_enum)
+        # 4. Default fallback to DocumentUnitsOutput when program is None
+        self.assertEqual(PostClear._GetNCProgramOutputUnits(None), doc_enum)
     def test_pipeline_nc_program_mm_unit_override(self):
         """Verify that NCProgram specifying mm output overrides Document units and passes MillimetersOutput to PostProcessInput."""
         import PostClear
@@ -2626,9 +2597,9 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         selected = PostClear.GetSelectedNcPrograms(cam, {"ncPrograms": ["ProgC", "ProgA"]})
         self.assertEqual([p.name for p in selected], ["ProgC", "ProgA"])
 
-        # Fallback to legacy single ncProgram when ncPrograms is empty
-        fallback = PostClear.GetSelectedNcPrograms(cam, {"ncPrograms": [], "ncProgram": "ProgB"})
-        self.assertEqual([p.name for p in fallback], ["ProgB"])
+        # Fallback to first NCProgram when ncPrograms is empty
+        fallback = PostClear.GetSelectedNcPrograms(cam, {"ncPrograms": []})
+        self.assertEqual([p.name for p in fallback], ["ProgA"])
 
     def test_multi_nc_program_command_dialog_validation_and_execute(self):
         """Verify TableCommandInput checklist, select-all sync, validation, and execute persistence."""
@@ -2721,7 +2692,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
 
         doc_settings = dict(PostClear.defaultSettings)
         doc_settings["ncPrograms"] = ["ProgA"]
-        doc_settings["ncProgram"] = "ProgA"
 
         saved_handlers = list(PostClear.handlers)
         saved_settings_mgr = PostClear.settingsMgr
@@ -2821,7 +2791,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                     exec_handler.notify(MagicMock())
 
             self.assertEqual(doc_settings["ncPrograms"], ["ProgB"])
-            self.assertEqual(doc_settings["ncProgram"], "ProgB")
             mock_perform.assert_called_once_with(doc_settings)
         finally:
             PostClear.handlers[:] = saved_handlers
@@ -2877,10 +2846,9 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             doc_settings = dict(PostClear.defaultSettings)
-            doc_settings["output"] = tmp_dir
             doc_settings["ncPrograms"] = ["NC1", "NC2"]
 
-            def _get_prog_setups_ops(_cam, _settings, setups_arg=None, program=None):
+            def _get_prog_setups_ops(_cam, program=None):
                 ops = [op1] if program is p_dup1 else [op2]
                 return [setup], {setup.name: ops}
 
@@ -2961,10 +2929,9 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                     f.write("OLD")
 
             doc_settings = dict(PostClear.defaultSettings)
-            doc_settings["output"] = tmp_dir
             doc_settings["ncPrograms"] = ["NC1", "NC2"]
 
-            def _get_prog_setups_ops(_cam, _settings, setups_arg=None, program=None):
+            def _get_prog_setups_ops(_cam, program=None):
                 if program is p1:
                     return [setup1], {setup1.name: [op1]}
                 return [setup2], {setup2.name: [op2]}
@@ -3040,10 +3007,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 PostClear._HandleNotificationAction(PostClear.constNotificationPaletteId, "dismiss", "")
                 self.assertFalse(mock_palette.isVisible, "dismiss must hide notification palette")
 
-                mock_palette.isVisible = True
-                PostClear._HandleNotificationAction(PostClear.constNotificationPaletteId, "close", "")
-                self.assertFalse(mock_palette.isVisible, "close must hide notification palette")
-
             # 2. _NotifyPostProcessResult with 3 programs -> scaled height & isResizable=True & per-row buttons
             created_palettes = []
 
@@ -3060,7 +3023,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             mock_ui2 = MagicMock()
             mock_ui2.palettes.itemById.return_value = None
             mock_ui2.palettes.add2.side_effect = _make_palette
-            mock_ui2.palettes.add.side_effect = _make_palette
 
             outcomes = [
                 {"nc_program": "NC1", "setup": "Setup 1", "cnc": nc1, "report": rep1, "png": png1, "status": "success", "summary": "Clean"},
@@ -3187,7 +3149,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
                  patch.object(PostClear.adsk.core, "MarkingMenuEventArgs", MagicMock(cast=lambda a: ev_setup), create=True), \
                  patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
-                 patch("PostClear.GetNcProgramSetupsAndOperations", side_effect=lambda c, s, program=None: ([setup1], []) if program is prog_a else ([], [])):
+                 patch("PostClear.GetNcProgramSetupsAndOperations", side_effect=lambda c, program=None: ([setup1], []) if program is prog_a else ([], [])):
                 handler.notify(MagicMock())
             mock_controls_setup.addCommand.assert_called_once_with(cmd_def, PostClear.constPostProcessControlId, False)
             self.assertEqual(PostClear._ResolvePreselectedNcProgramNames(cam, mock_ui), ["ProgA"])

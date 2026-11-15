@@ -39,6 +39,8 @@ from geometry.engine_interface import IVerificationEngine
 from context_parser import (
     DEFAULT_MIN_PROMOTE_LEN_MM,
     classify_stock_mode,
+    extract_workpiece_hint_bbox_mm,
+    is_turning_context,
     merge_context_dumps,
     parse_context_dump,
     apply_promotions_to_context,
@@ -504,10 +506,7 @@ class PipelineOrchestrator:
                 combined_ctx["unit"] = int(unit)
 
             if is_turning is None:
-                is_turning = any(
-                    s.get("type", 0) == 1 or bool(s.get("tool", {}).get("_isTurningTool", False))
-                    for s in combined_ctx.get("sections", [])
-                )
+                is_turning = is_turning_context(combined_ctx)
             stock_mode = str(
                 combined_ctx.get("stockMode")
                 or combined_ctx.get("globalParams", {}).get("job:stockMode")
@@ -622,32 +621,9 @@ class PipelineOrchestrator:
             tp_box_log = None
             st_box_log = None
             unmodeled_pattern_sec_indices: Set[int] = set()
+            pattern_secs_precomputed = False
             if is_stl_stock and segments:
-                wh_mm: Optional[Tuple[float, float, float, float, float, float]] = None
-                wh_raw = combined_ctx.get("workpieceHint")
-                if isinstance(wh_raw, dict):
-                    wh_lo = wh_raw.get("lower")
-                    wh_hi = wh_raw.get("upper")
-                    if isinstance(wh_lo, dict) and isinstance(wh_hi, dict):
-                        try:
-                            wh_scale = 25.4 if int(combined_ctx.get("unit", 0)) == 0 else 1.0
-                            wx0 = float(wh_lo["x"]) * wh_scale
-                            wx1 = float(wh_hi["x"]) * wh_scale
-                            wy0 = float(wh_lo["y"]) * wh_scale
-                            wy1 = float(wh_hi["y"]) * wh_scale
-                            wz0 = float(wh_lo["z"]) * wh_scale
-                            wz1 = float(wh_hi["z"]) * wh_scale
-                            if wx1 > wx0 + 1e-6 and wy1 > wy0 + 1e-6 and wz1 > wz0 + 1e-6:
-                                wh_mm = (
-                                    min(wx0, wx1),
-                                    max(wx0, wx1),
-                                    min(wy0, wy1),
-                                    max(wy0, wy1),
-                                    min(wz0, wz1),
-                                    max(wz0, wz1),
-                                )
-                        except (KeyError, TypeError, ValueError):
-                            wh_mm = None
+                wh_mm = extract_workpiece_hint_bbox_mm(combined_ctx)
 
                 from geometry.heightfield_engine import check_stl_stock_alignment
 
@@ -659,12 +635,14 @@ class PipelineOrchestrator:
                     workpiece_hint_mm=wh_mm,
                     dbg_fn=_dbg_pipe,
                 )
+                pattern_secs_precomputed = True
             elif not is_turning and segments and workpiece is not None:
                 try:
                     from geometry.heightfield_engine import detect_unmodeled_pattern_sections
                     unmodeled_pattern_sec_indices = detect_unmodeled_pattern_sections(
                         segments, workpiece, tools_by_op
                     )
+                    pattern_secs_precomputed = True
                 except Exception:
                     unmodeled_pattern_sec_indices = set()
 
@@ -679,7 +657,15 @@ class PipelineOrchestrator:
                     f"Z=[{min(all_z):.2f}, {max(all_z):.2f}]"
                 )
 
-            report = verifier.verify_toolpath(segments, tools_by_op, workpiece)
+            verify_kwargs: Dict[str, Any] = {}
+            if pattern_secs_precomputed:
+                try:
+                    from geometry.heightfield_engine import MillHeightfieldVerifier
+                    if isinstance(verifier, MillHeightfieldVerifier):
+                        verify_kwargs["unmodeled_pattern_sec_indices"] = unmodeled_pattern_sec_indices
+                except ImportError:
+                    pass
+            report = verifier.verify_toolpath(segments, tools_by_op, workpiece, **verify_kwargs)
             if report.promoted_events:
                 report.promoted_events = filter_promoted_events_by_length(
                     report.promoted_events,
@@ -693,34 +679,36 @@ class PipelineOrchestrator:
             multi_axis_sec_indices: Set[int] = set()
             multi_axis_ops: List[str] = []
 
-            for sec_idx, sec in enumerate(combined_ctx.get("sections", [])):
-                params = sec.get("params") or {}
-                op_name = params.get("operation-comment", f"Section_{sec.get('id', sec_idx)}")
-                sec_type = sec.get("type", 0)
-                wp_f = (sec.get("workPlane") or {}).get("forward") or {}
-                fx = float(wp_f.get("x", 0.0))
-                fy = float(wp_f.get("y", 0.0))
-                fz = float(wp_f.get("z", 1.0))
-                if sec_type != 1 and not (abs(fx) < 1e-5 and abs(fy) < 1e-5 and abs(fz - 1.0) < 1e-5):
-                    tilted_sec_indices.add(sec_idx)
-                    if op_name not in tilted_ops:
-                        tilted_ops.append(op_name)
-                if sec.get("isMultiAxis") or sec.get("has5DMoves"):
-                    multi_axis_sec_indices.add(sec_idx)
-                    if op_name not in multi_axis_ops:
-                        multi_axis_ops.append(op_name)
-
-            for seg in segments:
-                s_meta = getattr(seg, "metadata", None) or {}
-                sec_i = s_meta.get("sec_idx", seg.sec_id)
-                if s_meta.get("tilted_section"):
-                    tilted_sec_indices.add(sec_i)
-                    if seg.op_id and seg.op_id not in tilted_ops:
-                        tilted_ops.append(seg.op_id)
-                if s_meta.get("multi_axis"):
-                    multi_axis_sec_indices.add(sec_i)
-                    if seg.op_id and seg.op_id not in multi_axis_ops:
-                        multi_axis_ops.append(seg.op_id)
+            sections = combined_ctx.get("sections") or []
+            if sections:
+                for sec_idx, sec in enumerate(sections):
+                    params = sec.get("params") or {}
+                    op_name = params.get("operation-comment", f"Section_{sec.get('id', sec_idx)}")
+                    sec_type = sec.get("type", 0)
+                    wp_f = (sec.get("workPlane") or {}).get("forward") or {}
+                    fx = float(wp_f.get("x", 0.0))
+                    fy = float(wp_f.get("y", 0.0))
+                    fz = float(wp_f.get("z", 1.0))
+                    if sec_type != 1 and not (abs(fx) < 1e-5 and abs(fy) < 1e-5 and abs(fz - 1.0) < 1e-5):
+                        tilted_sec_indices.add(sec_idx)
+                        if op_name not in tilted_ops:
+                            tilted_ops.append(op_name)
+                    if sec.get("isMultiAxis") or sec.get("has5DMoves"):
+                        multi_axis_sec_indices.add(sec_idx)
+                        if op_name not in multi_axis_ops:
+                            multi_axis_ops.append(op_name)
+            else:
+                for seg in segments:
+                    s_meta = getattr(seg, "metadata", None) or {}
+                    sec_i = s_meta.get("sec_idx", seg.sec_id)
+                    if s_meta.get("tilted_section"):
+                        tilted_sec_indices.add(sec_i)
+                        if seg.op_id and seg.op_id not in tilted_ops:
+                            tilted_ops.append(seg.op_id)
+                    if s_meta.get("multi_axis"):
+                        multi_axis_sec_indices.add(sec_i)
+                        if seg.op_id and seg.op_id not in multi_axis_ops:
+                            multi_axis_ops.append(seg.op_id)
 
             blocked_sec_indices = tilted_sec_indices | multi_axis_sec_indices | unmodeled_pattern_sec_indices
             if blocked_sec_indices and report.promoted_events:
@@ -1055,56 +1043,51 @@ class PipelineOrchestrator:
                 notes.append("holder not checked")
             return notes
 
+        def _format_op_row(op_name: str, op_cols: Sequence[CollisionRecord] = ()) -> str:
+            notes = _op_notes(op_name)
+            if op_cols:
+                type_counts: Dict[str, int] = {}
+                for c in op_cols:
+                    k_name = c.kind.name if hasattr(c.kind, "name") else str(c.kind)
+                    type_counts[k_name] = type_counts.get(k_name, 0) + 1
+                type_str = ", ".join(f"`{k}` ({n})" for k, n in sorted(type_counts.items()))
+                if notes:
+                    type_str = f"{type_str}; {'; '.join(notes)}"
+                return f"| **{op_name}** | ⚠️ **Collision** | **{len(op_cols)}** | {type_str} |"
+            if op_name in tilted_set or op_name in multi_axis_set:
+                status_str = "⚠️ Not verified"
+            elif notes:
+                status_str = "⚠️ Warning"
+            else:
+                status_str = "✅ Safe"
+            detail_str = "; ".join(notes) if notes else "None"
+            return f"| {op_name} | {status_str} | 0 | {detail_str} |"
+
         if collision_count == 0:
             if not (tilted_ops or multi_axis_ops or holder_unchecked or frame_warnings):
                 lines.append("✅ **Zero collisions detected.** All rapid moves and holder clearances are verified safe across all operations.")
             else:
                 lines.append("✅ **Zero collisions detected** (see verification notes above for unverified or unchecked items).")
-            lines.append("")
-            lines.append("### Operations Verification Summary")
-            lines.append("| Operation | Status | Collisions | Details by Type |")
-            lines.append("| :--- | :--- | :--- | :--- |")
-            for op in all_ops:
-                notes = _op_notes(op)
-                if op in tilted_set or op in multi_axis_set:
-                    status_str = "⚠️ Not verified"
-                elif notes:
-                    status_str = "⚠️ Warning"
-                else:
-                    status_str = "✅ Safe"
-                detail_str = "; ".join(notes) if notes else "None"
-                lines.append(f"| {op} | {status_str} | 0 | {detail_str} |")
+            lines.extend([
+                "",
+                "### Operations Verification Summary",
+                "| Operation | Status | Collisions | Details by Type |",
+                "| :--- | :--- | :--- | :--- |",
+            ])
+            lines.extend(_format_op_row(op) for op in all_ops)
         else:
             affected_ops = [op for op, clist in cols_by_op.items() if len(clist) > 0]
-            lines.append(
-                f"⚠️ **{collision_count} Collision(s) Detected across {len(affected_ops)} operation(s)!**  \n"
-                "Final NC code generation completed with warnings. Review the table and detailed move listings below before machining."
-            )
-            lines.append("")
-            lines.append("### Collisions by Operation")
-            lines.append("| Operation | Status | Collisions | Details by Type |")
-            lines.append("| :--- | :--- | :--- | :--- |")
-            for op in all_ops:
-                op_cols = cols_by_op.get(op, [])
-                notes = _op_notes(op)
-                if op_cols:
-                    type_counts: Dict[str, int] = {}
-                    for c in op_cols:
-                        k_name = c.kind.name if hasattr(c.kind, "name") else str(c.kind)
-                        type_counts[k_name] = type_counts.get(k_name, 0) + 1
-                    type_str = ", ".join(f"`{k}` ({n})" for k, n in sorted(type_counts.items()))
-                    if notes:
-                        type_str = f"{type_str}; {'; '.join(notes)}"
-                    lines.append(f"| **{op}** | ⚠️ **Collision** | **{len(op_cols)}** | {type_str} |")
-                else:
-                    if op in tilted_set or op in multi_axis_set:
-                        status_str = "⚠️ Not verified"
-                    elif notes:
-                        status_str = "⚠️ Warning"
-                    else:
-                        status_str = "✅ Safe"
-                    detail_str = "; ".join(notes) if notes else "None"
-                    lines.append(f"| {op} | {status_str} | 0 | {detail_str} |")
+            lines.extend([
+                (
+                    f"⚠️ **{collision_count} Collision(s) Detected across {len(affected_ops)} operation(s)!**  \n"
+                    "Final NC code generation completed with warnings. Review the table and detailed move listings below before machining."
+                ),
+                "",
+                "### Collisions by Operation",
+                "| Operation | Status | Collisions | Details by Type |",
+                "| :--- | :--- | :--- | :--- |",
+            ])
+            lines.extend(_format_op_row(op, cols_by_op.get(op, ())) for op in all_ops)
             lines.append(f"| **Total** | | **{collision_count}** | |")
             lines.append("")
 
@@ -1139,19 +1122,13 @@ class PipelineOrchestrator:
                 op_name = sp.op_id if sp.op_id else "General"
                 spikes_by_op.setdefault(op_name, []).append(sp)
 
-            for op in all_ops:
-                op_spikes = spikes_by_op.get(op, [])
-                for sp in op_spikes:
+            all_ops_set = set(all_ops)
+            ordered_spike_ops = list(all_ops) + [op for op in spikes_by_op if op not in all_ops_set]
+            for op in ordered_spike_ops:
+                for sp in spikes_by_op.get(op, []):
                     lines.append(
                         f"| {op} | Move {sp.segment_id} | {sp.timestamp_sec:.2f} s | "
                         f"{sp.mrr_rate_mm3_per_min:.2f} | {sp.volume_removed_mm3:.2f} | {sp.depth_of_cut_mm:.2f} |"
                     )
-            for op, op_spikes in spikes_by_op.items():
-                if op not in all_ops:
-                    for sp in op_spikes:
-                        lines.append(
-                            f"| {op} | Move {sp.segment_id} | {sp.timestamp_sec:.2f} s | "
-                            f"{sp.mrr_rate_mm3_per_min:.2f} | {sp.volume_removed_mm3:.2f} | {sp.depth_of_cut_mm:.2f} |"
-                        )
 
         return "\n".join(lines)

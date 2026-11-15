@@ -160,7 +160,7 @@ class TestWorkpieceExtraction(unittest.TestCase):
             with open(milling_cps, "w", encoding="utf-8") as f:
                 f.write('capabilities = CAPABILITY_MILLING;\ndescription = "Tormach PathPilot";\n')
 
-            with unittest.mock.patch("PostClear._GetPostSearchDirs", return_value=[tmp_dir]):
+            with unittest.mock.patch("PostClear._GetPostSearchDirsByTier", return_value=([tmp_dir], [], [])):
                 resolved_turn = _ResolveBasePostPath(MockTurningProg(), is_turning=True)
                 self.assertTrue(os.path.isfile(resolved_turn))
                 self.assertTrue(resolved_turn.endswith("centroid_turning.cps"))

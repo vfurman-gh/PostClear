@@ -598,7 +598,7 @@ class TestDepBootstrapAndRelease(unittest.TestCase):
                 import PostClear
                 self.assertEqual(PostClear.constCmdName, "Post Clear")
                 self.assertEqual(PostClear.constCmdDefId, "PostClear_Cmd")
-                self.assertEqual(PostClear.constNcProgramName, "PostClear NC Program")
+                self.assertFalse(hasattr(PostClear, "constNcProgramName"))
                 self.assertEqual(PostClear.constNotificationPaletteId, "PostClear_NotificationPalette")
 
 

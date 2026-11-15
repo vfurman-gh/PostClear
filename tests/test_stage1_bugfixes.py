@@ -238,20 +238,18 @@ class TestStage1BugFixes(unittest.TestCase):
             p.parameters.itemByName.side_effect = lambda name: param if name == "nc_program_nc_extension" else None
             return p
 
-        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog(""), {}), ".cnc")
-        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog("   "), {}), ".cnc")
-        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog(None), {}), ".cnc")
-        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog("json"), {}), ".cnc")
-        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog(".json"), {}), ".cnc")
-        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog("nc"), {}), ".nc")
-        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog(".sbp"), {}), ".sbp")
+        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog("")), ".cnc")
+        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog("   ")), ".cnc")
+        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog(None)), ".cnc")
+        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog("json")), ".cnc")
+        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog(".json")), ".cnc")
+        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog("nc")), ".nc")
+        self.assertEqual(PostClear._GetNcProgramExtension(_make_prog(".sbp")), ".sbp")
 
         no_params_prog = MagicMock()
         no_params_prog.parameters = None
-        self.assertEqual(PostClear._GetNcProgramExtension(no_params_prog, {}), ".cnc")
-        self.assertEqual(PostClear._GetNcProgramExtension(None, {"extension": ""}), ".cnc")
-        self.assertEqual(PostClear._GetNcProgramExtension(None, {"extension": "tap"}), ".tap")
-        self.assertEqual(PostClear._GetNcProgramExtension(None, {"nc_program_nc_extension": ".nc"}), ".nc")
+        self.assertEqual(PostClear._GetNcProgramExtension(no_params_prog), ".cnc")
+        self.assertEqual(PostClear._GetNcProgramExtension(None), ".cnc")
 
     # ------------------------------------------------------------------
     # Bug #3: dog_leg_warning -> has_warnings and toast warning details

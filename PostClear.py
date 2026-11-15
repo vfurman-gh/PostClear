@@ -53,9 +53,7 @@ version = 18
 # Initial default values of settings
 defaultSettings = {
     "version" : version,
-    "ncProgram": "",
     "ncPrograms": [],
-    "output" : "",
     "restore_rapid" : True,
     "debug_log" : False,
     # Groups are expanded or not
@@ -72,7 +70,6 @@ constCAMProductId = "CAMProductType"
 constAttrGroup = constCmdDefId
 constAttrName = "settings"
 constSettingsFileExt = ".settings"
-constNcProgramName = "PostClear NC Program"
 constAddonDir = os.path.dirname(os.path.abspath(__file__))
 constDumperScript = os.path.join(constAddonDir, "universal_dumper.cps")
 constReplayerScript = os.path.join(constAddonDir, "universal_replayer.cps")
@@ -170,7 +167,7 @@ def _safe_getattr(obj, attr: str, default=None):
         return default
 
 
-def _FormatDiagnosticHeader(app=None, doc=None, cam=None, docSettings=None, setups=None) -> str:
+def _FormatDiagnosticHeader(app=None, doc=None, cam=None, docSettings=None) -> str:
     """Build a non-PII diagnostic banner covering Fusion, Python, OS, ABI/deps, and run config."""
     try:
         timestamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z %Z").strip()
@@ -213,10 +210,7 @@ def _FormatDiagnosticHeader(app=None, doc=None, cam=None, docSettings=None, setu
     )
 
     cfg = docSettings if isinstance(docSettings, dict) else {}
-    sel_progs = cfg.get("ncPrograms")
-    if not isinstance(sel_progs, list):
-        legacy_p = cfg.get("ncProgram")
-        sel_progs = [legacy_p] if isinstance(legacy_p, str) and legacy_p else []
+    sel_progs = cfg.get("ncPrograms") if isinstance(cfg.get("ncPrograms"), list) else []
     restore_rapid = bool(cfg.get("restore_rapid", True))
     dbg_enabled = bool(cfg.get("debug_log", False))
 
@@ -241,15 +235,14 @@ def _FormatDiagnosticHeader(app=None, doc=None, cam=None, docSettings=None, setu
         f"Dependencies: abi={abi_tag}, abi_dir={abi_pkg_dir} (exists={abi_pkg_exists}, on_sys_path={abi_pkg_on_path}), {pkg_versions}",
         (
             f"Invocation: selected_nc_programs={sel_progs}, restore_rapid={restore_rapid}, "
-            f"debug_log={dbg_enabled}, cam_setups={setups_str}, cam_nc_programs={progs_str}, "
-            f"incoming_setups={len(setups) if setups else 0}"
+            f"debug_log={dbg_enabled}, cam_setups={setups_str}, cam_nc_programs={progs_str}"
         ),
         "=====================================",
     ]
     return "\n".join(lines)
 
 
-def _LogInvocationDiagnostics(app=None, doc=None, cam=None, docSettings=None, setups=None) -> None:
+def _LogInvocationDiagnostics(app=None, doc=None, cam=None, docSettings=None) -> None:
     """Write the invocation diagnostic banner to _LOG_PATH when debug logging is enabled."""
     if not _debug_log_enabled:
         return
@@ -259,7 +252,6 @@ def _LogInvocationDiagnostics(app=None, doc=None, cam=None, docSettings=None, se
             doc=doc,
             cam=cam,
             docSettings=docSettings,
-            setups=setups,
         )
         _dbg_global(banner)
     except Exception:
@@ -299,23 +291,13 @@ def _NormalizeFileExtension(ext: Optional[str]) -> str:
     return clean
 
 
-def _GetNcProgramExtension(prog, settings: Optional[Dict[str, Any]] = None) -> str:
+def _GetNcProgramExtension(prog) -> str:
     """Resolve and normalize an NC Program's output extension, defaulting to '.cnc'."""
     raw_ext = ""
     params = getattr(prog, "parameters", None) if prog is not None else None
-    if params is not None:
-        try:
-            ext_param = (
-                params.itemByName("nc_program_nc_extension")
-                if hasattr(params, "itemByName")
-                else params.get("nc_program_nc_extension")
-            )
-            if ext_param is not None:
-                raw_ext = _extract_choice_value(ext_param)
-        except Exception:
-            pass
-    if not raw_ext and isinstance(settings, dict):
-        raw_ext = str(settings.get("nc_program_nc_extension") or settings.get("extension") or "").strip()
+    ext_param = _lookup_cam_param(params, "nc_program_nc_extension")
+    if ext_param is not None:
+        raw_ext = _extract_choice_value(ext_param)
     return _NormalizeFileExtension(raw_ext)
 
 
@@ -423,14 +405,7 @@ def stop(context):
 
         # Clean up the UI: delete controls first, then command definition, then palette.
         _CleanupCommandUI(ui)
-
-        if ui and hasattr(ui, "palettes") and ui.palettes:
-            try:
-                p = ui.palettes.itemById(constNotificationPaletteId)
-                if p:
-                    p.deleteMe()
-            except Exception:
-                pass
+        _CleanupNotificationPalette(ui)
     except:
         if ui:
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))	
@@ -440,7 +415,6 @@ class SettingsManager:
     def __init__(self):
         self.default = None
         self.path = None
-        self.fMustSave = False
 
     def GetSettings(self, docAttr):
         docSettings = None
@@ -467,7 +441,6 @@ class SettingsManager:
                     k: (list(v) if isinstance(v, list) else v)
                     for k, v in defaultSettings.items()
                 }
-                self.fMustSave = True
         
         if not docSettings:
             docSettings = {
@@ -481,7 +454,6 @@ class SettingsManager:
         return docSettings
 
     def SaveDefault(self, docSettings):
-        self.fMustSave = False
         self.default = {
             k: (list(v) if isinstance(v, list) else v)
             for k, v in docSettings.items()
@@ -494,8 +466,6 @@ class SettingsManager:
             pass
 
     def SaveSettings(self, docAttr, docSettings):
-        if self.fMustSave:
-            self.SaveDefault(docSettings)
         docAttr.add(constAttrGroup, constAttrName, json.dumps(docSettings))
             
     def UpdateSettings(self, src, dst):
@@ -509,14 +479,6 @@ class SettingsManager:
             dst["ncPrograms"] = [str(x) for x in dst["ncPrograms"] if x]
         else:
             dst["ncPrograms"] = []
-        if dst["ncPrograms"] and not dst.get("ncProgram"):
-            dst["ncProgram"] = dst["ncPrograms"][0]
-        for k in (
-            "verifyGcode", "splitSetup", "fastZ", "fastZHeuristic", "toolChange", "endCodes", "homeEndsOp",
-            "sequence", "twoDigits", "onlySelected", "groupRename", "groupPost", "numericName",
-            "groupAdvanced", "initialDelay", "postRetries", "delFiles", "delFolder", "combineTool"
-        ):
-            dst.pop(k, None)
         for item in src:
             if not (item in dst):
                 val = src[item]
@@ -576,6 +538,40 @@ def InitAddIn():
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
 
 
+def _same_cam_entity(a, b, check_name: bool = True) -> bool:
+    """Compare two Fusion CAM entities by identity, entityToken, operationId, or optional name fallback."""
+    if a is None or b is None:
+        return False
+    try:
+        if a is b or a == b:
+            return True
+    except Exception:
+        pass
+    try:
+        tok_a = getattr(a, "entityToken", None)
+        tok_b = getattr(b, "entityToken", None)
+        if isinstance(tok_a, str) and tok_a and tok_a == tok_b:
+            return True
+    except Exception:
+        pass
+    try:
+        op_a = getattr(a, "operationId", -1)
+        op_b = getattr(b, "operationId", -2)
+        if isinstance(op_a, int) and not isinstance(op_a, bool) and op_a != -1 and op_a == op_b:
+            return True
+    except Exception:
+        pass
+    if check_name:
+        try:
+            name_a = getattr(a, "name", None)
+            name_b = getattr(b, "name", None)
+            if isinstance(name_a, str) and name_a and name_a == name_b:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _is_setup_cam_object(obj, cam=None):
     if obj is None:
         return False
@@ -591,7 +587,7 @@ def _is_setup_cam_object(obj, cam=None):
         return True
     if cam and hasattr(cam, "setups"):
         for s in cam.setups:
-            if s == obj or (getattr(s, "name", None) is not None and getattr(s, "name", None) == getattr(obj, "name", None)):
+            if _same_cam_entity(s, obj):
                 return True
     return False
 
@@ -631,7 +627,7 @@ def _resolve_setup_for_object(obj, cam=None):
     if _is_setup_cam_object(obj, cam):
         if cam and hasattr(cam, "setups"):
             for s in cam.setups:
-                if s == obj or getattr(s, "name", None) == getattr(obj, "name", None):
+                if _same_cam_entity(s, obj):
                     return s
         return obj
 
@@ -641,7 +637,7 @@ def _resolve_setup_for_object(obj, cam=None):
         if _is_setup_cam_object(curr, cam):
             if cam and hasattr(cam, "setups"):
                 for s in cam.setups:
-                    if s == curr or getattr(s, "name", None) == getattr(curr, "name", None):
+                    if _same_cam_entity(s, curr):
                         return s
             return curr
         curr = getattr(curr, "parent", None)
@@ -650,15 +646,8 @@ def _resolve_setup_for_object(obj, cam=None):
     if cam and hasattr(cam, "setups"):
         for s in cam.setups:
             all_ops = getattr(s, "allOperations", [])
-            op_list = _extract_cam_collection(all_ops)
-            for op in op_list:
-                if op == obj:
-                    return s
-                if (getattr(op, "operationId", -1) != -1 and 
-                    getattr(op, "operationId", -1) == getattr(obj, "operationId", -2)):
-                    return s
-                if (getattr(op, "name", None) is not None and 
-                    getattr(op, "name", None) == getattr(obj, "name", None)):
+            for op in _extract_cam_collection(all_ops):
+                if _same_cam_entity(op, obj):
                     return s
     return None
 
@@ -781,41 +770,108 @@ def _check_operation_toolpath_status(op, cam=None):
     return False, ""
 
 
+def _lookup_cam_param(params, name: str):
+    """Look up a named CAM parameter from a Fusion CAMParameters collection or dict."""
+    if params is None:
+        return None
+    try:
+        if hasattr(params, "itemByName"):
+            return params.itemByName(name)
+        if isinstance(params, dict):
+            return params.get(name)
+    except Exception:
+        return None
+    return None
+
+
+def _unwrap_cam_param_scalar(p):
+    """Extract a concrete bool/int/float/str from a parameter object, ignoring unconfigured mocks."""
+    if p is None:
+        return None
+    if isinstance(p, (bool, int, float, str)):
+        return p
+    try:
+        v_obj = getattr(p, "value", None)
+        raw = getattr(v_obj, "value", v_obj)
+        if isinstance(raw, (bool, int, float, str)):
+            return raw
+    except Exception:
+        pass
+    try:
+        expr = getattr(p, "expression", None)
+        if isinstance(expr, str):
+            cleaned = expr.strip()
+            if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+                cleaned = cleaned[1:-1]
+            if cleaned:
+                return cleaned
+    except Exception:
+        pass
+    return None
+
+
 def _extract_scalar_param(params, *names):
     """Extract a concrete bool/int/float/str parameter value, ignoring unconfigured mock objects."""
     if params is None:
         return None
     for name in names:
-        p = None
-        try:
-            if hasattr(params, "itemByName"):
-                p = params.itemByName(name)
-            elif isinstance(params, dict):
-                p = params.get(name)
-        except Exception:
-            p = None
-        if p is None:
-            continue
-        if isinstance(p, (bool, int, float, str)):
-            return p
-        try:
-            v_obj = getattr(p, "value", None)
-            raw = getattr(v_obj, "value", v_obj)
-            if isinstance(raw, (bool, int, float, str)):
-                return raw
-        except Exception:
-            pass
-        try:
-            expr = getattr(p, "expression", None)
-            if isinstance(expr, str):
-                cleaned = expr.strip()
-                if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
-                    cleaned = cleaned[1:-1]
-                if cleaned:
-                    return cleaned
-        except Exception:
-            pass
+        p = _lookup_cam_param(params, name)
+        val = _unwrap_cam_param_scalar(p)
+        if val is not None:
+            return val
     return None
+
+
+def _extract_float_param_mm(params, names, default=None):
+    """Extract a Fusion length parameter in millimeters from numeric cm value or unit expression."""
+    if params is None:
+        return default
+    for n in names:
+        try:
+            p = _lookup_cam_param(params, n)
+            if p is None:
+                continue
+            expr = None
+            if hasattr(p, "expression") and p.expression:
+                expr = str(p.expression).strip()
+            val = p.value.value if hasattr(p, "value") and hasattr(p.value, "value") else getattr(p, "value", p)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                if not math.isnan(val) and not math.isinf(val):
+                    return float(val) * 10.0  # Fusion internal length unit (cm) to mm
+
+            s = expr or (str(val).strip() if val is not None else "")
+            if s:
+                try:
+                    app = adsk.core.Application.get() if ("adsk" in sys.modules and hasattr(adsk, "core")) else None
+                    doc = getattr(app, "activeDocument", None) if app else None
+                    units_mgr = getattr(doc, "unitsManager", None)
+                    if units_mgr and hasattr(units_mgr, "evaluateExpression"):
+                        fval = units_mgr.evaluateExpression(s, "mm")
+                        if not math.isnan(fval) and not math.isinf(fval):
+                            return float(fval)
+                except Exception:
+                    pass
+
+                s_clean = s.lower().strip()
+                m = re.match(r"^([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([a-z'\"]*)$", s_clean)
+                if m:
+                    num = float(m.group(1))
+                    unit = m.group(2)
+                    if unit in ("in", "inch", "inches", '"'):
+                        fval = num * 25.4
+                    elif unit in ("ft", "feet", "'"):
+                        fval = num * 304.8
+                    elif unit in ("cm", ""):
+                        fval = num * 10.0
+                    elif unit in ("mm",):
+                        fval = num
+                    else:
+                        fval = None
+                    if fval is not None and not math.isnan(fval) and not math.isinf(fval):
+                        return fval
+        except Exception:
+            pass
+    return default
 
 
 def _is_scalar_truthy(val) -> bool:
@@ -979,9 +1035,8 @@ def _CheckProgramCapability(p_setups, setup_operations_map) -> Optional[str]:
             return setup_err
         is_turning = _is_turning_setup_obj(setup)
         ops_to_check = list(_lookup_setup_ops(setup, setup_operations_map) or [])
-        s_name = _safe_getattr(setup, "name", None)
         for bad_s, bad_op, _reason in empty_invalid:
-            if bad_s == setup or (s_name is not None and _safe_getattr(bad_s, "name", None) == s_name):
+            if _same_cam_entity(bad_s, setup):
                 if bad_op not in ops_to_check:
                     ops_to_check.append(bad_op)
         for op in ops_to_check:
@@ -991,22 +1046,19 @@ def _CheckProgramCapability(p_setups, setup_operations_map) -> Optional[str]:
     return None
 
 
-def GetNcProgramSetupsAndOperations(cam, settings, program=None):
+def GetNcProgramSetupsAndOperations(cam, program=None):
     """
     Look in the selected NCProgram's setup and operations and derive the setups and operations to process.
     Returns:
         target_setups: list of adsk.cam.Setup objects
         setup_operations_map: SetupOperationsMap mapping Setup -> list[Operation]
     """
-    if program is None and cam is not None and hasattr(cam, "ncPrograms"):
-        program = GetNcProgram(cam, settings)
-
     whole_setups = []
     selected_ops_by_setup = SetupListDefaultDict()
     nc_prog_setups = []
 
     def add_setup_ref(s):
-        if s and not any(s == existing or getattr(s, "name", None) == getattr(existing, "name", None) for existing in nc_prog_setups):
+        if s and not any(_same_cam_entity(s, existing) for existing in nc_prog_setups):
             nc_prog_setups.append(s)
 
     # 1. Check if program has direct setups collection
@@ -1017,7 +1069,7 @@ def GetNcProgramSetupsAndOperations(cam, settings, program=None):
                 resolved_s = _resolve_setup_for_object(s, cam)
                 if resolved_s:
                     add_setup_ref(resolved_s)
-                    if not any(resolved_s == ws or getattr(resolved_s, "name", None) == getattr(ws, "name", None) for ws in whole_setups):
+                    if not any(_same_cam_entity(resolved_s, ws) for ws in whole_setups):
                         whole_setups.append(resolved_s)
         except Exception as exc:
             _dbg_global(f"GetNcProgramSetupsAndOperations: error inspecting program.setups: {exc}")
@@ -1031,7 +1083,7 @@ def GetNcProgramSetupsAndOperations(cam, settings, program=None):
                     resolved_s = _resolve_setup_for_object(item, cam)
                     if resolved_s:
                         add_setup_ref(resolved_s)
-                        if not any(resolved_s == ws or getattr(resolved_s, "name", None) == getattr(ws, "name", None) for ws in whole_setups):
+                        if not any(_same_cam_entity(resolved_s, ws) for ws in whole_setups):
                             whole_setups.append(resolved_s)
                 elif _is_folder_cam_object(item):
                     resolved_s = _resolve_setup_for_object(item, cam)
@@ -1054,7 +1106,7 @@ def GetNcProgramSetupsAndOperations(cam, settings, program=None):
         if cam and hasattr(cam, "setups"):
             for s in cam.setups:
                 add_setup_ref(s)
-                if not any(s == ws or getattr(s, "name", None) == getattr(ws, "name", None) for ws in whole_setups):
+                if not any(_same_cam_entity(s, ws) for ws in whole_setups):
                     whole_setups.append(s)
 
     target_setups = list(nc_prog_setups)
@@ -1066,10 +1118,7 @@ def GetNcProgramSetupsAndOperations(cam, settings, program=None):
         all_s_ops = getattr(s, "allOperations", [])
         all_s_ops_list = _extract_cam_collection(all_s_ops)
 
-        is_whole = any(
-            s == ws or getattr(s, "name", None) == getattr(ws, "name", None)
-            for ws in whole_setups
-        )
+        is_whole = any(_same_cam_entity(s, ws) for ws in whole_setups)
         if is_whole:
             cand_ops = [
                 op for op in all_s_ops_list
@@ -1077,16 +1126,11 @@ def GetNcProgramSetupsAndOperations(cam, settings, program=None):
             ]
         else:
             chosen_ops = selected_ops_by_setup.get(s, [])
-            cand_ops = []
-            for op in all_s_ops_list:
-                is_match = any(
-                    op == c_op or
-                    (getattr(op, "operationId", -1) != -1 and getattr(op, "operationId", -1) == getattr(c_op, "operationId", -2)) or
-                    (getattr(op, "name", None) is not None and getattr(op, "name", None) == getattr(c_op, "name", None))
-                    for c_op in chosen_ops
-                )
-                if is_match and not getattr(op, "isSuppressed", False):
-                    cand_ops.append(op)
+            cand_ops = [
+                op for op in all_s_ops_list
+                if not getattr(op, "isSuppressed", False)
+                and any(_same_cam_entity(op, c_op) for c_op in chosen_ops)
+            ]
 
         valid_ops = []
         for op in cand_ops:
@@ -1102,49 +1146,25 @@ def GetNcProgramSetupsAndOperations(cam, settings, program=None):
     return target_setups, setup_operations_map
 
 
-def GetNcProgram(cam, settings):
-    if not cam or not hasattr(cam, "ncPrograms"):
-        return None
-    target = None
-    prog_name = settings.get("ncProgram") if settings else None
-    if not prog_name and settings and isinstance(settings.get("ncPrograms"), (list, tuple)) and settings["ncPrograms"]:
-        prog_name = settings["ncPrograms"][0]
-    if prog_name:
-        for program in cam.ncPrograms:
-            if program.name == prog_name:
-                target = program
-                break
-    if target is None and cam.ncPrograms.count > 0:
-        target = cam.ncPrograms.item(0)
-    return target
-
-
 def GetSelectedNcPrograms(cam, settings) -> List[Any]:
-    """Resolve the list of selected NCProgram objects from settings (with legacy ncProgram fallback)."""
+    """Resolve the list of selected NCProgram objects from settings["ncPrograms"]."""
     if not cam or not hasattr(cam, "ncPrograms"):
         return []
     all_progs = _extract_cam_collection(cam.ncPrograms)
+    if not all_progs:
+        return []
     selected: List[Any] = []
 
     prog_names = settings.get("ncPrograms") if settings else None
-    if isinstance(prog_names, (list, tuple)) and len(prog_names) > 0:
+    if isinstance(prog_names, (list, tuple)) and prog_names:
         for name in prog_names:
             for p in all_progs:
                 if getattr(p, "name", None) == name and p not in selected:
                     selected.append(p)
                     break
 
-    if not selected and settings and settings.get("ncProgram"):
-        target = GetNcProgram(cam, settings)
-        if target is not None:
-            selected.append(target)
-
     if not selected:
-        target = GetNcProgram(cam, settings)
-        if target is not None:
-            selected.append(target)
-        elif all_progs:
-            selected.append(all_progs[0])
+        selected.append(all_progs[0])
 
     return selected
 
@@ -1157,15 +1177,11 @@ def _ResolveNcProgramOutputFilename(program, setup=None, fileExt: str = ".nc") -
     """
     raw_name = ""
     if program is not None and hasattr(program, "parameters") and program.parameters is not None:
-        try:
-            params = program.parameters
-            p_fn = params.itemByName("nc_program_filename") if hasattr(params, "itemByName") else params.get("nc_program_filename")
-            if p_fn is not None:
-                val = _extract_choice_value(p_fn)
-                if val and val.strip():
-                    raw_name = val.strip()
-        except Exception:
-            pass
+        p_fn = _lookup_cam_param(program.parameters, "nc_program_filename")
+        if p_fn is not None:
+            val = _extract_choice_value(p_fn)
+            if val and val.strip():
+                raw_name = val.strip()
 
     if not raw_name and program is not None:
         p_name = getattr(program, "name", None)
@@ -1202,11 +1218,7 @@ def _is_nc_program_object(obj, cam=None) -> bool:
         return True
     if cam and hasattr(cam, "ncPrograms"):
         for p in _extract_cam_collection(cam.ncPrograms):
-            if p == obj:
-                return True
-            p_tok = getattr(p, "entityToken", None)
-            o_tok = getattr(obj, "entityToken", None)
-            if isinstance(p_tok, str) and p_tok and p_tok == o_tok:
+            if _same_cam_entity(p, obj, check_name=False):
                 return True
     return False
 
@@ -1250,9 +1262,8 @@ def _ResolveNcProgramNamesFromEntities(cam, entities) -> List[str]:
 
         if _is_nc_program_object(ent, cam):
             for p in all_progs:
-                p_name = getattr(p, "name", None)
-                if p == ent or (isinstance(p_name, str) and p_name == ent_name_str):
-                    _add_name(p_name)
+                if _same_cam_entity(p, ent):
+                    _add_name(getattr(p, "name", None))
                     break
         elif ("NCPrograms" in obj_type_str) or ent_name_str == "NC Programs":
             for p in all_progs:
@@ -1266,16 +1277,11 @@ def _ResolveNcProgramNamesFromEntities(cam, entities) -> List[str]:
     if selected_setups:
         for p in all_progs:
             try:
-                p_setups, _ = GetNcProgramSetupsAndOperations(cam, {}, program=p)
+                p_setups, _ = GetNcProgramSetupsAndOperations(cam, program=p)
             except Exception:
                 p_setups = []
             for ps in p_setups:
-                ps_name = getattr(ps, "name", None)
-                if any(
-                    ps == s
-                    or (isinstance(ps_name, str) and ps_name and ps_name == getattr(s, "name", None))
-                    for s in selected_setups
-                ):
+                if any(_same_cam_entity(ps, s) for s in selected_setups):
                     _add_name(getattr(p, "name", None))
                     break
 
@@ -1384,17 +1390,10 @@ def _CollectCheckedNcProgramsFromInputs(inputs) -> Tuple[List[str], int]:
 
 def _extract_choice_value(param) -> str:
     """Extract string value from a CAM ParameterValue, ChoiceParameterValue, or mock."""
-    if param is None:
-        return ""
-    val = getattr(param, "value", param)
-    if hasattr(val, "value"):
-        val = getattr(val, "value", val)
-    if isinstance(val, str):
-        return val.strip()
-    expr = getattr(param, "expression", None)
-    if isinstance(expr, str) and expr.strip():
-        return expr.strip()
-    return str(val).strip() if val is not None else ""
+    val = _unwrap_cam_param_scalar(param)
+    if val is not None and not isinstance(val, bool):
+        return str(val).strip()
+    return ""
 
 
 def _ResolveCamOutputUnit(val):
@@ -1441,14 +1440,13 @@ def _safe_str(val) -> str:
     return val.strip() if isinstance(val, str) else ""
 
 
-def _GetNCProgramOutputUnits(program, docSettings=None):
+def _GetNCProgramOutputUnits(program):
     """
     Resolve the CAM PostOutputUnitOptions enum value from the NCProgram or its parameters.
     Checks:
       1. program.parameters.itemByName("nc_program_unit") (standard Fusion CAM choice parameter: "Millimeters", "Inches", "Document units")
       2. program.outputUnits property (if present)
       3. program.postParameters ("nc_program_unit" or "unit")
-      4. docSettings fallback ("nc_program_unit" or "outputUnits" or "unit")
     Returns:
       adsk.cam.PostOutputUnitOptions enum value (MillimetersOutput=2, InchesOutput=1, or DocumentUnitsOutput=0)
     """
@@ -1459,15 +1457,11 @@ def _GetNCProgramOutputUnits(program, docSettings=None):
     if program is not None:
         # 1. Native NCProgram parameter: nc_program_unit
         if hasattr(program, "parameters"):
-            try:
-                params = program.parameters
-                p = params.itemByName("nc_program_unit") if hasattr(params, "itemByName") else params.get("nc_program_unit")
-                if p is not None:
-                    raw_val = _extract_choice_value(p)
-                    if raw_val:
-                        return _ResolveCamOutputUnit(raw_val)
-            except Exception:
-                pass
+            p = _lookup_cam_param(program.parameters, "nc_program_unit")
+            if p is not None:
+                raw_val = _extract_choice_value(p)
+                if raw_val:
+                    return _ResolveCamOutputUnit(raw_val)
 
         # 2. program.outputUnits property
         if hasattr(program, "outputUnits"):
@@ -1480,22 +1474,13 @@ def _GetNCProgramOutputUnits(program, docSettings=None):
 
         # 3. program.postParameters
         if hasattr(program, "postParameters"):
-            try:
-                post_params = program.postParameters
-                for k in ("nc_program_unit", "unit", "outputUnits"):
-                    p = post_params.itemByName(k) if hasattr(post_params, "itemByName") else post_params.get(k)
-                    if p is not None:
-                        raw_val = _extract_choice_value(p)
-                        if raw_val:
-                            return _ResolveCamOutputUnit(raw_val)
-            except Exception:
-                pass
-
-    # 4. docSettings fallback
-    if docSettings and isinstance(docSettings, dict):
-        for k in ("nc_program_unit", "outputUnits", "unit"):
-            if k in docSettings and docSettings[k] is not None:
-                return _ResolveCamOutputUnit(docSettings[k])
+            post_params = program.postParameters
+            for k in ("nc_program_unit", "unit", "outputUnits"):
+                p = _lookup_cam_param(post_params, k)
+                if p is not None:
+                    raw_val = _extract_choice_value(p)
+                    if raw_val:
+                        return _ResolveCamOutputUnit(raw_val)
 
     return doc_opt
 
@@ -1627,19 +1612,8 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
             cam = adsk.cam.CAM.cast(app.activeDocument.products.itemByProductType(constCAMProductId))
             docSettings = settingsMgr.GetSettings(app.activeDocument.attributes)
 
-            # Get the NCPrograms
-            programs = cam.ncPrograms
-            if programs.count == 0:
-                ncInput = programs.createInput()
-                ncInput.displayName = constNcProgramName
-                program = programs.add(ncInput)
-                outputFolder = docSettings["output"]
-                out_param = program.parameters.itemByName("nc_program_output_folder")
-                if out_param is not None:
-                    out_param.value.value = outputFolder
-                program.parameters.itemByName("nc_program_createInBrowser").value.value = True
-
-            all_progs = _extract_cam_collection(programs)
+            # Get the NCPrograms (read-only; never auto-create or mutate)
+            all_progs = _extract_cam_collection(cam.ncPrograms)
             all_prog_names = [p.name for p in all_progs if getattr(p, "name", None)]
             valid_name_set = set(all_prog_names)
 
@@ -1651,8 +1625,6 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                 saved_progs = docSettings.get("ncPrograms")
                 if isinstance(saved_progs, (list, tuple)) and saved_progs:
                     checked_names = [n for n in saved_progs if n in valid_name_set]
-                elif docSettings.get("ncProgram") in valid_name_set:
-                    checked_names = [docSettings["ncProgram"]]
                 else:
                     checked_names = []
                 if not checked_names and all_prog_names:
@@ -1661,7 +1633,6 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
             checked_set = set(checked_names)
             ordered_checked = [n for n in all_prog_names if n in checked_set]
             docSettings["ncPrograms"] = ordered_checked
-            docSettings["ncProgram"] = ordered_checked[0] if ordered_checked else ""
             docSettings["debug_log"] = bool(docSettings.get("debug_log", False))
 
             # Connect to the execute event.
@@ -1673,7 +1644,7 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
             inputs = cmd.commandInputs
 
             tableInput = inputs.addTableCommandInput("ncProgramsTable", "NC Programs", 3, "1:5:4")
-            tableInput.minimumVisibleRows = min(4, max(2, programs.count + 1))
+            tableInput.minimumVisibleRows = min(4, max(2, len(all_progs) + 1))
             tableInput.maximumVisibleRows = 9
             tableInput.hasGrid = False
 
@@ -1686,6 +1657,8 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                 len(ordered_checked) == len(all_prog_names) and len(all_prog_names) > 0,
             )
             sel_all_inp.tooltip = "Select or deselect all NC Programs"
+            if not all_progs:
+                sel_all_inp.isEnabled = False
             hdr_name_inp = inputs.addStringValueInput("ncprog_hdr_label", "", "Select All")
             hdr_name_inp.isReadOnly = True
             hdr_info_inp = inputs.addStringValueInput("ncprog_hdr_info", "", "")
@@ -1702,7 +1675,7 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
 
                 # Build setup & output filename summary
                 try:
-                    p_setups, p_ops_map = GetNcProgramSetupsAndOperations(cam, docSettings, program=prog)
+                    p_setups, p_ops_map = GetNcProgramSetupsAndOperations(cam, program=prog)
                 except Exception:
                     p_setups, p_ops_map = [], None
 
@@ -1713,7 +1686,7 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                 else:
                     setup_obj = p_setups[0] if len(p_setups) == 1 else None
                     setup_name = _safe_str(getattr(setup_obj, "name", None)) or "No setup"
-                    file_ext = _GetNcProgramExtension(prog, docSettings)
+                    file_ext = _GetNcProgramExtension(prog)
                     raw_fname = _ResolveNcProgramOutputFilename(prog, setup_obj, file_ext)
                     leaf_fname = _SanitizePathSegment(raw_fname)
                     info_str = f"{setup_name} -> {leaf_fname}{file_ext}"
@@ -1766,9 +1739,10 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                 "Save these settings to use as the default for each new design.")
 
             # text box for error messages
-            input = inputs.addTextBoxCommandInput("error", "", "", 3, True)
+            err_msg = "No NC Programs found. Create an NC Program first." if not all_progs else ""
+            input = inputs.addTextBoxCommandInput("error", "", err_msg, 3, True)
             input.isFullWidth = True
-            input.isVisible = False
+            input.isVisible = (not all_progs)
 
             # Connect to the inputChanged event.
             onInputChanged = CommandInputChangedHandler(docSettings)
@@ -1824,7 +1798,6 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                                 if isinstance(p_name, str) and p_name:
                                     selected.append(p_name)
                     self.docSettings["ncPrograms"] = selected
-                    self.docSettings["ncProgram"] = selected[0] if selected else ""
                 finally:
                     self._updating_select_all = False
 
@@ -1842,7 +1815,6 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                     if sel_all is not None and total > 0:
                         sel_all.value = (len(selected) == total)
                     self.docSettings["ncPrograms"] = selected
-                    self.docSettings["ncProgram"] = selected[0] if selected else ""
                 finally:
                     self._updating_select_all = False
 
@@ -1870,7 +1842,12 @@ class CommandValidateInputsHandler(adsk.core.ValidateInputsEventHandler):
             inputs = _GetRootCommandInputs(eventArgs)
             selected, total = _CollectCheckedNcProgramsFromInputs(inputs)
             err_box = inputs.itemById("error") if inputs is not None else None
-            if total > 0 and not selected:
+            if total == 0:
+                eventArgs.areInputsValid = False
+                if err_box is not None:
+                    err_box.text = "No NC Programs found. Create an NC Program first."
+                    err_box.isVisible = True
+            elif not selected:
                 eventArgs.areInputsValid = False
                 if err_box is not None:
                     err_box.text = "Select at least one NC Program."
@@ -1916,11 +1893,10 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
         selected, total = _CollectCheckedNcProgramsFromInputs(inputs)
         if total > 0:
             self.docSettings["ncPrograms"] = selected
-            self.docSettings["ncProgram"] = selected[0] if selected else ""
 
         # Code to react to the event.
         for key in list(self.docSettings.keys()):
-            if key in ("ncPrograms", "ncProgram"):
+            if key == "ncPrograms":
                 continue
             inp = _FindCommandInputById(inputs, key)
             if inp:
@@ -1938,7 +1914,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
 
 
-def PerformPostProcess(docSettings, setups=None):
+def PerformPostProcess(docSettings):
     ui = None
     progress = None
     try:
@@ -1953,18 +1929,14 @@ def PerformPostProcess(docSettings, setups=None):
         lstSkipped = ""
         verifyResults.clear()
         if _debug_log_enabled:
-            _LogInvocationDiagnostics(app=app, doc=doc, cam=cam, docSettings=docSettings, setups=setups)
-        _dbg_global(f"PerformPostProcess entered: incoming setups count={len(setups) if setups else 0}")
+            _LogInvocationDiagnostics(app=app, doc=doc, cam=cam, docSettings=docSettings)
+        _dbg_global("PerformPostProcess entered")
 
         global settingsMgr
         if settingsMgr is None:
             settingsMgr = SettingsManager()
 
         selected_programs = GetSelectedNcPrograms(cam, docSettings)
-        if not selected_programs:
-            fallback_prog = GetNcProgram(cam, docSettings)
-            if fallback_prog is not None:
-                selected_programs = [fallback_prog]
 
         if not selected_programs:
             err = "No NC Programs found to post process."
@@ -1983,14 +1955,13 @@ def PerformPostProcess(docSettings, setups=None):
         all_empty_invalid = []
         existing_files = []
         runnable_tasks = []
-        program_snapshots = {}
         seen_targets = {}
         first_output_folder = ""
 
         for prog_idx, program in enumerate(selected_programs):
             prog_name = _safe_str(getattr(program, "name", None)) or f"NC Program {prog_idx + 1}"
             parameters = getattr(program, "parameters", None)
-            p_setups, setup_operations_map = GetNcProgramSetupsAndOperations(cam, docSettings, program=program)
+            p_setups, setup_operations_map = GetNcProgramSetupsAndOperations(cam, program=program)
 
             # Abort with error if multiple setups are detected in a single NC Program
             if len(p_setups) > 1:
@@ -2023,13 +1994,7 @@ def PerformPostProcess(docSettings, setups=None):
                 return cap_err
 
             # Normalize output folder for this user ("\" -> "/")
-            raw_folder = ""
-            if parameters is not None:
-                try:
-                    p_folder = parameters.itemByName("nc_program_output_folder")
-                    raw_folder = _extract_choice_value(p_folder)
-                except Exception:
-                    raw_folder = ""
+            raw_folder = _extract_choice_value(_lookup_cam_param(parameters, "nc_program_output_folder"))
             outputFolder = raw_folder.replace("\\", "/")
             # Keep leading "\\" for file share
             if outputFolder[0:2] == "//":
@@ -2042,32 +2007,12 @@ def PerformPostProcess(docSettings, setups=None):
             if not first_output_folder:
                 first_output_folder = outputFolder
 
-            docSettings["output"] = outputFolder
-
             empty_invalid = getattr(setup_operations_map, "empty_or_invalid_ops", [])
             if empty_invalid:
                 all_empty_invalid.extend(empty_invalid)
 
-            # Snapshot original NCProgram parameters so the user's NCProgram is never left mutated
-            orig_prog_params = {}
-            if parameters is not None:
-                for p_key in (
-                    "nc_program_name",
-                    "nc_program_filename",
-                    "nc_program_openInEditor",
-                    "nc_program_nc_extension",
-                    "nc_program_output_folder",
-                ):
-                    try:
-                        p_item = parameters.itemByName(p_key)
-                        if p_item is not None:
-                            orig_prog_params[p_key] = p_item.value.value
-                    except Exception:
-                        pass
-            program_snapshots[id(program)] = (program, parameters, outputFolder, orig_prog_params)
-
             if len(p_setups) != 0 and cam.allOperations.count != 0:
-                fileExt = _GetNcProgramExtension(program, docSettings)
+                fileExt = _GetNcProgramExtension(program)
 
                 for setup in p_setups:
                     target_ops = _lookup_setup_ops(setup, setup_operations_map)
@@ -2104,7 +2049,6 @@ def PerformPostProcess(docSettings, setups=None):
                     runnable_tasks.append({
                         "program": program,
                         "prog_name": prog_name,
-                        "parameters": parameters,
                         "setup": setup,
                         "target_ops": target_ops,
                         "setupFolder": sFolder,
@@ -2215,14 +2159,9 @@ def PerformPostProcess(docSettings, setups=None):
                     prev_len = len(verifyResults)
                     status = PostProcessSetup(
                         fname, setup, setupFolder, docSettings, program,
-                        target_operations=target_ops, progress_cb=setup_cb
+                        target_operations=target_ops, progress_cb=setup_cb,
+                        nc_program_name=prog_name,
                     )
-                    # Backfill nc_program on any verifyResult appended during this task
-                    for vr in verifyResults[prev_len:]:
-                        if not vr.get("nc_program"):
-                            vr["nc_program"] = prog_name
-                        if not vr.get("folder"):
-                            vr["folder"] = task["outputFolder"]
 
                     if status is None:
                         cntFiles += 1
@@ -2257,16 +2196,6 @@ def PerformPostProcess(docSettings, setups=None):
                         progress.hide()
                     except Exception:
                         pass
-                # Restore every program's original parameters
-                for _, parameters, _, orig_prog_params in program_snapshots.values():
-                    if parameters is not None:
-                        for p_key, p_val in orig_prog_params.items():
-                            try:
-                                p_item = parameters.itemByName(p_key)
-                                if p_item is not None:
-                                    p_item.value.value = p_val
-                            except Exception:
-                                pass
 
         # done with setups, report results non-modally
         _NotifyPostProcessResult(
@@ -2305,11 +2234,12 @@ def _RecordVerifyResult(setup, cncPath, reportText, reportPath=None, pngPath=Non
         reportPath = basePath + "_report.md"
     if not pngPath:
         pngPath = basePath + ".png"
-    try:
-        with open(reportPath, "w", encoding="utf8") as f:
-            f.write(reportText)
-    except Exception:
-        pass
+    if reportText and (error or not os.path.isfile(reportPath)):
+        try:
+            with open(reportPath, "w", encoding="utf8") as f:
+                f.write(reportText)
+        except Exception:
+            pass
     kinds = {}
     for c in (collisions or []):
         kind_str = c.kind.name if hasattr(c.kind, "name") else str(c.kind)
@@ -2518,15 +2448,7 @@ def _ResolveBasePostPath(program=None, is_turning: Optional[bool] = None) -> str
         if u_str:
             candidates.append(os.path.basename(u_str))
 
-    search_dirs = _GetPostSearchDirs()
-    user_dirs_def, sys_dirs_def, addon_dirs_def = _GetPostSearchDirsByTier()
-    sys_set = set(sys_dirs_def)
-    addon_set = set(addon_dirs_def)
-
-    user_dirs = [d for d in search_dirs if d not in sys_set and d not in addon_set]
-    sys_dirs = [d for d in search_dirs if d in sys_set]
-    addon_dirs = [d for d in search_dirs if d in addon_set]
-
+    user_dirs, sys_dirs, addon_dirs = _GetPostSearchDirsByTier()
     tiers = [
         ("user/cloud", user_dirs),
         ("system", sys_dirs),
@@ -2621,28 +2543,22 @@ def _ExtractPostProperties(program=None) -> dict:
                 p_name = getattr(param, "name", None)
                 if not p_name:
                     continue
-                val_obj = getattr(param, "value", None)
-                val = getattr(val_obj, "value", None) if val_obj is not None else None
-                if isinstance(val, (bool, int, float, str)):
+                val = _unwrap_cam_param_scalar(param)
+                if val is not None:
                     props[p_name] = val
             except Exception:
                 pass
 
         # Check standard NCProgram parameters if maximumSpindleSpeed was not in postParameters
         if "maximumSpindleSpeed" not in props:
-            prog_params = getattr(program, "parameters", None)
-            if prog_params:
-                for candidate_name in ("maximumSpindleSpeed", "maxSpindleSpeed", "nc_program_maximum_spindle_speed"):
-                    try:
-                        p_obj = prog_params.itemByName(candidate_name)
-                        if p_obj:
-                            val_obj = getattr(p_obj, "value", None)
-                            val = getattr(val_obj, "value", None) if val_obj is not None else getattr(p_obj, "value", None)
-                            if isinstance(val, (int, float)) and val > 0:
-                                props["maximumSpindleSpeed"] = val
-                                break
-                    except Exception:
-                        pass
+            val = _extract_scalar_param(
+                getattr(program, "parameters", None),
+                "maximumSpindleSpeed",
+                "maxSpindleSpeed",
+                "nc_program_maximum_spindle_speed",
+            )
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+                props["maximumSpindleSpeed"] = val
     except Exception as exc:
         _dbg_global(f"_ExtractPostProperties warning: {exc}")
     return props
@@ -2955,20 +2871,12 @@ def _GetSetupStockMode(setup) -> str:
     # 2. Fallback check for headless test setups or mock objects
     if not res and hasattr(setup, "parameters") and setup.parameters is not None:
         for p_name in ("job_stockMode", "stockMode", "job_stockType", "stockType"):
-            try:
-                p = setup.parameters.itemByName(p_name)
-                if p is not None:
-                    for attr in ("value", "expression"):
-                        pv = getattr(p, attr, None)
-                        if pv is not None:
-                            pv_sub = getattr(pv, "value", pv)
-                            if isinstance(pv_sub, (str, int)) and not hasattr(pv_sub, "_mock_return_value"):
-                                res = _map_stock_mode_str(str(pv_sub))
-                                break
-                    if res:
-                        break
-            except Exception:
-                pass
+            raw_mode = _extract_scalar_param(setup.parameters, p_name)
+            if isinstance(raw_mode, (str, int)) and not isinstance(raw_mode, bool):
+                mapped = _map_stock_mode_str(str(raw_mode))
+                if mapped:
+                    res = mapped
+                    break
 
     _dbg_global(f"_GetSetupStockMode: setup='{getattr(setup, 'name', '')}' val={val} -> mode='{res}'")
     return res
@@ -2997,55 +2905,7 @@ def _ExtractWorkpieceFromSetup(setup):
         params = setup.parameters
 
         def _get_float_param(names, default=None):
-            for n in names:
-                try:
-                    p = params.itemByName(n)
-                    if p is not None:
-                        expr = None
-                        if hasattr(p, "expression") and p.expression:
-                            expr = str(p.expression).strip()
-                        val = p.value.value if hasattr(p, "value") and hasattr(p.value, "value") else getattr(p, "value", p)
-                        if isinstance(val, (int, float)):
-                            if not math.isnan(val) and not math.isinf(val):
-                                return float(val) * 10.0  # Fusion internal length unit (cm) to mm
-
-                        s = expr or (str(val).strip() if val is not None else "")
-                        if s:
-                            # 1. Try Fusion native unitsManager expression evaluation if in Fusion process
-                            try:
-                                app = adsk.core.Application.get() if ("adsk" in sys.modules and hasattr(adsk, "core")) else None
-                                doc = getattr(app, "activeDocument", None) if app else None
-                                units_mgr = getattr(doc, "unitsManager", None)
-                                if units_mgr and hasattr(units_mgr, "evaluateExpression"):
-                                    fval = units_mgr.evaluateExpression(s, "mm")
-                                    if not math.isnan(fval) and not math.isinf(fval):
-                                        return float(fval)
-                            except Exception:
-                                pass
-
-                            # 2. Robust unit regex parsing (S5)
-                            s_clean = s.lower().strip()
-                            m = re.match(r"^([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([a-z'\"]*)$", s_clean)
-                            if m:
-                                num = float(m.group(1))
-                                unit = m.group(2)
-                                if unit in ("in", "inch", "inches", '"'):
-                                    fval = num * 25.4
-                                elif unit in ("ft", "feet", "'"):
-                                    fval = num * 304.8
-                                elif unit in ("cm",):
-                                    fval = num * 10.0
-                                elif unit in ("mm",):
-                                    fval = num
-                                elif unit == "":
-                                    fval = num * 10.0
-                                else:
-                                    fval = None
-                                if fval is not None and not math.isnan(fval) and not math.isinf(fval):
-                                    return fval
-                except Exception:
-                    pass
-            return default
+            return _extract_float_param_mm(params, names, default=default)
 
         d_outer_mm = _get_float_param(["job_stockDiameter", "stockDiameter", "job_stockDimensionsX", "job_stockDimensionsY", "stock_diameter"])
         length_mm = _get_float_param(["job_stockLength", "stockLength", "job_stockDimensionsZ", "stock_length"])
@@ -3096,9 +2956,48 @@ def _ExtractWorkpieceFromSetup(setup):
 
 
 _palette_handlers = []
-_last_action_timestamp = 0
-_last_action_key = ""
 constNotificationPaletteId = "PostClear_NotificationPalette"
+
+
+def _ComputeToastBottomRight(palette_w: int, palette_h: int, vp=None) -> Tuple[int, int]:
+    """Compute bottom-right toast palette (x, y) in logical screen coordinates from viewport origin + size."""
+    if vp is not None and hasattr(adsk, "core") and hasattr(adsk.core, "Point2D") and hasattr(adsk.core.Point2D, "create"):
+        try:
+            origin = vp.viewToScreen(adsk.core.Point2D.create(0, 0))
+            vp_w = int(vp.width)
+            vp_h = int(vp.height)
+            if origin is not None and vp_w > 0 and vp_h > 0:
+                ox = int(round(float(origin.x)))
+                oy = int(round(float(origin.y)))
+                tx = max(ox + 12, ox + vp_w - int(palette_w) - 20)
+                ty = max(oy + 12, oy + vp_h - int(palette_h) - 24)
+                _dbg_global(f"_ComputeToastBottomRight: origin=({ox}, {oy}), vp=({vp_w}, {vp_h}) -> ({tx}, {ty})")
+                return (tx, ty)
+        except Exception as pt_exc:
+            _dbg_global(f"_ComputeToastBottomRight: viewToScreen note: {pt_exc}")
+
+    return (940, 680)
+
+
+def _CleanupNotificationPalette(ui) -> None:
+    """Delete any existing notification palette and detach tracked HTML event handlers."""
+    if ui and hasattr(ui, "palettes") and ui.palettes:
+        try:
+            existing = ui.palettes.itemById(constNotificationPaletteId)
+            if existing:
+                _dbg_global(f"_CleanupNotificationPalette: deleting previous palette id={constNotificationPaletteId}")
+                existing.deleteMe()
+        except Exception as rex:
+            _dbg_global(f"_CleanupNotificationPalette: palette cleanup error: {rex}")
+    global _palette_handlers, handlers
+    for h in _palette_handlers:
+        if h in handlers:
+            try:
+                handlers.remove(h)
+            except ValueError:
+                pass
+    _palette_handlers.clear()
+
 
 _HTMLEventHandlerBase = (
     getattr(adsk.core, "HTMLEventHandler", object)
@@ -3106,24 +3005,8 @@ _HTMLEventHandlerBase = (
     else object
 )
 
-_NavigationEventHandlerBase = (
-    getattr(adsk.core, "NavigationEventHandler", object)
-    if ("adsk" in sys.modules and hasattr(adsk, "core") and hasattr(adsk.core, "NavigationEventHandler"))
-    else object
-)
-
 
 def _HandleNotificationAction(palette_id, action, data):
-    global _last_action_timestamp, _last_action_key
-    now = time.time()
-    key = f"{action}:{data}"
-    # Debounce duplicate events if both Navigation and HTML handlers fire for the same click
-    if key == _last_action_key and (now - _last_action_timestamp) < 0.8:
-        _dbg_global(f"_HandleNotificationAction: debouncing duplicate action={action}")
-        return
-    _last_action_key = key
-    _last_action_timestamp = now
-
     _dbg_global(f"_HandleNotificationAction: executing action={action}, data={data}")
 
     # 1. Execute OS action first (independent of Fusion UI state); keep palette open
@@ -3135,8 +3018,8 @@ def _HandleNotificationAction(palette_id, action, data):
             _dbg_global(f"_HandleNotificationAction: path does not exist: '{data}'")
         return
 
-    # 2. Hide palette only when explicitly dismissed/closed
-    if action in ("dismiss", "close"):
+    # 2. Hide palette only when explicitly dismissed
+    if action == "dismiss":
         try:
             app = adsk.core.Application.get() if ("adsk" in sys.modules and hasattr(adsk, "core") and hasattr(adsk.core, "Application")) else None
             ui = getattr(app, "userInterface", None) if app else None
@@ -3146,45 +3029,6 @@ def _HandleNotificationAction(palette_id, action, data):
                     p.isVisible = False
         except Exception as hide_exc:
             _dbg_global(f"_HandleNotificationAction hide palette note: {hide_exc}")
-
-
-class _NotificationNavigationEventHandler(_NavigationEventHandlerBase):
-    def __init__(self, palette_id):
-        super().__init__()
-        self.palette_id = palette_id
-
-    def notify(self, args):
-        try:
-            url = getattr(args, "navigationURL", "")
-            if "adsk" in sys.modules and hasattr(adsk, "core") and hasattr(adsk.core, "NavigationEventArgs"):
-                try:
-                    c = adsk.core.NavigationEventArgs.cast(args)
-                    if c:
-                        url = c.navigationURL
-                except Exception:
-                    pass
-
-            _dbg_global(f"NotificationNavigationEventHandler notify: url={url}")
-
-            if url and url.startswith("action://"):
-                try:
-                    args.launchExternally = False
-                except Exception:
-                    pass
-                try:
-                    if hasattr(args, "preventDefault"):
-                        args.preventDefault = True
-                except Exception:
-                    pass
-
-                p = urllib.parse.urlparse(url)
-                action = (p.netloc or p.path).strip("/")
-                q = urllib.parse.parse_qs(p.query)
-                data = q.get("path", [""])[0] or q.get("data", [""])[0]
-                _dbg_global(f"NotificationNavigationEventHandler parsed: action={action}, data={data}")
-                _HandleNotificationAction(self.palette_id, action, data)
-        except Exception as exc:
-            _dbg_global(f"NotificationNavigationEventHandler exception: {exc}\n{traceback.format_exc()}")
 
 
 class _NotificationHTMLEventHandler(_HTMLEventHandlerBase):
@@ -3212,11 +3056,7 @@ class _NotificationHTMLEventHandler(_HTMLEventHandlerBase):
 
 
 def _BuildNotificationHTML(title, status_type, message, details, actions, program_rows=None):
-    """
-    Generate self-contained HTML for non-modal Fusion toast notification.
-    Note: Fusion 360's palettes.add2 requires the HTML string to strictly start
-    with <html> (no <!DOCTYPE html> or leading whitespace).
-    """
+    """Generate self-contained HTML for the non-modal Fusion toast notification."""
     icon_map = {
         'success': '✓',
         'warning': '⚠',
@@ -3232,10 +3072,9 @@ def _BuildNotificationHTML(title, status_type, message, details, actions, progra
 
     def _make_btn(label, action_name, action_data, css_cls="action-btn"):
         esc_data = html.escape(action_data, quote=True).replace('\\', '\\\\').replace("'", "\\'")
-        nav_href = f"action://{action_name}?path={urllib.parse.quote(action_data)}"
         return (
-            f'<a class="{css_cls}" href="{nav_href}" '
-            f'onclick="sendAction(event, \'{action_name}\', \'{esc_data}\')">{html.escape(label)}</a>'
+            f'<a class="{css_cls}" href="#" '
+            f'onclick="sendAction(event, \'{action_name}\', \'{esc_data}\'); return false;">{html.escape(label)}</a>'
         )
 
     action_buttons = [_make_btn(label, action_name, action_data) for label, action_name, action_data in actions]
@@ -3321,7 +3160,6 @@ def _BuildNotificationHTML(title, status_type, message, details, actions, progra
   var dismissTimer = null;
   function cancelAutoDismiss() {}"""
 
-    # Note: Must strictly begin with <html> (no <!DOCTYPE html>) for Fusion 360 C++ add2 parser
     html_content = f"""<html>
 <head>
 <meta charset="utf-8">
@@ -3472,7 +3310,7 @@ def _BuildNotificationHTML(title, status_type, message, details, actions, progra
     flex-wrap: wrap;
     margin-top: 4px;
   }}
-  a.action-btn, button.action-btn {{
+  a.action-btn {{
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -3490,9 +3328,9 @@ def _BuildNotificationHTML(title, status_type, message, details, actions, progra
     -webkit-user-select: none;
   }}
   @media (prefers-color-scheme: light) {{
-    a.action-btn, button.action-btn {{ background: #eeeeee; color: #111111 !important; border-color: #cccccc; }}
+    a.action-btn {{ background: #eeeeee; color: #111111 !important; border-color: #cccccc; }}
   }}
-  a.action-btn:hover, button.action-btn:hover {{
+  a.action-btn:hover {{
     background: #007acc;
     border-color: #007acc;
     color: #ffffff !important;
@@ -3500,23 +3338,18 @@ def _BuildNotificationHTML(title, status_type, message, details, actions, progra
 </style>
 <script>
   function sendAction(e, action, data) {{
-    if (action !== 'dismiss' && action !== 'close') {{
+    if (e && e.preventDefault) {{
+      e.preventDefault();
+    }}
+    if (action !== 'dismiss') {{
       cancelAutoDismiss();
     }}
-    // 1. Try adsk.fusionSendData if available
     try {{
-      if (typeof adsk !== 'undefined' && adsk && adsk.fusionSendData) {{
-        adsk.fusionSendData(action, data);
-      }} else if (window.adsk && window.adsk.fusionSendData) {{
+      if (window.adsk && window.adsk.fusionSendData) {{
         window.adsk.fusionSendData(action, data);
       }}
     }} catch (err) {{}}
-
-    // 2. Direct location navigation to fire navigatingURL (universal fail-safe)
-    try {{
-      var navUrl = 'action://' + encodeURIComponent(action) + '?path=' + encodeURIComponent(data) + '&t=' + Date.now();
-      window.location.href = navUrl;
-    }} catch (err2) {{}}
+    return false;
   }}{auto_dismiss_js}
 </script>
 </head>
@@ -3676,91 +3509,32 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
         else:
             palette_h = min(440, 150 + 56 * len(program_rows))
             is_resizable = True
-        target_x = 940
-        target_y = 680
 
-        # Query macOS Fusion window bounds for pixel-perfect lower-right placement
-        if sys.platform == "darwin":
-            try:
-                cmd = 'tell application "System Events" to tell process "Autodesk Fusion" to repeat with w in windows\nif name of w contains "Autodesk Fusion" then\nreturn {position of w, size of w}\nend if\nend repeat'
-                raw = subprocess.check_output(['osascript', '-e', cmd], timeout=0.4).decode().strip()
-                parts = [int(p.strip()) for p in raw.split(',') if p.strip().lstrip('-').isdigit()]
-                if len(parts) >= 4:
-                    win_x, win_y, win_w, win_h = parts[0], parts[1], parts[2], parts[3]
-                    target_x = max(20, win_x + win_w - palette_w - 24)
-                    target_y = max(20, win_y + win_h - palette_h - 45)
-                    _dbg_global(f"_NotifyPostProcessResult: macOS window bounds ({win_x},{win_y},{win_w},{win_h}) -> target ({target_x}, {target_y})")
-            except Exception as e_mac:
-                _dbg_global(f"_NotifyPostProcessResult: mac window query note: {e_mac}")
-        else:
-            app = adsk.core.Application.get() if ("adsk" in sys.modules and hasattr(adsk, "core")) else None
-            if app and hasattr(app, "activeViewport") and app.activeViewport:
-                vp = app.activeViewport
-                try:
-                    if hasattr(adsk.core, "Point2D") and hasattr(adsk.core.Point2D, "create"):
-                        pt = vp.viewToScreen(adsk.core.Point2D.create(vp.width, vp.height))
-                        if pt:
-                            target_x = max(50, int(pt.x) - palette_w - 20)
-                            target_y = max(50, int(pt.y) - palette_h - 20)
-                except Exception as pt_exc:
-                    _dbg_global(f"_NotifyPostProcessResult: viewToScreen note: {pt_exc}")
+        app = adsk.core.Application.get() if ("adsk" in sys.modules and hasattr(adsk, "core")) else None
+        vp = getattr(app, "activeViewport", None) if app else None
+        target_x, target_y = _ComputeToastBottomRight(palette_w, palette_h, vp=vp)
+
+        _CleanupNotificationPalette(ui)
 
         palette = None
-
-        # Check if existing notification palette exists and recreate cleanly
-        existing = None
-        try:
-            existing = ui.palettes.itemById(constNotificationPaletteId)
-        except Exception:
-            existing = None
-
-        if existing:
+        if os.path.isfile(tmp_html) and hasattr(ui.palettes, "add2"):
             try:
-                _dbg_global(f"_NotifyPostProcessResult: cleaning up previous palette id={constNotificationPaletteId}")
-                existing.deleteMe()
-            except Exception as rex:
-                _dbg_global(f"_NotifyPostProcessResult: palette cleanup error: {rex}")
-            existing = None
-
-        if not palette and os.path.isfile(tmp_html):
-            if hasattr(ui.palettes, "add2"):
-                try:
-                    _dbg_global("_NotifyPostProcessResult: attempting ui.palettes.add2 with tmp_html")
-                    palette = ui.palettes.add2(
-                        constNotificationPaletteId,
-                        "Post Processing",
-                        tmp_html,
-                        True,   # isVisible=True so native Qt window is allocated for setPosition/setSize
-                        True,   # showCloseButton
-                        is_resizable,
-                        palette_w,
-                        palette_h,
-                    )
-                except Exception as e_add2:
-                    _dbg_global(f"_NotifyPostProcessResult: add2 with tmp_html failed: {e_add2}")
-
-            if not palette and hasattr(ui.palettes, "add"):
-                try:
-                    _dbg_global("_NotifyPostProcessResult: attempting ui.palettes.add with tmp_html")
-                    palette = ui.palettes.add(
-                        constNotificationPaletteId,
-                        "Post Processing",
-                        tmp_html,
-                        True,
-                        True,
-                        is_resizable,
-                        palette_w,
-                        palette_h,
-                    )
-                except Exception as e_add:
-                    _dbg_global(f"_NotifyPostProcessResult: add with tmp_html failed: {e_add}")
+                _dbg_global("_NotifyPostProcessResult: attempting ui.palettes.add2 with tmp_html")
+                palette = ui.palettes.add2(
+                    constNotificationPaletteId,
+                    "Post Processing",
+                    tmp_html,
+                    True,   # isVisible=True so native Qt window is allocated for setPosition/setSize
+                    True,   # showCloseButton
+                    is_resizable,
+                    palette_w,
+                    palette_h,
+                )
+            except Exception as e_add2:
+                _dbg_global(f"_NotifyPostProcessResult: add2 with tmp_html failed: {e_add2}")
 
         if palette:
             _dbg_global(f"_NotifyPostProcessResult: palette active (id={constNotificationPaletteId})")
-            try:
-                palette.isVisible = True
-            except Exception:
-                pass
 
             try:
                 if "adsk.core" in sys.modules:
@@ -3783,28 +3557,7 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
             except Exception as pos_exc:
                 _dbg_global(f"_NotifyPostProcessResult: setPosition failed: {pos_exc}")
 
-            # Remove any stale notification handlers from global handlers
-            global _palette_handlers, handlers
-            for h in _palette_handlers:
-                if h in handlers:
-                    try:
-                        handlers.remove(h)
-                    except ValueError:
-                        pass
-            _palette_handlers = []
-
-            # 1. Navigation Event Handler (handles action:// links from <a> or window.location.href)
-            if hasattr(palette, "navigatingURL") and hasattr(palette.navigatingURL, "add"):
-                try:
-                    nav_handler = _NotificationNavigationEventHandler(constNotificationPaletteId)
-                    palette.navigatingURL.add(nav_handler)
-                    _palette_handlers.append(nav_handler)
-                    handlers.append(nav_handler)
-                    _dbg_global("_NotifyPostProcessResult: navigatingURL handler attached successfully")
-                except Exception as n_exc:
-                    _dbg_global(f"_NotifyPostProcessResult: navigatingURL attach note: {n_exc}")
-
-            # 2. HTML Event Handler (handles adsk.fusionSendData)
+            # HTML Event Handler (handles window.adsk.fusionSendData)
             if hasattr(palette, "incomingFromHTML") and hasattr(palette.incomingFromHTML, "add"):
                 try:
                     html_handler = _NotificationHTMLEventHandler(constNotificationPaletteId)
@@ -3852,7 +3605,7 @@ def _OpenFile(path):
         return str(exc)
 
 
-def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileExt, target_operations=None, progress_cb=None):
+def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileExt, target_operations=None, progress_cb=None, _skip_cap_check=False, nc_program_name=None):
     """
     Unified 2-pass Context-Dump & Single-Pass Replay pipeline for Milling and Turning setups:
     Pass 1 (Context Extraction): Post each single-tool batch inside Fusion using universal_dumper.cps
@@ -3878,22 +3631,15 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
     is_turning = _is_turning_setup_obj(setup)
     _dbg(f"_PostProcessUnifiedPipeline entered for {fname}, path={path}, is_turning={is_turning}")
 
-    setup_cap_err = _CheckSetupCapability(setup)
-    if setup_cap_err:
-        _dbg(f"_PostProcessUnifiedPipeline: {setup_cap_err}")
-        return setup_cap_err
+    if not _skip_cap_check:
+        setup_cap_err = _CheckSetupCapability(setup)
+        if setup_cap_err:
+            _dbg(f"_PostProcessUnifiedPipeline: {setup_cap_err}")
+            return setup_cap_err
 
     # 0. Ensure Add-In modules are on sys.path and reloaded in Fusion's persistent interpreter
     _EnsureLocalModulesLoaded(progress_cb=_notify_p)
 
-    if program is None:
-        try:
-            app = adsk.core.Application.get()
-            doc = getattr(app, "activeDocument", None)
-            cam = adsk.cam.CAM.cast(doc.products.itemByProductType(constCAMProductId)) if (doc and hasattr(doc, "products")) else None
-            program = GetNcProgram(cam, docSettings)
-        except Exception:
-            pass
     try:
         base_post_path = _ResolveBasePostPath(program, is_turning=is_turning)
     except (ValueError, RuntimeError) as err:
@@ -3938,6 +3684,23 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
     base_no_ext = os.path.splitext(path)[0]
     report_path = base_no_ext + "_report.md"
     plot_path = base_no_ext + ".png"
+    nc_program = nc_program_name if (isinstance(nc_program_name, str) and nc_program_name) else _safe_str(getattr(program, "name", None))
+
+    def _record_failure(err_msg, summary_md=""):
+        _RecordVerifyResult(
+            setup=setup,
+            cncPath=path,
+            reportText=summary_md or f"# Verification Failed\n\nError: {err_msg}",
+            reportPath=report_path,
+            pngPath=plot_path,
+            promoted=0,
+            spikes=0,
+            volume_mm3=0.0,
+            collisions=[],
+            error=err_msg,
+            warning=None,
+            nc_program=nc_program,
+        )
 
     from context_parser import classify_stock_mode
     stock_mode = _GetSetupStockMode(setup)
@@ -3954,19 +3717,7 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
                 f"Setup '{setup.name}' uses 'From Solid' stock, but extraction failed: {solid_exc}"
             )
             _dbg(f"_PostProcessUnifiedPipeline: {err_msg}")
-            _RecordVerifyResult(
-                setup=setup,
-                cncPath=path,
-                reportText=f"# Verification Failed\n\nError: {err_msg}",
-                reportPath=report_path,
-                pngPath=plot_path,
-                promoted=0,
-                spikes=0,
-                volume_mm3=0.0,
-                collisions=[],
-                error=err_msg,
-                warning=None,
-            )
+            _record_failure(err_msg)
             return err_msg
 
         if solid_wp is None:
@@ -3974,19 +3725,7 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
                 f"Setup '{setup.name}' uses 'From Solid' stock, but no valid stock bodies were found or extracted."
             )
             _dbg(f"_PostProcessUnifiedPipeline: {err_msg}")
-            _RecordVerifyResult(
-                setup=setup,
-                cncPath=path,
-                reportText=f"# Verification Failed\n\nError: {err_msg}",
-                reportPath=report_path,
-                pngPath=plot_path,
-                promoted=0,
-                spikes=0,
-                volume_mm3=0.0,
-                collisions=[],
-                error=err_msg,
-                warning=None,
-            )
+            _record_failure(err_msg)
             return err_msg
 
     # 2. Partition setup operations into single-tool batches (mandatory for Personal Edition compatibility)
@@ -3999,35 +3738,23 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
         and getattr(op, "hasToolpath", True)
         and getattr(op, "isToolpathValid", True)
     ]
-    for op in active_ops:
-        op_cap_err = _CheckOperationCapability(op, setup=setup, is_turning=is_turning, check_probing=True)
-        if op_cap_err:
-            _dbg(f"_PostProcessUnifiedPipeline: {op_cap_err}")
-            _RecordVerifyResult(
-                setup=setup,
-                cncPath=path,
-                reportText=f"# Verification Failed\n\nError: {op_cap_err}",
-                reportPath=report_path,
-                pngPath=plot_path,
-                promoted=0,
-                spikes=0,
-                volume_mm3=0.0,
-                collisions=[],
-                error=op_cap_err,
-                warning=None,
-                nc_program=_safe_str(getattr(program, "name", None)),
-            )
-            return op_cap_err
+    if not _skip_cap_check:
+        for op in active_ops:
+            op_cap_err = _CheckOperationCapability(op, setup=setup, is_turning=is_turning, check_probing=True)
+            if op_cap_err:
+                _dbg(f"_PostProcessUnifiedPipeline: {op_cap_err}")
+                _record_failure(op_cap_err)
+                return op_cap_err
     batches = []
     i = 0
     while i < len(active_ops):
         op = active_ops[i]
-        curTool = op.tool.parameters.itemByName("tool_number").value.value
+        curTool = _extract_scalar_param(getattr(getattr(op, "tool", None), "parameters", None), "tool_number")
         opList = [op]
         i += 1
         while i < len(active_ops):
             next_op = active_ops[i]
-            t_num = next_op.tool.parameters.itemByName("tool_number").value.value
+            t_num = _extract_scalar_param(getattr(getattr(next_op, "tool", None), "parameters", None), "tool_number")
             if t_num != curTool:
                 break
             opList.append(next_op)
@@ -4054,7 +3781,7 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
 
         batch_json_files = []
         bootstrap_cnc = os.path.join(tmp_dir, "bootstrap.intermediate.cnc")
-        units = _GetNCProgramOutputUnits(program, docSettings=docSettings)
+        units = _GetNCProgramOutputUnits(program)
         cam_mod = sys.modules.get("adsk.cam")
         enum_cls = getattr(cam_mod, "PostOutputUnitOptions", None)
         mm_opt = getattr(enum_cls, "MillimetersOutput", 2) if enum_cls else 2
@@ -4168,20 +3895,7 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
         )
         if dumped_cap_err:
             _dbg(f"_PostProcessUnifiedPipeline: {dumped_cap_err}")
-            _RecordVerifyResult(
-                setup=setup,
-                cncPath=path,
-                reportText=f"# Verification Failed\n\nError: {dumped_cap_err}",
-                reportPath=report_path,
-                pngPath=plot_path,
-                promoted=0,
-                spikes=0,
-                volume_mm3=0.0,
-                collisions=[],
-                error=dumped_cap_err,
-                warning=None,
-                nc_program=_safe_str(getattr(program, "name", None)),
-            )
+            _record_failure(dumped_cap_err)
             return dumped_cap_err
 
         # -------------------------------------------------------------
@@ -4265,10 +3979,7 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
         promoted_total = len(report.promoted_events) if report and report.promoted_events else 0
 
         summary_md = ""
-        if os.path.isfile(report_path):
-            with open(report_path, "r", encoding="utf-8") as rf:
-                summary_md = rf.read()
-        else:
+        if not os.path.isfile(report_path):
             summary_md = orchestrator.format_summary_report(
                 report, final_gcode=final_gcode, base_post_path=base_post_path, restored_count=promoted_total
             )
@@ -4285,7 +3996,7 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
             collisions=report.collisions,
             error=None,
             warning=warning_msg,
-            nc_program=_safe_str(getattr(program, "name", None)),
+            nc_program=nc_program,
         )
 
         return None
@@ -4293,20 +4004,7 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
     except Exception as exc:
         err_msg = str(exc)
         _dbg(f"_PostProcessUnifiedPipeline exception: {traceback.format_exc()}")
-        _RecordVerifyResult(
-            setup=setup,
-            cncPath=path,
-            reportText=f"# Verification Failed\n\nError: {err_msg}",
-            reportPath=report_path,
-            pngPath=plot_path,
-            promoted=0,
-            spikes=0,
-            volume_mm3=0.0,
-            collisions=[],
-            error=err_msg,
-            warning=None,
-            nc_program=_safe_str(getattr(program, "name", None)),
-        )
+        _record_failure(err_msg)
         return f"PostProcess pipeline error: {err_msg}"
     finally:
         try:
@@ -4316,7 +4014,7 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
 
 
 
-def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_operations, progress_cb=None):
+def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_operations, progress_cb=None, nc_program_name=None):
     ui = None
 
     try:
@@ -4325,9 +4023,6 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
         ui  = app.userInterface
         doc = getattr(app, "activeDocument", None)
         cam = adsk.cam.CAM.cast(doc.products.itemByProductType(constCAMProductId)) if (doc and hasattr(doc, "products")) else None
-        if program is None and cam is not None:
-            program = GetNcProgram(cam, docSettings)
-        parameters = getattr(program, "parameters", None)
 
         if not target_operations:
             return "No active operations specified to post process."
@@ -4343,18 +4038,12 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
                 _dbg_global(f"PostProcessSetup: {op_cap_err}")
                 return op_cap_err
 
-        # Verify file name is valid by creating it now
-        fileExt = _GetNcProgramExtension(program, docSettings)
+        fileExt = _GetNcProgramExtension(program)
         path = os.path.join(setupFolder, fname + fileExt)
         try:
             pathlib.Path(setupFolder).mkdir(parents=True, exist_ok=True)
-            if os.path.exists(path):
-                if not os.access(path, os.W_OK):
-                    raise PermissionError(f"File {path} is not writable")
-            else:
-                with open(path, "w", encoding="utf8"):
-                    pass
-                os.remove(path)
+            if os.path.exists(path) and not os.access(path, os.W_OK):
+                raise PermissionError(f"File {path} is not writable")
         except Exception as exc:
             return "Unable to create output file '" + path + "'. Make sure the setup name is valid as a file name."
 
@@ -4368,9 +4057,7 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
                     all_setups = list(cam.setups)
                     s_idx = -1
                     for idx, s in enumerate(all_setups):
-                        if s == setup or (
-                            hasattr(setup, "entityToken") and hasattr(s, "entityToken") and setup.entityToken == s.entityToken
-                        ) or getattr(s, "name", None) == getattr(setup, "name", None):
+                        if _same_cam_entity(s, setup):
                             s_idx = idx
                             break
 
@@ -4427,30 +4114,15 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
                     # Answering "No" returns "Operation cancelled by user.", which causes the caller loop to abort all remaining setups.
                     return "Operation cancelled by user."
 
-        # Ensure toolpaths are generated for active operations
-        for item in target_operations:
-            if not cam.checkToolpath(item):
-                if progress_cb and not progress_cb("Generating missing toolpath...", 0.02):
-                    return "Operation cancelled by user."
-                genStat = cam.generateToolpath(item)
-                start_wait = time.time()
-                while not genStat.isGenerationCompleted:
-                    time.sleep(.1)
-                    if progress_cb and not progress_cb("Generating missing toolpath...", 0.02):
-                        return "Operation cancelled by user."
-                    if time.time() - start_wait > 300.0:
-                        return "Toolpath generation timed out."
-                    if "adsk" in sys.modules and hasattr(adsk, "doEvents"):
-                        try:
-                            adsk.doEvents()
-                        except Exception:
-                            pass
-
         _dbg = _dbg_global
         _dbg(f"PostProcessSetup called: fname={fname}, setup={setup.name}, opType={setup.operationType}, target_ops_cnt={len(target_operations)}")
 
         # Unified 2-pass dump & single-pass replay pipeline for all setups
-        return _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileExt, target_operations=target_operations, progress_cb=progress_cb)
+        return _PostProcessUnifiedPipeline(
+            fname, setup, docSettings, program, path, fileExt,
+            target_operations=target_operations, progress_cb=progress_cb, _skip_cap_check=True,
+            nc_program_name=nc_program_name,
+        )
 
     except Exception as exc:
         _dbg_global(f"PostProcessSetup exception: {traceback.format_exc()}")

@@ -46,7 +46,6 @@ else:
 
 from PostClear import (
     GetNcProgramSetupsAndOperations,
-    GetNcProgram,
 )
 
 
@@ -162,7 +161,7 @@ class TestNCProgramSelection(unittest.TestCase):
         prog = MockNCProgram("ProgA", operations=[self.setup1, self.setup2])
         self.cam.ncPrograms = MockNCProgramsCollection([prog])
 
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=prog)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=prog)
 
         self.assertEqual(len(target_setups), 2)
         self.assertEqual(target_setups[0].name, "Setup1")
@@ -178,7 +177,7 @@ class TestNCProgramSelection(unittest.TestCase):
     def test_ncprogram_filters_to_single_setup(self):
         """NCProgram that references only Setup2 excludes Setup1 and Setup3."""
         prog = MockNCProgram("ProgB", operations=[self.setup2])
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=prog)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=prog)
 
         self.assertEqual(len(target_setups), 1)
         self.assertEqual(target_setups[0].name, "Setup2")
@@ -189,7 +188,7 @@ class TestNCProgramSelection(unittest.TestCase):
     def test_ncprogram_filters_to_specific_operations_within_setup(self):
         """NCProgram containing only op1_2 results in only Setup 1 and only op1_2 being processed."""
         prog = MockNCProgram("ProgC", operations=[self.op1_2])
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=prog)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=prog)
 
         self.assertEqual(len(target_setups), 1)
         self.assertEqual(target_setups[0].name, "Setup1")
@@ -200,7 +199,7 @@ class TestNCProgramSelection(unittest.TestCase):
     def test_ncprogram_with_mixed_selection(self):
         """NCProgram with Setup 1 (whole) and Op 2_2 (individual) correctly partitions each setup."""
         prog = MockNCProgram("ProgD", operations=[self.setup1, self.op2_2])
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=prog)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=prog)
 
         self.assertEqual(len(target_setups), 2)
         # Setup 1 has all 3 ops
@@ -221,7 +220,7 @@ class TestNCProgramSelection(unittest.TestCase):
         free_op.parent = self.setup3
 
         prog = MockNCProgram("ProgFolder", operations=[folder])
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=prog)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=prog)
 
         self.assertEqual(len(target_setups), 1)
         self.assertEqual(target_setups[0].name, "Setup3")
@@ -235,7 +234,7 @@ class TestNCProgramSelection(unittest.TestCase):
     def test_empty_ncprogram_fallback(self):
         """Empty NCProgram operations collection falls back safely to all setups."""
         prog = MockNCProgram("EmptyProg", operations=[])
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=prog)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=prog)
 
         self.assertEqual(len(target_setups), 3)
         self.assertEqual(len(op_map[self.setup1]), 3)
@@ -252,7 +251,7 @@ class TestNCProgramSelection(unittest.TestCase):
         cam = MockCAM([setup])
 
         prog = MockNCProgram("SpecialProg", operations=[setup])
-        target_setups, op_map = GetNcProgramSetupsAndOperations(cam, self.settings, program=prog)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(cam, program=prog)
 
         self.assertEqual(len(target_setups), 1)
         self.assertEqual(len(op_map[setup]), 1)
@@ -262,7 +261,7 @@ class TestNCProgramSelection(unittest.TestCase):
         """NCProgram that exposes setups collection directly is supported."""
         prog = MockNCProgram("DirectSetupsProg")
         prog.setups = [self.setup1]
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=prog)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=prog)
 
         self.assertEqual(len(target_setups), 1)
         self.assertEqual(target_setups[0].name, "Setup1")
@@ -278,7 +277,7 @@ class TestNCProgramSelection(unittest.TestCase):
         self.setup1.allOperations.append(deep_op)
 
         prog = MockNCProgram("DeepProg", operations=[inner_folder])
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=prog)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=prog)
 
         self.assertEqual(len(target_setups), 1)
         self.assertEqual(target_setups[0].name, "Setup1")
@@ -358,7 +357,7 @@ class TestNCProgramSelection(unittest.TestCase):
         self.setup1.allOperations = [self.op1_1, self.op1_2, self.op1_3]
         program = MockNCProgram(name="PatternProgram", operations=[pattern])
 
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=program)
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=program)
         self.assertEqual(target_setups, [self.setup1])
         selected_ops = op_map.get(self.setup1)
         self.assertEqual(selected_ops, [self.op1_1, self.op1_2])
@@ -414,7 +413,7 @@ class TestNCProgramSelection(unittest.TestCase):
         setup = MockSetup("OilLidSetup", operations=[valid_op, empty_op, invalid_op, suppressed_op])
         self.cam.setups = [setup]
 
-        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, self.settings, program=MockNCProgram(operations=[]))
+        target_setups, op_map = GetNcProgramSetupsAndOperations(self.cam, program=MockNCProgram(operations=[]))
 
         self.assertIn(setup, target_setups)
         # valid_ops must contain only the valid operation

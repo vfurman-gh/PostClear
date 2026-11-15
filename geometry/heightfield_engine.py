@@ -795,12 +795,15 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         tools_by_op: Optional[Dict[str, ToolAssembly]] = None,
         workpiece: Optional[WorkpieceDefinition] = None,
         segments: Optional[Sequence[MotionSegment]] = None,
+        unmodeled_pattern_sec_indices: Optional[Set[int]] = None,
     ) -> VerificationReport:
         """Evaluate complete milling toolpath while blocking promotions on unmodeled CAM pattern copies."""
         moves_seq = moves if moves is not None else (segments or [])
         if workpiece is not None:
             self.reset(workpiece)
-        if self.workpiece is not None and moves_seq:
+        if unmodeled_pattern_sec_indices is not None:
+            self._unmodeled_pattern_sec_indices = set(unmodeled_pattern_sec_indices)
+        elif self.workpiece is not None and moves_seq:
             self._unmodeled_pattern_sec_indices = detect_unmodeled_pattern_sections(
                 moves_seq, self.workpiece, tools_by_op
             )
