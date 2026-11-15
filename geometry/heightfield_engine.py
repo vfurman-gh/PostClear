@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 import warnings
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 # Ensure packages directory is discoverable for Fusion 360's Python 3.14 environment
 if sys.version_info >= (3, 14):
@@ -46,6 +47,7 @@ from .models import (
     SolidMeshStock3D,
     ToolAssembly,
     Vector3D,
+    VerificationReport,
     WorkpieceDefinition,
 )
 
@@ -255,6 +257,427 @@ def evaluate_tool_bottom_profile(
     return z_rel
 
 
+# Autodesk CPS movement enum subsets:
+#   0=RAPID, 1=LEAD_IN, 2=CUTTING, 3=LEAD_OUT, 4=LINK_TRANSITION, 5=LINK_DIRECT,
+#   6..9=RAMP*, 10=EXTENDED/PLUNGE, 11..14=CUTTING*, 15=HIGH_FEED
+_LINK_OR_RAPID_MOVEMENTS = frozenset((0, 4, 5, 15))
+_CORE_CUT_MOVEMENTS = frozenset((2, 6, 7, 8, 9, 11, 12, 13, 14))
+_LEAD_OR_LINK_MOVEMENTS = frozenset((0, 1, 3, 4, 5, 10, 15))
+
+
+def _z_overlap_ratio(
+    tp_min_z: float,
+    tp_max_z: float,
+    st_min_z: float,
+    st_max_z: float,
+    z_skin_tol: float = 0.05,
+) -> float:
+    """Compute asymmetric Z overlap ratio in [0, 1], penalizing cuts above stock top."""
+    tp_dz = max(0.0, tp_max_z - tp_min_z)
+    st_dz = max(0.0, st_max_z - st_min_z)
+    above_excess = max(0.0, tp_max_z - (st_max_z + z_skin_tol))
+    denom_z = (min(tp_dz, st_dz) + above_excess) if st_dz > 1e-6 else tp_dz
+    ov_z = max(0.0, min(tp_max_z, st_max_z + z_skin_tol) - max(tp_min_z, st_min_z - z_skin_tol))
+    if denom_z > z_skin_tol:
+        return min(1.0, ov_z / denom_z)
+    return (
+        1.0
+        if (st_min_z - z_skin_tol <= tp_min_z <= st_max_z + z_skin_tol)
+        and (st_min_z - z_skin_tol <= tp_max_z <= st_max_z + z_skin_tol)
+        else 0.0
+    )
+
+
+def _compute_section_cutting_bounds(
+    segments: Sequence[MotionSegment],
+    st_max_z: float,
+    z_skin_tol: float = 0.05,
+) -> Tuple[
+    Dict[int, List[MotionSegment]],
+    Dict[int, str],
+    Set[int],
+    Dict[int, Tuple[float, float, float, float, float, float]],
+]:
+    """Compute per-section cutting 3D bounding boxes after trimming rapid/link/retract/lead moves."""
+    by_sec: Dict[int, List[MotionSegment]] = {}
+    sec_op_id: Dict[int, str] = {}
+    sec_tilted_or_5x: Set[int] = set()
+    for s in segments:
+        if s.motion == MotionKind.RAPID:
+            continue
+        meta = getattr(s, "metadata", None) or {}
+        sec_i = int(meta.get("sec_idx", s.sec_id))
+        by_sec.setdefault(sec_i, []).append(s)
+        if meta.get("tilted_section") or meta.get("multi_axis"):
+            sec_tilted_or_5x.add(sec_i)
+        if s.op_id and sec_i not in sec_op_id:
+            sec_op_id[sec_i] = s.op_id
+
+    sec_bounds: Dict[int, Tuple[float, float, float, float, float, float]] = {}
+    for si, s_list in by_sec.items():
+        no_link = [
+            s
+            for s in s_list
+            if (getattr(s, "metadata", None) or {}).get("movement") not in _LINK_OR_RAPID_MOVEMENTS
+        ]
+        s_work = no_link if no_link else s_list
+
+        if si in sec_tilted_or_5x:
+            xs = [s.start.x for s in s_work] + [s.end.x for s in s_work]
+            ys = [s.start.y for s in s_work] + [s.end.y for s in s_work]
+            zs = [s.start.z for s in s_work] + [s.end.z for s in s_work]
+            sec_bounds[si] = (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+            continue
+
+        horiz = [
+            s
+            for s in s_work
+            if math.hypot(s.end.x - s.start.x, s.end.y - s.start.y) > 1e-6
+        ]
+        vert = [
+            s
+            for s in s_work
+            if math.hypot(s.end.x - s.start.x, s.end.y - s.start.y) <= 1e-6
+        ]
+
+        if horiz:
+            ceil_cands: List[float] = []
+            for s in s_work:
+                meta = getattr(s, "metadata", None) or {}
+                for k in ("z_retract_mm", "z_clearance_mm"):
+                    val = meta.get(k)
+                    if val is not None:
+                        ceil_cands.append(float(val))
+            min_hz = min(min(s.start.z, s.end.z) for s in horiz)
+            for vseg in vert:
+                vz_hi = max(vseg.start.z, vseg.end.z)
+                vz_lo = min(vseg.start.z, vseg.end.z)
+                if vz_hi > st_max_z + 0.5 and vz_hi > vz_lo + 0.5 and vz_lo <= st_max_z + 1.0:
+                    ceil_cands.append(vz_hi)
+
+            if ceil_cands:
+                rc = min(ceil_cands)
+                if rc > min_hz + 1e-4:
+                    below = [
+                        s
+                        for s in horiz
+                        if not (s.start.z >= rc - 1e-4 and s.end.z >= rc - 1e-4)
+                    ]
+                    if below:
+                        horiz = below
+
+            core_cuts = [
+                s
+                for s in horiz
+                if (getattr(s, "metadata", None) or {}).get("movement") in _CORE_CUT_MOVEMENTS
+                and min(s.start.z, s.end.z) <= st_max_z + z_skin_tol
+            ]
+            if core_cuts:
+                trimmed = [
+                    s
+                    for s in horiz
+                    if not (
+                        (
+                            (getattr(s, "metadata", None) or {}).get("movement")
+                            in _LEAD_OR_LINK_MOVEMENTS
+                            and max(s.start.z, s.end.z) > st_max_z + z_skin_tol
+                        )
+                        or (
+                            (getattr(s, "metadata", None) or {}).get("movement") in (None, 2)
+                            and min(s.start.z, s.end.z) > st_max_z + z_skin_tol
+                        )
+                    )
+                ]
+                if trimmed:
+                    horiz = trimmed
+
+            xs = [s.start.x for s in horiz] + [s.end.x for s in horiz]
+            ys = [s.start.y for s in horiz] + [s.end.y for s in horiz]
+            zs = [s.start.z for s in horiz] + [s.end.z for s in horiz]
+            sec_bounds[si] = (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+        else:
+            plunges = [s for s in vert if s.end.z < s.start.z - 1e-6]
+            v_use = plunges if plunges else vert
+            xs = [s.start.x for s in v_use] + [s.end.x for s in v_use]
+            ys = [s.start.y for s in v_use] + [s.end.y for s in v_use]
+            zs = []
+            for s in v_use:
+                z_start = (
+                    min(s.start.z, st_max_z)
+                    if (s.end.z <= st_max_z + z_skin_tol and s.start.z > st_max_z)
+                    else s.start.z
+                )
+                zs.append(z_start)
+                zs.append(s.end.z)
+            sec_bounds[si] = (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+
+    return by_sec, sec_op_id, sec_tilted_or_5x, sec_bounds
+
+
+def _find_unmodeled_pattern_secs(
+    sec_bounds: Dict[int, Tuple[float, float, float, float, float, float]],
+    sec_op_id: Dict[int, str],
+    st_min_x: float,
+    st_max_x: float,
+    st_min_y: float,
+    st_max_y: float,
+    st_min_z: float,
+    st_max_z: float,
+    xy_margin: float,
+) -> Set[int]:
+    """Identify section indices outside expanded stock bounds that share an explicit op_id with an in-stock section."""
+    if len(sec_bounds) < 2:
+        return set()
+    z_margin = max(xy_margin, 2.0)
+    eff_min_x, eff_max_x = st_min_x - xy_margin, st_max_x + xy_margin
+    eff_min_y, eff_max_y = st_min_y - xy_margin, st_max_y + xy_margin
+    eff_min_z, eff_max_z = st_min_z - z_margin, st_max_z + z_margin
+
+    op_ids_overlapping: Set[str] = set()
+    sec_overlaps: Dict[int, bool] = {}
+    for si, (x0, x1, y0, y1, z0, z1) in sec_bounds.items():
+        ov = (
+            (x1 >= eff_min_x and x0 <= eff_max_x)
+            and (y1 >= eff_min_y and y0 <= eff_max_y)
+            and (z1 >= eff_min_z and z0 <= eff_max_z)
+        )
+        sec_overlaps[si] = ov
+        op = sec_op_id.get(si, "")
+        if ov and op and not re.fullmatch(r"Section_\d+", op):
+            op_ids_overlapping.add(op)
+
+    return {
+        si
+        for si in sec_bounds
+        if not sec_overlaps.get(si, False) and sec_op_id.get(si, "") in op_ids_overlapping
+    }
+
+
+def detect_unmodeled_pattern_sections(
+    segments: Sequence[MotionSegment],
+    workpiece: Optional[WorkpieceDefinition],
+    tools_by_op: Optional[Dict[str, ToolAssembly]] = None,
+) -> Set[int]:
+    """
+    Identify CAM pattern / tombstone duplicate sections whose cutting geometry lies
+    completely outside the modeled stock 3D envelope while a sibling section with
+    the exact same explicit `op_id` overlaps the modeled stock.
+    """
+    if workpiece is None or not segments:
+        return set()
+    st = getattr(workpiece, "stock", None)
+    if not (hasattr(st, "x_min") and hasattr(st, "x_max")):
+        return set()
+
+    st_min_x, st_max_x = float(st.x_min), float(st.x_max)
+    st_min_y, st_max_y = float(st.y_min), float(st.y_max)
+    st_min_z, st_max_z = float(st.z_min), float(st.z_max)
+    if st_max_x < st_min_x or st_max_y < st_min_y or st_max_z < st_min_z:
+        return set()
+
+    max_tool_r = max(
+        (
+            float(getattr(getattr(t, "geometry", None), "diameter", 0.0) or 0.0) * 0.5
+            for t in (tools_by_op or {}).values()
+        ),
+        default=0.0,
+    )
+    _, sec_op_id, _, sec_bounds = _compute_section_cutting_bounds(segments, st_max_z)
+    return _find_unmodeled_pattern_secs(
+        sec_bounds,
+        sec_op_id,
+        st_min_x,
+        st_max_x,
+        st_min_y,
+        st_max_y,
+        st_min_z,
+        st_max_z,
+        xy_margin=2.0 * max_tool_r,
+    )
+
+
+def check_stl_stock_alignment(
+    segments: Sequence[MotionSegment],
+    workpiece: WorkpieceDefinition,
+    tools_by_op: Optional[Dict[str, ToolAssembly]] = None,
+    is_turning: bool = False,
+    workpiece_hint_mm: Optional[Tuple[float, float, float, float, float, float]] = None,
+    dbg_fn: Optional[Callable[[str], None]] = None,
+) -> Tuple[Optional[str], Optional[str], Set[int]]:
+    """
+    Phase 1 H4: Runtime coordinate frame alignment check for STL-derived stock.
+
+    Verifies >= 50% cutting-envelope overlap against the STL stock bounding box
+    and returns `(toolpath_box_log, stock_box_log, unmodeled_pattern_secs)`.
+    """
+    non_rapid = [s for s in segments if s.motion != MotionKind.RAPID]
+    if not non_rapid:
+        return None, None, set()
+
+    st = getattr(workpiece, "stock", None)
+    if hasattr(st, "x_min") and hasattr(st, "x_max"):
+        st_min_x, st_max_x = float(st.x_min), float(st.x_max)
+        st_min_y, st_max_y = float(st.y_min), float(st.y_max)
+        st_min_z, st_max_z = float(st.z_min), float(st.z_max)
+    elif hasattr(st, "outer_radius") and hasattr(st, "z_min"):
+        st_r = float(st.outer_radius)
+        st_min_x, st_max_x = -st_r, st_r
+        st_min_y, st_max_y = -st_r, st_r
+        st_min_z, st_max_z = float(st.z_min), float(st.z_max)
+    else:
+        st_min_x = st_max_x = st_min_y = st_max_y = st_min_z = st_max_z = 0.0
+
+    st_box_log = (
+        f"[{st_min_x:.2f}, {st_max_x:.2f}] x "
+        f"[{st_min_y:.2f}, {st_max_y:.2f}] x "
+        f"[{st_min_z:.2f}, {st_max_z:.2f}]"
+    )
+    z_skin_tol = 0.05
+
+    if is_turning:
+        lathe_segs = [
+            s for s in non_rapid if (getattr(s, "metadata", None) or {}).get("sec_type", 1) == 1
+        ]
+        cand = lathe_segs if lathe_segs else non_rapid
+        cand_no_link = [
+            s
+            for s in cand
+            if (getattr(s, "metadata", None) or {}).get("movement") not in _LINK_OR_RAPID_MOVEMENTS
+        ]
+        if cand_no_link:
+            cand = cand_no_link
+
+        outer_r = float(getattr(st, "outer_radius", max(abs(st_max_x), abs(st_max_y))) or 0.0)
+        if outer_r > 0.0:
+            near_stock = [
+                s
+                for s in cand
+                if (getattr(s, "metadata", None) or {}).get("movement") is not None
+                or min(math.hypot(s.start.x, s.start.y), math.hypot(s.end.x, s.end.y))
+                <= outer_r + 2.0
+            ]
+            if near_stock:
+                cand = near_stock
+
+        tp_xs = [s.start.x for s in cand] + [s.end.x for s in cand]
+        tp_ys = [s.start.y for s in cand] + [s.end.y for s in cand]
+        tp_zs = [s.start.z for s in cand] + [s.end.z for s in cand]
+        tp_min_x, tp_max_x = min(tp_xs), max(tp_xs)
+        tp_min_y, tp_max_y = min(tp_ys), max(tp_ys)
+        tp_min_z, tp_max_z = min(tp_zs), max(tp_zs)
+        tp_box_log = (
+            f"[{tp_min_x:.2f}, {tp_max_x:.2f}] x "
+            f"[{tp_min_y:.2f}, {tp_max_y:.2f}] x "
+            f"[{tp_min_z:.2f}, {tp_max_z:.2f}]"
+        )
+
+        z_ratio = _z_overlap_ratio(tp_min_z, tp_max_z, st_min_z, st_max_z, z_skin_tol)
+        if dbg_fn is not None:
+            dbg_fn(
+                f"H4 turning Z overlap: toolpath={tp_box_log}, stock={st_box_log}, ratio={z_ratio*100:.1f}%"
+            )
+        if z_ratio < 0.5:
+            raise ValueError(
+                f"Cutting toolpath Z span [{tp_min_z:.2f}, {tp_max_z:.2f}] has insufficient overlap ({z_ratio*100:.1f}% < 50%) "
+                f"with stock Z span [{st_min_z:.2f}, {st_max_z:.2f}]. "
+                f"Toolpath bounding box: {tp_box_log}; Stock bounding box: {st_box_log}."
+            )
+        return tp_box_log, st_box_log, set()
+
+    max_tool_r = max(
+        (
+            float(getattr(getattr(t, "geometry", None), "diameter", 0.0) or 0.0) * 0.5
+            for t in (tools_by_op or {}).values()
+        ),
+        default=0.0,
+    )
+    xy_margin = 2.0 * max_tool_r
+    eff_st_min_x, eff_st_max_x = st_min_x - xy_margin, st_max_x + xy_margin
+    eff_st_min_y, eff_st_max_y = st_min_y - xy_margin, st_max_y + xy_margin
+
+    _, sec_op_id, sec_tilted_or_5x, sec_bounds = _compute_section_cutting_bounds(
+        non_rapid, st_max_z, z_skin_tol
+    )
+    unmodeled_pattern_secs = _find_unmodeled_pattern_secs(
+        sec_bounds,
+        sec_op_id,
+        st_min_x,
+        st_max_x,
+        st_min_y,
+        st_max_y,
+        st_min_z,
+        st_max_z,
+        xy_margin=xy_margin,
+    )
+
+    z_aligned_secs = [si for si in sorted(sec_bounds) if si not in sec_tilted_or_5x]
+    eval_secs = z_aligned_secs if z_aligned_secs else sorted(sec_bounds)
+    active_secs = [si for si in eval_secs if si not in unmodeled_pattern_secs] or eval_secs
+
+    tp_min_x = min(sec_bounds[si][0] for si in active_secs)
+    tp_max_x = max(sec_bounds[si][1] for si in active_secs)
+    tp_min_y = min(sec_bounds[si][2] for si in active_secs)
+    tp_max_y = max(sec_bounds[si][3] for si in active_secs)
+    tp_min_z = min(sec_bounds[si][4] for si in active_secs)
+    tp_max_z = max(sec_bounds[si][5] for si in active_secs)
+    tp_box_log = (
+        f"[{tp_min_x:.2f}, {tp_max_x:.2f}] x "
+        f"[{tp_min_y:.2f}, {tp_max_y:.2f}] x "
+        f"[{tp_min_z:.2f}, {tp_max_z:.2f}]"
+    )
+
+    tp_dx = max(0.0, tp_max_x - tp_min_x)
+    tp_dy = max(0.0, tp_max_y - tp_min_y)
+    ov_dx = max(0.0, min(tp_max_x, eff_st_max_x) - max(tp_min_x, eff_st_min_x))
+    ov_dy = max(0.0, min(tp_max_y, eff_st_max_y) - max(tp_min_y, eff_st_min_y))
+    r_x = (
+        min(1.0, ov_dx / tp_dx)
+        if tp_dx > 1e-6
+        else (1.0 if eff_st_min_x <= tp_min_x <= eff_st_max_x else 0.0)
+    )
+    r_y = (
+        min(1.0, ov_dy / tp_dy)
+        if tp_dy > 1e-6
+        else (1.0 if eff_st_min_y <= tp_min_y <= eff_st_max_y else 0.0)
+    )
+    r_z = _z_overlap_ratio(tp_min_z, tp_max_z, st_min_z, st_max_z, z_skin_tol)
+
+    if (
+        r_z < 0.5
+        and workpiece_hint_mm is not None
+        and r_x >= 0.8
+        and r_y >= 0.8
+        and tp_max_z <= st_max_z + z_skin_tol
+        and tp_min_z < st_min_z
+        and tp_max_z >= st_min_z + z_skin_tol
+    ):
+        wh_x0, wh_x1, wh_y0, wh_y1, wh_z0, wh_z1 = workpiece_hint_mm
+        tol_wh = 1.0
+        if (
+            abs(st_min_x - wh_x0) <= tol_wh
+            and abs(st_max_x - wh_x1) <= tol_wh
+            and abs(st_min_y - wh_y0) <= tol_wh
+            and abs(st_max_y - wh_y1) <= tol_wh
+            and abs(st_max_z - wh_z1) <= tol_wh
+            and st_min_z >= wh_z0 - tol_wh
+            and max(0.0, tp_max_z - max(tp_min_z, st_min_z)) > z_skin_tol
+        ):
+            r_z = 1.0
+
+    vol_ratio = r_x * r_y * r_z
+    if dbg_fn is not None:
+        dbg_fn(
+            f"H4 milling volume overlap: toolpath={tp_box_log}, stock={st_box_log}, ratio={vol_ratio*100:.1f}%"
+            + (f", unmodeled_pattern_secs={sorted(unmodeled_pattern_secs)}" if unmodeled_pattern_secs else "")
+        )
+    if vol_ratio < 0.5:
+        raise ValueError(
+            f"Toolpath bounding box {tp_box_log} has insufficient volume overlap ({vol_ratio*100:.1f}% < 50%) "
+            f"with Stock bounding box {st_box_log}."
+        )
+    return tp_box_log, st_box_log, unmodeled_pattern_secs
+
+
 class MillHeightfieldVerifier(BaseVerificationEngine):
     """
     3D Milling In-Process Workpiece (IPW) & Collision Verification Engine using
@@ -304,13 +727,19 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         self.default_overall_length = 50.0
         self.default_holder_diameter = 40.0
         self.default_holder_length = 50.0
+        self._cached_tool_key: Optional[Tuple[Any, ...]] = None
+        self._cached_tool_params: Optional[
+            Tuple[float, float, float, float, float, bool, List[Tuple[float, float]], float, float]
+        ] = None
 
         self._sec_clearance_mm: Dict[int, float] = {}
+        self._unmodeled_pattern_sec_indices: Set[int] = set()
 
     def reset(self, workpiece: WorkpieceDefinition) -> None:
         """Reset verifier and IPW grid to raw stock."""
         self._reset_base_state(workpiece)
         self._sec_clearance_mm.clear()
+        self._unmodeled_pattern_sec_indices.clear()
 
         self.has_valid_stock = False
         stock = getattr(workpiece, "stock", None)
@@ -349,6 +778,38 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         """Mount active tool assembly."""
         self.active_tool = tool
 
+    def _promotion_blocked(self, move: MotionSegment) -> bool:
+        """Block rapid promotion on tilted/multi-axis, cutter-comp, or unmodeled pattern duplicate sections."""
+        if super()._promotion_blocked(move):
+            return True
+        if self._unmodeled_pattern_sec_indices:
+            meta = getattr(move, "metadata", None) or {}
+            sec_idx = int(meta.get("sec_idx", move.sec_id))
+            if sec_idx in self._unmodeled_pattern_sec_indices:
+                return True
+        return False
+
+    def verify_toolpath(
+        self,
+        moves: Optional[Sequence[MotionSegment]] = None,
+        tools_by_op: Optional[Dict[str, ToolAssembly]] = None,
+        workpiece: Optional[WorkpieceDefinition] = None,
+        segments: Optional[Sequence[MotionSegment]] = None,
+    ) -> VerificationReport:
+        """Evaluate complete milling toolpath while blocking promotions on unmodeled CAM pattern copies."""
+        moves_seq = moves if moves is not None else (segments or [])
+        if workpiece is not None:
+            self.reset(workpiece)
+        if self.workpiece is not None and moves_seq:
+            self._unmodeled_pattern_sec_indices = detect_unmodeled_pattern_sections(
+                moves_seq, self.workpiece, tools_by_op
+            )
+        return super().verify_toolpath(
+            moves=moves_seq,
+            tools_by_op=tools_by_op,
+            workpiece=None,
+        )
+
     def _get_active_mill_tool_params(
         self,
     ) -> Tuple[float, float, float, float, float, bool, List[Tuple[float, float]], float, float]:
@@ -358,6 +819,24 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         """
         geom = getattr(self.active_tool, "geometry", None)
         if isinstance(geom, MillToolGeometry):
+            raw_sections = getattr(geom, "holder_sections", None) or []
+            cache_key = (
+                id(geom),
+                geom.diameter,
+                geom.corner_radius,
+                geom.flute_length,
+                getattr(geom, "body_length", 0.0),
+                geom.overall_length,
+                getattr(geom, "shaft_diameter", 0.0),
+                geom.holder_diameter,
+                geom.holder_length,
+                geom.taper_angle_deg,
+                id(raw_sections),
+                len(raw_sections),
+            )
+            if self._cached_tool_key == cache_key and self._cached_tool_params is not None:
+                return self._cached_tool_params
+
             d = max(0.5, float(geom.diameter))
             tool_r = d / 2.0
             cr = max(0.0, float(geom.corner_radius))
@@ -367,7 +846,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
             raw_shaft = float(getattr(geom, "shaft_diameter", 0.0) or 0.0)
             shank_r = (raw_shaft / 2.0) if raw_shaft > 0.0 else tool_r
 
-            raw_sections = getattr(geom, "holder_sections", None) or []
             valid_sections: List[Tuple[float, float]] = []
             for sec in raw_sections:
                 sec_l, sec_d = float(sec[0]), float(sec[1])
@@ -389,7 +867,10 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                 holder_max_r = 0.0
 
             taper = float(geom.taper_angle_deg)
-            return tool_r, cr, flute, body_len, shank_r, has_holder, holder_sections, holder_max_r, taper
+            res = (tool_r, cr, flute, body_len, shank_r, has_holder, holder_sections, holder_max_r, taper)
+            self._cached_tool_key = cache_key
+            self._cached_tool_params = res
+            return res
 
         # Fallback values when ToolAssembly geometry is missing
         r = self.default_cutter_diameter / 2.0
@@ -558,19 +1039,34 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         move_collisions: List[CollisionRecord] = []
 
         # ---------------------------------------------------------------------
-        # 1. Bounding Subgrid Extraction
+        # 1. Bounding Subgrid Extraction (Decoupled Core vs. Holder Envelope)
         # ---------------------------------------------------------------------
         # Phase 2 H2: Promotion clearance radius includes lateral margin and grid cell diagonal bound
         cell_diag_half = self.grid.cell_size_mm * math.sqrt(2.0) / 2.0
         clearance_r = tool_r + self.promote_margin_mm + cell_diag_half
-        # Max radius encompasses cutter, shank, toolholder envelope, and promotion clearance radius
-        max_r = max(tool_r, shank_r, holder_max_r, clearance_r)
+        core_r = max(tool_r, shank_r, clearance_r) + 1e-4
         col_min, col_max, row_min, row_max = self.grid.get_subgrid_bounds(
-            p1.x, p1.y, p2.x, p2.y, max_r
+            p1.x, p1.y, p2.x, p2.y, core_r
         )
+        core_nonempty = (col_max > col_min) and (row_max > row_min)
 
-        # If move is completely outside the padded grid bounds, return safe air move
-        if col_max <= col_min or row_max <= row_min:
+        z_tip_min = min(float(p1.z), float(p2.z))
+        z_holder_min = float(np.float32(z_tip_min + body_len)) - 1e-3
+        h_cmin = h_cmax = h_rmin = h_rmax = 0
+        h_sub_max = -math.inf
+        holder_can_strike = False
+        holder_can_violate_margin = False
+        if has_holder and holder_max_r > 0.0:
+            h_cmin, h_cmax, h_rmin, h_rmax = self.grid.get_subgrid_bounds(
+                p1.x, p1.y, p2.x, p2.y, holder_max_r + 1e-4
+            )
+            if h_cmax > h_cmin and h_rmax > h_rmin:
+                h_sub_max = float(np.max(self.grid.H[h_rmin:h_rmax, h_cmin:h_cmax]))
+                holder_can_strike = h_sub_max > (z_holder_min + self.z_tol_mm)
+                holder_can_violate_margin = h_sub_max > (z_holder_min - self.holder_margin_mm)
+
+        # If move is completely outside both core and active holder bounds, return safe air move
+        if not core_nonempty and not holder_can_strike and not holder_can_violate_margin:
             is_air_outside = not self._promotion_blocked(move)
             if record_metrics:
                 self.record_event_evaluation(move, is_air_move=is_air_outside, collisions=[])
@@ -584,6 +1080,9 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                 sec_idx=move.metadata.get("sec_idx", move.sec_id) if move.metadata else move.sec_id,
                 event_idx=move.metadata.get("event_idx", move.segment_id) if move.metadata else move.segment_id,
             )
+
+        if not core_nonempty:
+            col_min, col_max, row_min, row_max = h_cmin, h_cmax, h_rmin, h_rmax
 
         sub_H = self.grid.H[row_min:row_max, col_min:col_max]
 
@@ -601,93 +1100,114 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         # ---------------------------------------------------------------------
         # 3. Holder & Shank Collision Checks
         # ---------------------------------------------------------------------
-        X_sub, Y_sub = self.grid.get_mesh_coordinates(col_min, col_max, row_min, row_max)
         vx = p2.x - p1.x
         vy = p2.y - p1.y
         L2 = vx * vx + vy * vy
-        if L2 < 1e-10:
-            dist_holder = np.sqrt((X_sub - p1.x) ** 2 + (Y_sub - p1.y) ** 2)
-            z_tip_min = min(p1.z, p2.z)
-            z_holder_bottom = np.full_like(dist_holder, z_tip_min + body_len, dtype=np.float32)
-            z_shank_bottom = np.full_like(dist_holder, z_tip_min + flute_len, dtype=np.float32)
-        else:
-            t_holder = np.clip(((X_sub - p1.x) * vx + (Y_sub - p1.y) * vy) / L2, 0.0, 1.0)
-            cx_h = p1.x + t_holder * vx
-            cy_h = p1.y + t_holder * vy
-            dist_holder = np.sqrt((X_sub - cx_h) ** 2 + (Y_sub - cy_h) ** 2)
-            z_tip_h = p1.z + t_holder * (p2.z - p1.z)
-            z_holder_bottom = (z_tip_h + body_len).astype(np.float32)
-            z_shank_bottom = (z_tip_h + flute_len).astype(np.float32)
 
-        z_holder_env_clear = None
-        if has_holder:
-            z_holder_env_col = np.full(dist_holder.shape, np.inf, dtype=np.float32)
-            z_holder_env_clear = np.full(dist_holder.shape, np.inf, dtype=np.float32)
+        if holder_can_strike:
             cum_len = 0.0
+            strike_secs: List[Tuple[float, float]] = []
+            strike_max_r = 0.0
             for sec_len, sec_dia in holder_sections:
-                sec_r = sec_dia * 0.5
-                sec_z_bot = z_holder_bottom + np.float32(cum_len)
-                col_sec = dist_holder <= (sec_r - self.collision_lateral_tol_mm)
-                if np.any(col_sec):
-                    z_holder_env_col = np.where(col_sec, np.minimum(z_holder_env_col, sec_z_bot), z_holder_env_col)
-                clr_sec = dist_holder <= (sec_r + 1e-5)
-                if np.any(clr_sec):
-                    z_holder_env_clear = np.where(clr_sec, np.minimum(z_holder_env_clear, sec_z_bot), z_holder_env_clear)
+                if (z_holder_min + cum_len) < (h_sub_max - self.z_tol_mm):
+                    sec_r = sec_dia * 0.5
+                    strike_secs.append((cum_len, sec_r))
+                    if sec_r > strike_max_r:
+                        strike_max_r = sec_r
                 cum_len += sec_len
 
-            # Holder strike: stock top is higher than holder envelope bottom
-            holder_penetration = sub_H - z_holder_env_col
-            holder_strike_mask = np.isfinite(z_holder_env_col) & (holder_penetration > self.z_tol_mm)
+            if strike_secs and strike_max_r > 0.0:
+                s_cmin, s_cmax, s_rmin, s_rmax = self.grid.get_subgrid_bounds(
+                    p1.x, p1.y, p2.x, p2.y, strike_max_r + 1e-4
+                )
+                if s_cmax > s_cmin and s_rmax > s_rmin:
+                    sub_H_s = self.grid.H[s_rmin:s_rmax, s_cmin:s_cmax]
+                    s_sub_max = float(np.max(sub_H_s))
+                    if s_sub_max > (z_holder_min + self.z_tol_mm):
+                        X_h, Y_h = self.grid.get_mesh_coordinates(s_cmin, s_cmax, s_rmin, s_rmax)
+                        if L2 < 1e-10:
+                            dist_h = np.sqrt((X_h - p1.x) ** 2 + (Y_h - p1.y) ** 2)
+                            z_h_bot = np.full(dist_h.shape, z_tip_min + body_len, dtype=np.float32)
+                        else:
+                            t_h = np.clip(((X_h - p1.x) * vx + (Y_h - p1.y) * vy) / L2, 0.0, 1.0)
+                            cx_h = p1.x + t_h * vx
+                            cy_h = p1.y + t_h * vy
+                            dist_h = np.sqrt((X_h - cx_h) ** 2 + (Y_h - cy_h) ** 2)
+                            z_h_bot = (p1.z + t_h * (p2.z - p1.z) + body_len).astype(np.float32)
 
-            if np.any(holder_strike_mask):
-                max_pen = float(np.max(holder_penetration[holder_strike_mask]))
-                pen_vol = float(np.sum(holder_penetration[holder_strike_mask])) * self.grid.cell_area_mm2
-                if pen_vol >= self.min_collision_volume_mm3:
-                    col = CollisionRecord(
-                        segment_id=move.segment_id,
-                        vector_key=v_key_str,
-                        kind=CollisionKind.HOLDER_STRIKE,
-                        timestamp_sec=self.current_time_sec,
-                        contact_point=Vector3D(p2.x, p2.y, float(p2.z + body_len)),
-                        penetration_volume_mm3=pen_vol,
-                        description=(
-                            f"Toolholder collided with uncut stock (max penetration: {max_pen:.3f} mm, "
-                            f"volume: {pen_vol:.2f} mm³)"
-                        ),
-                        op_id=move.op_id,
-                        sec_idx=sec_idx,
-                        event_idx=event_idx,
-                    )
-                    if record_metrics:
-                        self.collisions.append(col)
-                    move_collisions.append(col)
+                        z_holder_env_col = np.full(dist_h.shape, np.inf, dtype=np.float32)
+                        for c_len, sec_r in strike_secs:
+                            if (z_holder_min + c_len) >= (s_sub_max - self.z_tol_mm):
+                                continue
+                            col_sec = dist_h <= (sec_r - self.collision_lateral_tol_mm)
+                            if np.any(col_sec):
+                                sec_z_bot = z_h_bot + np.float32(c_len)
+                                z_holder_env_col = np.where(col_sec, np.minimum(z_holder_env_col, sec_z_bot), z_holder_env_col)
+
+                        # Holder strike: stock top is higher than holder envelope bottom
+                        holder_penetration = sub_H_s - z_holder_env_col
+                        holder_strike_mask = np.isfinite(z_holder_env_col) & (holder_penetration > self.z_tol_mm)
+
+                        if np.any(holder_strike_mask):
+                            max_pen = float(np.max(holder_penetration[holder_strike_mask]))
+                            pen_vol = float(np.sum(holder_penetration[holder_strike_mask])) * self.grid.cell_area_mm2
+                            if pen_vol >= self.min_collision_volume_mm3:
+                                col = CollisionRecord(
+                                    segment_id=move.segment_id,
+                                    vector_key=v_key_str,
+                                    kind=CollisionKind.HOLDER_STRIKE,
+                                    timestamp_sec=self.current_time_sec,
+                                    contact_point=Vector3D(p2.x, p2.y, float(p2.z + body_len)),
+                                    penetration_volume_mm3=pen_vol,
+                                    description=(
+                                        f"Toolholder collided with uncut stock (max penetration: {max_pen:.3f} mm, "
+                                        f"volume: {pen_vol:.2f} mm³)"
+                                    ),
+                                    op_id=move.op_id,
+                                    sec_idx=sec_idx,
+                                    event_idx=event_idx,
+                                )
+                                if record_metrics:
+                                    self.collisions.append(col)
+                                move_collisions.append(col)
 
         # Shank rub check: band from tip + flute_len up to holder bottom using shaft radius
-        mask_shank_col = dist_holder <= (shank_r - self.collision_lateral_tol_mm)
-        shank_top_in_stock = np.minimum(sub_H, z_holder_bottom)
-        shank_rub_penetration = shank_top_in_stock - z_shank_bottom
-        shank_rub_mask = mask_shank_col & (shank_rub_penetration > self.z_tol_mm)
-        if np.any(shank_rub_mask) and move.motion != MotionKind.RAPID:
-            max_pen = float(np.max(shank_rub_penetration[shank_rub_mask]))
-            pen_vol = float(np.sum(shank_rub_penetration[shank_rub_mask])) * self.grid.cell_area_mm2
-            if pen_vol >= self.min_collision_volume_mm3:
-                col = CollisionRecord(
-                    segment_id=move.segment_id,
-                    vector_key=v_key_str,
-                    kind=CollisionKind.SHANK_RUB,
-                    timestamp_sec=self.current_time_sec,
-                    contact_point=Vector3D(p2.x, p2.y, float(p2.z + flute_len)),
-                    penetration_volume_mm3=pen_vol,
-                    description=(
-                        f"Unfluted tool shank rubbed into raw stock (depth exceeded flute by {max_pen:.3f} mm)"
-                    ),
-                    op_id=move.op_id,
-                    sec_idx=sec_idx,
-                    event_idx=event_idx,
-                )
-                if record_metrics:
-                    self.collisions.append(col)
-                move_collisions.append(col)
+        if move.motion != MotionKind.RAPID:
+            core_sub_max = float(np.max(sub_H))
+            z_shank_min = float(np.float32(z_tip_min + flute_len)) - 1e-3
+            if core_sub_max > (z_shank_min + self.z_tol_mm):
+                if L2 < 1e-10:
+                    z_holder_bottom = np.full(dist_cutter.shape, z_tip_min + body_len, dtype=np.float32)
+                    z_shank_bottom = np.full(dist_cutter.shape, z_tip_min + flute_len, dtype=np.float32)
+                else:
+                    z_tip_s = p1.z + t_param * (p2.z - p1.z)
+                    z_holder_bottom = (z_tip_s + body_len).astype(np.float32)
+                    z_shank_bottom = (z_tip_s + flute_len).astype(np.float32)
+                mask_shank_col = dist_cutter <= (shank_r - self.collision_lateral_tol_mm)
+                shank_top_in_stock = np.minimum(sub_H, z_holder_bottom)
+                shank_rub_penetration = shank_top_in_stock - z_shank_bottom
+                shank_rub_mask = mask_shank_col & (shank_rub_penetration > self.z_tol_mm)
+                if np.any(shank_rub_mask):
+                    max_pen = float(np.max(shank_rub_penetration[shank_rub_mask]))
+                    pen_vol = float(np.sum(shank_rub_penetration[shank_rub_mask])) * self.grid.cell_area_mm2
+                    if pen_vol >= self.min_collision_volume_mm3:
+                        col = CollisionRecord(
+                            segment_id=move.segment_id,
+                            vector_key=v_key_str,
+                            kind=CollisionKind.SHANK_RUB,
+                            timestamp_sec=self.current_time_sec,
+                            contact_point=Vector3D(p2.x, p2.y, float(p2.z + flute_len)),
+                            penetration_volume_mm3=pen_vol,
+                            description=(
+                                f"Unfluted tool shank rubbed into raw stock (depth exceeded flute by {max_pen:.3f} mm)"
+                            ),
+                            op_id=move.op_id,
+                            sec_idx=sec_idx,
+                            event_idx=event_idx,
+                        )
+                        if record_metrics:
+                            self.collisions.append(col)
+                        move_collisions.append(col)
 
         # ---------------------------------------------------------------------
         # 4. Rapid Move Collision (RAPID_INTO_STOCK)
@@ -794,12 +1314,45 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         elif (not cuts_material) and (not in_cycle) and (dist_3d > 1e-6):
             # Check holder clearance (conservative, no collision lateral shrinkage)
             holder_margin_clear = True
-            if z_holder_env_clear is not None:
-                h_margin_mask = np.isfinite(z_holder_env_clear)
-                if np.any(h_margin_mask):
-                    h_margin_depth = sub_H[h_margin_mask] - (z_holder_env_clear[h_margin_mask] - self.holder_margin_mm)
-                    if np.any(h_margin_depth > 0.0):
-                        holder_margin_clear = False
+            if holder_can_violate_margin:
+                cum_len = 0.0
+                margin_secs: List[Tuple[float, float]] = []
+                margin_max_r = 0.0
+                for sec_len, sec_dia in holder_sections:
+                    if (z_holder_min + cum_len) < (h_sub_max + self.holder_margin_mm):
+                        sec_r = sec_dia * 0.5
+                        margin_secs.append((cum_len, sec_r))
+                        if sec_r > margin_max_r:
+                            margin_max_r = sec_r
+                    cum_len += sec_len
+
+                if margin_secs and margin_max_r > 0.0:
+                    m_cmin, m_cmax, m_rmin, m_rmax = self.grid.get_subgrid_bounds(
+                        p1.x, p1.y, p2.x, p2.y, margin_max_r + 1e-4
+                    )
+                    if m_cmax > m_cmin and m_rmax > m_rmin:
+                        sub_H_m = self.grid.H[m_rmin:m_rmax, m_cmin:m_cmax]
+                        m_sub_max = float(np.max(sub_H_m))
+                        if m_sub_max > (z_holder_min - self.holder_margin_mm):
+                            X_m, Y_m = self.grid.get_mesh_coordinates(m_cmin, m_cmax, m_rmin, m_rmax)
+                            if L2 < 1e-10:
+                                dist_m = np.sqrt((X_m - p1.x) ** 2 + (Y_m - p1.y) ** 2)
+                                z_m_bot = np.full(dist_m.shape, z_tip_min + body_len, dtype=np.float32)
+                            else:
+                                t_m = np.clip(((X_m - p1.x) * vx + (Y_m - p1.y) * vy) / L2, 0.0, 1.0)
+                                cx_m = p1.x + t_m * vx
+                                cy_m = p1.y + t_m * vy
+                                dist_m = np.sqrt((X_m - cx_m) ** 2 + (Y_m - cy_m) ** 2)
+                                z_m_bot = (p1.z + t_m * (p2.z - p1.z) + body_len).astype(np.float32)
+                            for c_len, sec_r in margin_secs:
+                                if (z_holder_min + c_len) >= (m_sub_max + self.holder_margin_mm):
+                                    continue
+                                clr_sec = dist_m <= (sec_r + 1e-5)
+                                if np.any(clr_sec):
+                                    sec_z_bot = z_m_bot + np.float32(c_len)
+                                    if np.any(sub_H_m[clr_sec] - (sec_z_bot[clr_sec] - self.holder_margin_mm) > 0.0):
+                                        holder_margin_clear = False
+                                        break
 
             # Check cutter clearance
             # Phase 2 H2: clearance check uses clearance_r (lateral margin + cell diagonal discretization bound)
@@ -814,6 +1367,7 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                         if abs(dz_c) <= 1e-9:
                             z_tip_c = p1.z + t_param * dz_c
                         else:
+                            X_sub, Y_sub = self.grid.get_mesh_coordinates(col_min, col_max, row_min, row_max)
                             L_c = math.sqrt(L2)
                             wx_c = X_sub - p1.x
                             wy_c = Y_sub - p1.y

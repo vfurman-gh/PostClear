@@ -284,6 +284,20 @@ function serializeVector(v) {
   return {x: v.x, y: v.y, z: v.z};
 }
 
+function _safeToolAxisABC(sec, getterName) {
+  try {
+    if (
+      sec &&
+      sec.isMultiAxis && sec.isMultiAxis() &&
+      sec.isOptimizedForMachine && sec.isOptimizedForMachine() &&
+      typeof sec[getterName] === "function"
+    ) {
+      return serializeVector(sec[getterName]());
+    }
+  } catch (e) {}
+  return {x: 0, y: 0, z: 0};
+}
+
 function serializeMatrix(m) {
   if (!m) {
     return {
@@ -533,8 +547,8 @@ onSection = function() {
     globalInitialToolAxis: currentSection.getGlobalInitialToolAxis ? serializeVector(currentSection.getGlobalInitialToolAxis()) : {x: 0, y: 0, z: 1},
     finalToolAxis: currentSection.getFinalToolAxis ? serializeVector(currentSection.getFinalToolAxis()) : {x: 0, y: 0, z: 1},
     globalFinalToolAxis: currentSection.getGlobalFinalToolAxis ? serializeVector(currentSection.getGlobalFinalToolAxis()) : {x: 0, y: 0, z: 1},
-    initialToolAxisABC: (isMulti && currentSection.getInitialToolAxisABC) ? serializeVector(currentSection.getInitialToolAxisABC()) : {x: 0, y: 0, z: 0},
-    finalToolAxisABC: (isMulti && currentSection.getFinalToolAxisABC) ? serializeVector(currentSection.getFinalToolAxisABC()) : {x: 0, y: 0, z: 0},
+    initialToolAxisABC: _safeToolAxisABC(currentSection, "getInitialToolAxisABC"),
+    finalToolAxisABC: _safeToolAxisABC(currentSection, "getFinalToolAxisABC"),
     forceToolChange: currentSection.getForceToolChange ? currentSection.getForceToolChange() : false,
     movements: currentSection.getMovements ? currentSection.getMovements() : 0,
     patternId: currentSection.getPatternId ? currentSection.getPatternId() : 0,
@@ -723,22 +737,36 @@ onCyclePoint = function(x, y, z) {
   var reposMoves = [];
   var afterReposMoves = [];
 
-  capturingExpanded = reposMoves;
+  var ctStr = (typeof cycleType === "string") ? cycleType.toLowerCase() : "";
+  var isProbeOrInspect = false;
   try {
-    repositionToCycleClearance(cycle, x, y, z);
-  } catch (e) {}
-  capturingExpanded = afterReposMoves;
-  try {
-    expandCyclePoint(x, y, z);
-  } catch (e) {}
-  capturingExpanded = null;
+    isProbeOrInspect = (ctStr.indexOf("prob") !== -1 || ctStr.indexOf("inspect") !== -1) ||
+      (typeof isProbeOperation === "function" && isProbeOperation()) ||
+      (typeof isInspectionOperation === "function" && isInspectionOperation()) ||
+      !!(curSec && curSec.params && (curSec.params["operation:isProbingStrategy"] == 1 || curSec.params["operation:isInspectionStrategy"] == 1));
+  } catch (e) {
+    isProbeOrInspect = (ctStr.indexOf("prob") !== -1 || ctStr.indexOf("inspect") !== -1) ||
+      !!(curSec && curSec.params && (curSec.params["operation:isProbingStrategy"] == 1 || curSec.params["operation:isInspectionStrategy"] == 1));
+  }
 
-  setCurrentPosition(start);
-  capturingExpanded = expMoves;
-  try {
-    expandCyclePoint(x, y, z);
-  } catch (e) {}
-  capturingExpanded = null;
+  if (!isProbeOrInspect) {
+    capturingExpanded = reposMoves;
+    try {
+      repositionToCycleClearance(cycle, x, y, z);
+    } catch (e) {}
+    capturingExpanded = afterReposMoves;
+    try {
+      expandCyclePoint(x, y, z);
+    } catch (e) {}
+    capturingExpanded = null;
+
+    setCurrentPosition(start);
+    capturingExpanded = expMoves;
+    try {
+      expandCyclePoint(x, y, z);
+    } catch (e) {}
+    capturingExpanded = null;
+  }
   setCurrentPosition(new Vector(x, y, z));
 
   var pt = {
@@ -782,9 +810,7 @@ onSectionEnd = function() {
     if (currentSection.getGlobalFinalToolAxis) {
       curSec.globalFinalToolAxis = serializeVector(currentSection.getGlobalFinalToolAxis());
     }
-    if (currentSection.isMultiAxis && currentSection.isMultiAxis() && currentSection.getFinalToolAxisABC) {
-      curSec.finalToolAxisABC = serializeVector(currentSection.getFinalToolAxisABC());
-    }
+    curSec.finalToolAxisABC = _safeToolAxisABC(currentSection, "getFinalToolAxisABC");
   }
   curSec = null;
 };

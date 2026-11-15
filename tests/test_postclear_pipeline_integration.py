@@ -3905,6 +3905,362 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         self.assertAlmostEqual(segs[5].end.z, 45.0)
 
 
+class TestPostClearCapabilityPreChecks(unittest.TestCase):
+    """Verify PostClear pre-checks reject unsupported setups/ops while preserving 3-axis milling & 2-axis turning."""
+
+    def setUp(self):
+        verifyResults.clear()
+
+    @staticmethod
+    def _make_params(mapping):
+        class _ParamVal:
+            def __init__(self, v):
+                self.value = v
+
+        class _Params:
+            def __init__(self, d):
+                self._d = dict(d)
+
+            def itemByName(self, k):
+                return _ParamVal(_ParamVal(self._d[k])) if k in self._d else None
+
+        return _Params(mapping)
+
+    @staticmethod
+    def _make_wcs(zx, zy, zz):
+        return types.SimpleNamespace(
+            getAsCoordinateSystem=lambda: (
+                types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                types.SimpleNamespace(x=1.0, y=0.0, z=0.0),
+                types.SimpleNamespace(x=0.0, y=1.0, z=0.0),
+                types.SimpleNamespace(x=zx, y=zy, z=zz),
+            )
+        )
+
+    def test_setup_capability_rejects_jet_and_additive_allows_mill_and_turn(self):
+        import PostClear
+
+        mill_s = types.SimpleNamespace(name="MillSetup", operationType=0)
+        turn_s = types.SimpleNamespace(name="TurnSetup", operationType=1)
+        jet_s = types.SimpleNamespace(name="WaterjetSetup", operationType=2)
+        add_s = types.SimpleNamespace(name="FFFSetup", operationType=3)
+
+        self.assertIsNone(PostClear._CheckSetupCapability(mill_s))
+        self.assertIsNone(PostClear._CheckSetupCapability(turn_s))
+
+        jet_err = PostClear._CheckSetupCapability(jet_s)
+        self.assertIsNotNone(jet_err)
+        self.assertIn("WaterjetSetup", jet_err)
+        self.assertIn("Cutting / Jet", jet_err)
+
+        add_err = PostClear._CheckSetupCapability(add_s)
+        self.assertIsNotNone(add_err)
+        self.assertIn("FFFSetup", add_err)
+        self.assertIn("Additive", add_err)
+
+    def test_operation_capability_rejects_unsupported_and_avoids_false_positives(self):
+        import PostClear
+
+        mill_setup = types.SimpleNamespace(
+            name="3AxisMill",
+            operationType=0,
+            workCoordinateSystem=self._make_wcs(0.0, 0.0, 1.0),
+        )
+        turn_setup = types.SimpleNamespace(
+            name="2AxisLathe",
+            operationType=1,
+            workCoordinateSystem=self._make_wcs(0.0, 0.0, 1.0),
+        )
+
+        # False-positive trap checks: 2D Adaptive with isRotaryStrategy=1 & unwrap=1, and 3D Flow with three_axis
+        adaptive_3x = types.SimpleNamespace(
+            name="2D Adaptive1",
+            isSuppressed=False,
+            strategy="adaptive2d",
+            parameters=self._make_params({
+                "operation:isRotaryStrategy": 1,
+                "operation:unwrap": 1,
+                "operation:multiAxisMachiningType": "three_axis",
+                "operation:view_orientation_mode": "useWCS",
+                "operation:view_orientation_flipZ": 0,
+            }),
+            tool=types.SimpleNamespace(parameters=self._make_params({"tool_number": 1, "tool_type": "flat end mill"})),
+        )
+        flow_3x = types.SimpleNamespace(
+            name="Flow1",
+            isSuppressed=False,
+            strategy="flow",
+            parameters=self._make_params({
+                "operation:isMultiAxisStrategy": 1,
+                "operation:multiAxisMachiningType": "three_axis",
+                "operation:view_orientation_mode": "useWCS",
+            }),
+            tool=types.SimpleNamespace(parameters=self._make_params({"tool_number": 2, "tool_type": "ball end mill"})),
+        )
+        self.assertIsNone(PostClear._CheckOperationCapability(adaptive_3x, setup=mill_setup))
+        self.assertIsNone(PostClear._CheckOperationCapability(flow_3x, setup=mill_setup))
+
+        # Valid 2-axis turning + centerline Z-drilling
+        turn_rough = types.SimpleNamespace(
+            name="Profile Roughing",
+            isSuppressed=False,
+            strategy="turningProfileRoughing",
+            parameters=self._make_params({"operation:isTurningStrategy": 1}),
+            tool=types.SimpleNamespace(parameters=self._make_params({"tool_number": 1, "tool_type": "turning general"})),
+        )
+        center_drill = types.SimpleNamespace(
+            name="Center Drill",
+            isSuppressed=False,
+            strategy="drill",
+            parameters=self._make_params({
+                "operation:isDrillingStrategy": 1,
+                "operation:isMillingStrategy": 0,
+                "operation:view_orientation_mode": "useWCS",
+            }),
+            tool=types.SimpleNamespace(parameters=self._make_params({"tool_number": 4, "tool_type": "drill"})),
+        )
+        self.assertIsNone(PostClear._CheckOperationCapability(turn_rough, setup=turn_setup))
+        self.assertIsNone(PostClear._CheckOperationCapability(center_drill, setup=turn_setup))
+
+        # Probing op rejected
+        probe_op = types.SimpleNamespace(
+            name="WCS Probe1",
+            isSuppressed=False,
+            strategy="probe",
+            parameters=self._make_params({"operation:isProbingStrategy": 1}),
+        )
+        self.assertIn("probing", PostClear._CheckOperationCapability(probe_op, setup=mill_setup).lower())
+
+        # 4-axis rotary wrap & pure 5-axis simultaneous (isMultiAxisStrategy=1 without three_axis) rejected
+        wrap_op = types.SimpleNamespace(
+            name="Wrapped Pocket",
+            isSuppressed=False,
+            parameters=self._make_params({"operation:multiAxisMachiningType": "wrapped"}),
+        )
+        swarf_op = types.SimpleNamespace(
+            name="Swarf1",
+            isSuppressed=False,
+            parameters=self._make_params({"operation:isMultiAxisStrategy": 1}),
+        )
+        self.assertIn("multi-axis", PostClear._CheckOperationCapability(wrap_op, setup=mill_setup).lower())
+        self.assertIn("multi-axis", PostClear._CheckOperationCapability(swarf_op, setup=mill_setup).lower())
+
+        # 3+2 Tool Orientation rejected when overrideToolView=1, but dormant child params with overrideToolView=0 allowed
+        tilted_param_op = types.SimpleNamespace(
+            name="Tilted Pocket",
+            isSuppressed=False,
+            parameters=self._make_params({"overrideToolView": 1, "view_orientation_mode": "axesZX"}),
+        )
+        dormant_child_param_op = types.SimpleNamespace(
+            name="LowerControlArmPocket",
+            isSuppressed=False,
+            parameters=self._make_params({
+                "operation:overrideToolView": 0,
+                "operation:view_orientation_mode": "modelOrientation",
+                "operation:view_orientation_flipZ": 1,
+            }),
+        )
+        self.assertIn("3+2", PostClear._CheckOperationCapability(tilted_param_op, setup=mill_setup))
+        self.assertIsNone(PostClear._CheckOperationCapability(dormant_child_param_op, setup=mill_setup))
+
+        # Mill-Turn live-tool milling inside Turning setup rejected
+        live_mill_op = types.SimpleNamespace(
+            name="Hex Flats",
+            isSuppressed=False,
+            parameters=self._make_params({"operation:isMillingStrategy": 1}),
+        )
+        self.assertIn("mill-turn", PostClear._CheckOperationCapability(live_mill_op, setup=turn_setup).lower())
+
+    def test_perform_post_process_and_pipeline_abort_cleanly_on_unsupported_ops(self):
+        import PostClear
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tilted_op = types.SimpleNamespace(
+                name="TiltedContour",
+                operationId=10,
+                isSuppressed=False,
+                hasToolpath=False,  # Even when ungenerated in Personal Use, pre-check catches it before empty prompt!
+                isToolpathValid=False,
+                strategy="contour2d",
+                parameters=self._make_params({"overrideToolView": 1, "view_orientation_mode": "axesZX"}),
+                tool=types.SimpleNamespace(parameters=self._make_params({"tool_number": 1})),
+            )
+            setup = types.SimpleNamespace(
+                name="MotorBracketOp1",
+                objectType="adsk::cam::Setup",
+                operationType=0,
+                isSuppressed=False,
+                allOperations=[tilted_op],
+            )
+            prog = types.SimpleNamespace(
+                name="NCProgram1",
+                objectType="adsk::cam::NCProgram",
+                setups=[setup],
+                operations=[],
+                parameters=self._make_params({
+                    "nc_program_output_folder": tmp_dir,
+                    "nc_program_filename": "1001",
+                    "nc_program_nc_extension": ".nc",
+                }),
+            )
+            msg_calls = []
+            ui = types.SimpleNamespace(
+                messageBox=lambda *args, **kwargs: msg_calls.append(args),
+            )
+            cam = types.SimpleNamespace(
+                setups=[setup],
+                ncPrograms=types.SimpleNamespace(count=1, item=lambda i: prog, __iter__=lambda self: iter([prog])),
+                allOperations=types.SimpleNamespace(count=1),
+            )
+            doc = types.SimpleNamespace(
+                name="BracketDoc",
+                attributes=MagicMock(),
+                products=types.SimpleNamespace(itemByProductType=lambda _pt: cam),
+            )
+            app = types.SimpleNamespace(userInterface=ui, activeDocument=doc)
+
+            post_setup_calls = []
+            with patch("PostClear.adsk.core.Application.get", return_value=app), \
+                 patch("PostClear.PostProcessSetup", side_effect=lambda *a, **k: post_setup_calls.append(a)):
+                res = PostClear.PerformPostProcess(dict(PostClear.defaultSettings, ncPrograms=["NCProgram1"]))
+
+            self.assertIsNotNone(res)
+            self.assertIn("3+2", res)
+            self.assertEqual(len(post_setup_calls), 0)
+            self.assertEqual(len(msg_calls), 1)
+            self.assertIn("TiltedContour", msg_calls[0][0])
+
+            # Post-Pass-1 dumped section check catches rotary CAMPattern tilted workPlane AND off-center lathe drill
+            fixture_cnc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures", "roughing_test.cnc")
+            base_cps = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "centroid_turning.cps")
+            clean_op = types.SimpleNamespace(
+                name="PatternChild",
+                isSuppressed=False,
+                hasToolpath=True,
+                isToolpathValid=True,
+                strategy="face",
+                parameters=self._make_params({"operation:view_orientation_mode": "useWCS"}),
+                tool=types.SimpleNamespace(parameters=self._make_params({"tool_number": 1})),
+            )
+            rot_setup = types.SimpleNamespace(
+                name="RotaryPatternSetup",
+                operationType=0,
+                isSuppressed=False,
+                parameters=self._make_params({"job_stockMode": "default"}),
+                allOperations=[clean_op],
+            )
+
+            def _fake_dumper_post(_ops, post_in):
+                b_json = os.path.join(post_in.outputFolder, f"{post_in.programName}.json")
+                with open(b_json, "w", encoding="utf-8") as jf:
+                    json.dump({
+                        "unit": 1,
+                        "sections": [{
+                            "id": 0,
+                            "type": 0,
+                            "workPlane": {"forward": {"x": 0.0, "y": -0.8660254, "z": -0.5}},
+                            "params": {"operation-comment": "PatternChild"},
+                            "events": [],
+                        }],
+                    }, jf)
+                shutil.copy2(fixture_cnc, os.path.join(post_in.outputFolder, "bootstrap.intermediate.cnc"))
+                return True
+
+            cam_pipe = types.SimpleNamespace(postProcess=_fake_dumper_post)
+            doc_pipe = types.SimpleNamespace(
+                products=types.SimpleNamespace(itemByProductType=lambda _pt: cam_pipe),
+                unitsManager=types.SimpleNamespace(defaultLengthUnits="mm"),
+            )
+            app_pipe = types.SimpleNamespace(activeDocument=doc_pipe, log=lambda _m: None)
+            out_nc = os.path.join(tmp_dir, "rotary_out.nc")
+            with patch("PostClear.adsk.core.Application.get", return_value=app_pipe), \
+                 patch("PostClear._ResolveBasePostPath", return_value=base_cps):
+                pipe_err = PostClear._PostProcessUnifiedPipeline(
+                    fname="rotary_out",
+                    setup=rot_setup,
+                    setupFolder=tmp_dir,
+                    docSettings=dict(PostClear.defaultSettings),
+                    program=prog,
+                    path=out_nc,
+                    fileExt=".nc",
+                    target_operations=[clean_op],
+                )
+            self.assertIsNotNone(pipe_err)
+            self.assertIn("3+2", pipe_err)
+            self.assertFalse(os.path.exists(out_nc))
+            self.assertEqual(len(verifyResults), 1)
+            self.assertIn("3+2", verifyResults[0]["error"])
+
+            # Off-center vs centerline drilling in Turning setup (including turret-home rapids & expanded Z-plunge)
+            from context_parser import check_dumped_sections_capability
+
+            offcenter_json = os.path.join(tmp_dir, "offcenter.json")
+            offcenter_plunge_json = os.path.join(tmp_dir, "offcenter_plunge.json")
+            center_json = os.path.join(tmp_dir, "center.json")
+            with open(offcenter_json, "w", encoding="utf-8") as f:
+                json.dump({
+                    "unit": 0,
+                    "sections": [{
+                        "id": 0,
+                        "type": 0,
+                        "workPlane": {"forward": {"x": 0.0, "y": 0.0, "z": 1.0}},
+                        "params": {"operation-comment": "BoltCircleDrill", "operation:isDrillingStrategy": 1},
+                        "events": [{"type": "onCyclePoint", "x": -0.74, "y": 0.74, "z": -0.5}],
+                    }],
+                }, f)
+            with open(offcenter_plunge_json, "w", encoding="utf-8") as f:
+                json.dump({
+                    "unit": 1,
+                    "sections": [{
+                        "id": 0,
+                        "type": 0,
+                        "workPlane": {"forward": {"x": 0.0, "y": 0.0, "z": 1.0}},
+                        "params": {"operation-comment": "ExpandedOffCenterDrill", "operation:isDrillingStrategy": 1},
+                        "events": [
+                            {"type": "onRapid", "sx": 50.0, "sy": 0.0, "sz": 50.0, "x": 12.0, "y": 0.0, "z": 2.0},
+                            {"type": "onLinear", "sx": 12.0, "sy": 0.0, "sz": 2.0, "x": 12.0, "y": 0.0, "z": -15.0, "movement": 2},
+                        ],
+                    }],
+                }, f)
+            with open(center_json, "w", encoding="utf-8") as f:
+                json.dump({
+                    "unit": 0,
+                    "sections": [{
+                        "id": 0,
+                        "type": 0,
+                        "workPlane": {"forward": {"x": 0.0, "y": 0.0, "z": 1.0}},
+                        "params": {"operation-comment": "TailstockDrill", "operation:isDrillingStrategy": 1},
+                        "events": [
+                            {"type": "onRapid", "sx": 4.0, "sy": 0.0, "sz": 4.0, "x": 0.0, "y": 0.0, "z": 0.2},
+                            {"type": "onLinear", "sx": 4.0, "sy": 0.0, "sz": 4.0, "x": 0.0, "y": 0.0, "z": 0.1, "movement": 15},
+                            {"type": "onCyclePoint", "x": 0.0, "y": 0.0, "z": -1.2},
+                            {"type": "onRapid", "sx": 0.0, "sy": 0.0, "sz": 0.2, "x": 4.0, "y": 0.0, "z": 4.0},
+                        ],
+                    }],
+                }, f)
+            self.assertIn(
+                "off-center",
+                check_dumped_sections_capability([offcenter_json], setup_name="QuickRelease", is_turning=True),
+            )
+            self.assertIn(
+                "off-center",
+                check_dumped_sections_capability([offcenter_plunge_json], setup_name="QuickRelease", is_turning=True),
+            )
+            self.assertIsNone(
+                check_dumped_sections_capability([center_json], setup_name="ColletLathe", is_turning=True)
+            )
+            additive_json = os.path.join(tmp_dir, "additive.json")
+            with open(additive_json, "w", encoding="utf-8") as f:
+                json.dump({
+                    "unit": 1,
+                    "sections": [{"id": 0, "type": 4, "events": []}],
+                }, f)
+            self.assertIn(
+                "additive",
+                check_dumped_sections_capability([additive_json], setup_name="StockFence", check_probing=False),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
 

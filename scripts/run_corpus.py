@@ -40,6 +40,8 @@ if REPO_ROOT not in sys.path:
 
 from context_parser import (
     apply_promotions_to_context,
+    check_context_dict_capability,
+    check_dumped_sections_capability,
     extract_tools_from_context,
     extract_workpiece_from_context,
     filter_promoted_events_by_length,
@@ -395,6 +397,37 @@ def _resolve_bundle_path(bundle_dir: str, rel_or_abs: Optional[str]) -> Optional
     return os.path.abspath(p) if os.path.isfile(p) else None
 
 
+def _manifest_bundle_is_unsupported(manifest_path: str) -> bool:
+    """Return True if a harvested setup bundle contains unsupported 3+2, multi-axis, or mill-turn sections."""
+    try:
+        bundle_dir = os.path.dirname(os.path.abspath(manifest_path))
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+        json_paths = [
+            bp
+            for rel_j in (data.get("json_batches") or [])
+            for bp in (_resolve_bundle_path(bundle_dir, rel_j),)
+            if bp is not None
+        ]
+        if not json_paths:
+            return False
+        setup_name = str(data.get("setup_name") or os.path.basename(bundle_dir))
+        is_turning = bool(data.get("is_turning", False))
+        return (
+            check_dumped_sections_capability(
+                json_paths,
+                setup_name=setup_name,
+                is_turning=is_turning,
+                check_probing=False,
+            )
+            is not None
+        )
+    except Exception:
+        return False
+
+
 def load_fixture_from_manifest(manifest_path: str) -> CorpusFixture:
     """Load a harvested setup bundle manifest into a `CorpusFixture`."""
     bundle_dir = os.path.dirname(os.path.abspath(manifest_path))
@@ -474,6 +507,12 @@ def load_standalone_cnc_fixture(
         s.get("type", 0) == 1 or bool(s.get("tool", {}).get("_isTurningTool", False))
         for s in ctx.get("sections", [])
     )
+    cap_err = check_context_dict_capability(
+        ctx,
+        setup_name=os.path.basename(abs_cnc),
+        is_turning=is_turning,
+        check_probing=False,
+    )
     wp = extract_workpiece_from_context(ctx, is_turning=is_turning)
     if wp is None:
         wp = _synthesize_fallback_workpiece_from_context(ctx, is_turning=is_turning)
@@ -484,6 +523,7 @@ def load_standalone_cnc_fixture(
         is_turning=is_turning,
         unit=ctx.get("unit"),
         fallback_workpiece=wp,
+        metadata={"capability_error": cap_err} if cap_err else {},
     )
 
 
@@ -552,6 +592,8 @@ def discover_fixtures(
 
     fixtures: List[CorpusFixture] = []
     for mp in sorted(manifests):
+        if _manifest_bundle_is_unsupported(mp):
+            continue
         fixtures.append(load_fixture_from_manifest(mp))
 
     if standalone_cncs:
@@ -561,7 +603,10 @@ def discover_fixtures(
             raise FileNotFoundError("Could not find a probe post processor (shopbot.cps/grbl.cps) for standalone .cnc inspection")
         orch = PipelineOrchestrator()
         for cnc in sorted(standalone_cncs):
-            fixtures.append(load_standalone_cnc_fixture(cnc, probe_post_path=probe_post, orchestrator=orch))
+            fx = load_standalone_cnc_fixture(cnc, probe_post_path=probe_post, orchestrator=orch)
+            if fx.metadata.get("capability_error"):
+                continue
+            fixtures.append(fx)
 
     if max_fixtures is not None and max_fixtures > 0:
         fixtures = fixtures[:max_fixtures]
@@ -824,20 +869,55 @@ def check_oracle2_nc_diff(
             return False, "No promoted_events, yet promote=True altered NC output"
         return True, "no-op verified (0 promotions)"
 
+    # Strip wrapper summary comments from promoted output before prefix/suffix trim & alignment
+    p_lines = [ln for ln in p_lines if not _PURE_WRAPPER_COMMENT_RE.match(ln)]
+
+    # Trim identical leading/trailing NC lines (where nl == pl is a guaranteed no-op)
+    len_n, len_p = len(n_lines), len(p_lines)
+    prefix = 0
+    min_len = min(len_n, len_p)
+    while prefix < min_len and n_lines[prefix] == p_lines[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix < (min_len - prefix) and n_lines[len_n - 1 - suffix] == p_lines[len_p - 1 - suffix]:
+        suffix += 1
+    n_lines = n_lines[prefix : len_n - suffix]
+    p_lines = p_lines[prefix : len_p - suffix]
+    if not n_lines and not p_lines:
+        return True, f"diff guard passed ({len(promoted_events)} promoted events)"
+
+    key_cache: Dict[str, str] = {}
+
     def _align_key(ln: str) -> str:
-        if _PURE_WRAPPER_COMMENT_RE.match(ln):
-            return ln
+        cached = key_cache.get(ln)
+        if cached is not None:
+            return cached
         stripped = _strip_comments_and_n(ln)
         if not _CANNED_CYCLE_RE.search(stripped):
             coords = _extract_move_coordinates([ln])
             if coords:
-                return f"MOVE:{coords[0]}"
+                res = f"MOVE:{coords[0]}"
+                key_cache[ln] = res
+                return res
+        key_cache[ln] = ln
         return ln
+
+    k0 = [_align_key(x) for x in n_lines]
+    k1 = [_align_key(x) for x in p_lines]
+    if k0 == k1:
+        for nl, pl in zip(n_lines, p_lines):
+            if nl == pl:
+                continue
+            if _CANNED_CYCLE_RE.search(_strip_comments_and_n(nl)):
+                return False, f"Canned cycle or threading move altered by promotion: {nl}"
+            if _extract_move_coordinates([nl]) != _extract_move_coordinates([pl]):
+                return False, f"Coordinate mismatch in promoted line: before={nl!r} after={pl!r}"
+        return True, f"diff guard passed ({len(promoted_events)} promoted events)"
 
     matcher = difflib.SequenceMatcher(
         None,
-        [_align_key(x) for x in n_lines],
-        [_align_key(x) for x in p_lines],
+        k0,
+        k1,
         autojunk=False,
     )
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -1176,14 +1256,15 @@ def _transform_context_unit_flip(ctx: Dict[str, Any]) -> Dict[str, Any]:
     k = 25.4 if orig_unit == 0 else (1.0 / 25.4)
     out["unit"] = new_unit
 
-    wp = out.get("workpiece")
-    if isinstance(wp, dict):
-        for bound_key in ("lower", "upper"):
-            pt = wp.get(bound_key)
-            if isinstance(pt, dict):
-                for ax in ("x", "y", "z"):
-                    if ax in pt and pt[ax] is not None:
-                        pt[ax] = float(pt[ax]) * k
+    for wp_key in ("workpiece", "workpieceHint"):
+        wp = out.get(wp_key)
+        if isinstance(wp, dict):
+            for bound_key in ("lower", "upper"):
+                pt = wp.get(bound_key)
+                if isinstance(pt, dict):
+                    for ax in ("x", "y", "z"):
+                        if ax in pt and pt[ax] is not None:
+                            pt[ax] = float(pt[ax]) * k
 
     g_params = out.get("globalParams")
     if isinstance(g_params, dict):
@@ -1303,6 +1384,18 @@ def _transform_180_z(
 ) -> Tuple[Dict[str, Any], WorkpieceDefinition]:
     """Rotate a milling context and stock 180 degrees around the setup Z axis."""
     out = copy.deepcopy(ctx)
+    for wp_key in ("workpiece", "workpieceHint"):
+        wp_box = out.get(wp_key)
+        if isinstance(wp_box, dict):
+            lo = wp_box.get("lower")
+            hi = wp_box.get("upper")
+            if isinstance(lo, dict) and isinstance(hi, dict):
+                if "x" in lo and "x" in hi and lo["x"] is not None and hi["x"] is not None:
+                    nx0, nx1 = -float(hi["x"]), -float(lo["x"])
+                    lo["x"], hi["x"] = nx0, nx1
+                if "y" in lo and "y" in hi and lo["y"] is not None and hi["y"] is not None:
+                    ny0, ny1 = -float(hi["y"]), -float(lo["y"])
+                    lo["y"], hi["y"] = ny0, ny1
     for sec in out.get("sections", []):
         wp = sec.get("workPlane")
         has_wp = isinstance(wp, dict)

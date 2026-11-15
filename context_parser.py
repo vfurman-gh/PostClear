@@ -67,6 +67,12 @@ def merge_context_dumps(sources: Sequence[Union[str, Dict[str, Any]]]) -> Dict[s
                 merged["rapidMode"] = copy.deepcopy(d["rapidMode"])
                 break
 
+    if not merged.get("workpieceHint"):
+        for d in dumps:
+            if d.get("workpieceHint"):
+                merged["workpieceHint"] = copy.deepcopy(d["workpieceHint"])
+                break
+
     global_sec_id = 0
     for batch_idx, d in enumerate(dumps):
         for k, v in d.get("globalParams", {}).items():
@@ -508,10 +514,14 @@ def parse_context_dump(
                                 metadata={
                                     "tool_id": tool_id,
                                     "in_cycle": True,
+                                    "movement": lin_mv.get("movement", ev.get("movement")),
                                     "batch_idx": batch_idx,
                                     "batch_sec_id": orig_sec_id,
                                     "sec_idx": sec_idx,
                                     "event_idx": ev_idx,
+                                    "z_clearance_mm": z_clearance_mm,
+                                    "z_retract_mm": z_retract_mm,
+                                    "sec_type": sec_type,
                                 },
                             )
                         )
@@ -537,10 +547,14 @@ def parse_context_dump(
                             metadata={
                                 "tool_id": tool_id,
                                 "in_cycle": in_cycle_active,
+                                "movement": ev.get("movement"),
                                 "batch_idx": batch_idx,
                                 "batch_sec_id": orig_sec_id,
                                 "sec_idx": sec_idx,
                                 "event_idx": ev_idx,
+                                "z_clearance_mm": z_clearance_mm,
+                                "z_retract_mm": z_retract_mm,
+                                "sec_type": sec_type,
                             },
                         )
                     )
@@ -1179,3 +1193,189 @@ def extract_tools_from_context(
         )
 
     return tools_by_op
+
+
+# Autodesk CPS C++ Section.getType() & Tool.getType() constants:
+#   Section.type: 0 = TYPE_MILLING, 1 = TYPE_TURNING, 2 = TYPE_WIRE, 3 = TYPE_JET, 4 = TYPE_ADDITIVE
+#   Tool.type:    27 = TOOL_PROBE, 29 = TOOL_WATER_JET, 30 = TOOL_LASER_CUTTER, 36 = TOOL_PLASMA_CUTTER, 37 = TOOL_MARKER
+_NON_MACHINING_TOOL_TYPES = frozenset({29, 30, 36, 37})
+_PROBE_TOOL_TYPE = 27
+
+
+def _is_truthy_flag(val: Any) -> bool:
+    if val is True:
+        return True
+    if val is False or val is None:
+        return False
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return abs(float(val)) > 1e-9
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes")
+    return False
+
+
+def check_section_dict_capability(
+    sec: Dict[str, Any],
+    setup_name: str = "Setup",
+    is_turning: bool = False,
+    dump_unit: Optional[int] = None,
+    fallback_idx: int = 0,
+    check_probing: bool = True,
+) -> Optional[str]:
+    """
+    Check whether a dumped section from `universal_dumper.cps` uses capabilities
+    unsupported by Fusion for Personal Use and PostClear using CPS C++ enums,
+    section geometry, and Fusion's structured boolean taxonomy flags.
+    """
+    if not isinstance(sec, dict):
+        return None
+    params = sec.get("params") if isinstance(sec.get("params"), dict) else {}
+    tool = sec.get("tool") if isinstance(sec.get("tool"), dict) else {}
+    raw_comment = params.get("operation-comment")
+    op_name = (
+        raw_comment.strip()
+        if isinstance(raw_comment, str) and raw_comment.strip()
+        else f"Section_{sec.get('id', fallback_idx)}"
+    )
+    s_type = sec.get("type", 0)
+    t_type = tool.get("type")
+
+    if (
+        s_type not in (0, 1)
+        or t_type in _NON_MACHINING_TOOL_TYPES
+        or _is_truthy_flag(params.get("operation:isJetStrategy"))
+        or _is_truthy_flag(params.get("operation:isAdditiveStrategy"))
+    ):
+        return (
+            f"Unsupported operation '{op_name}' in setup '{setup_name}': "
+            f"wire, jet/cutting, and additive toolpaths are not supported "
+            f"(PostClear supports 2D/3-axis Milling and 2-axis Turning)."
+        )
+
+    if check_probing and (
+        t_type == _PROBE_TOOL_TYPE
+        or _is_truthy_flag(params.get("operation:isProbingStrategy"))
+        or _is_truthy_flag(params.get("operation:isInspectionStrategy"))
+    ):
+        return (
+            f"Unsupported operation '{op_name}' in setup '{setup_name}': "
+            f"probing and inspection toolpaths are not supported by PostClear."
+        )
+
+    ma_type = params.get("operation:multiAxisMachiningType")
+    if (
+        sec.get("isMultiAxis")
+        or sec.get("has5DMoves")
+        or _is_truthy_flag(params.get("operation:wrap_cylinder"))
+        or (isinstance(ma_type, str) and ma_type.strip().lower() not in ("", "three_axis", "3_axis", "none"))
+    ):
+        return (
+            f"Unsupported multi-axis / rotary-wrap operation '{op_name}' in setup '{setup_name}': "
+            f"4-axis rotary wrap and simultaneous multi-axis toolpaths are not supported "
+            f"(PostClear supports 2D/3-axis Milling and 2-axis Turning)."
+        )
+
+    wp = sec.get("workPlane")
+    if s_type != 1 and isinstance(wp, dict) and isinstance(wp.get("forward"), dict):
+        fwd = wp["forward"]
+        fx, fy, fz = float(fwd.get("x", 0.0)), float(fwd.get("y", 0.0)), float(fwd.get("z", 1.0))
+        if not (abs(fx) < 1e-5 and abs(fy) < 1e-5 and abs(fz - 1.0) < 1e-5):
+            return (
+                f"Unsupported 3+2 tilted Tool Orientation in operation '{op_name}' "
+                f"(setup '{setup_name}', tool axis=({fx:.3f}, {fy:.3f}, {fz:.3f})): "
+                f"PostClear supports only 2D/3-axis Milling aligned with the setup +Z axis and 2-axis Turning."
+            )
+
+    if is_turning and s_type != 1:
+        is_mill = _is_truthy_flag(params.get("operation:isMillingStrategy")) or _is_truthy_flag(
+            params.get("operation:isHoleMillingStrategy")
+        )
+        if is_mill or not _is_truthy_flag(params.get("operation:isDrillingStrategy")):
+            return (
+                f"Unsupported mill-turn live-tool operation '{op_name}' in turning setup '{setup_name}': "
+                f"milling operations inside a Turning setup require C/Y-axis live tooling and are not supported."
+            )
+        tol_xy = 0.001 if dump_unit == 0 else 0.025
+        for ev in sec.get("events") or []:
+            if not isinstance(ev, dict):
+                continue
+            ev_type = ev.get("type")
+            is_hole_plunge = (
+                ev_type == "onLinear"
+                and float(ev.get("z", 0.0) or 0.0) < float(ev.get("sz", ev.get("z", 0.0)) or 0.0) - 1e-6
+                and (
+                    ev.get("movement") in (2, 7)
+                    or (
+                        abs(float(ev.get("x", 0.0) or 0.0) - float(ev.get("sx", 0.0) or 0.0)) < 1e-5
+                        and abs(float(ev.get("y", 0.0) or 0.0) - float(ev.get("sy", 0.0) or 0.0)) < 1e-5
+                    )
+                )
+            )
+            if ev_type == "onCyclePoint" or is_hole_plunge:
+                vx = float(ev.get("x", 0.0) or 0.0)
+                vy = float(ev.get("y", 0.0) or 0.0)
+                if math.hypot(vx, vy) > tol_xy:
+                    return (
+                        f"Unsupported mill-turn off-center drilling operation '{op_name}' "
+                        f"in turning setup '{setup_name}': off-center axial holes require C/Y-axis live tooling "
+                        f"and are not supported (PostClear supports 2-axis Turning and spindle-centerline Z-drilling)."
+                    )
+
+    return None
+
+
+def check_context_dict_capability(
+    dump_data: Dict[str, Any],
+    setup_name: str = "Setup",
+    is_turning: bool = False,
+    check_probing: bool = True,
+    start_sec_idx: int = 0,
+) -> Optional[str]:
+    """Check all sections in a single parsed dump dictionary for unsupported capabilities."""
+    if not isinstance(dump_data, dict):
+        return None
+    dump_unit = dump_data.get("unit")
+    unit_int = dump_unit if isinstance(dump_unit, int) and not isinstance(dump_unit, bool) else None
+    for offset, sec in enumerate(dump_data.get("sections") or []):
+        err = check_section_dict_capability(
+            sec,
+            setup_name=setup_name,
+            is_turning=is_turning,
+            dump_unit=unit_int,
+            fallback_idx=start_sec_idx + offset,
+            check_probing=check_probing,
+        )
+        if err:
+            return err
+    return None
+
+
+def check_dumped_sections_capability(
+    batch_json_paths: Sequence[str],
+    setup_name: str = "Setup",
+    is_turning: bool = False,
+    check_probing: bool = True,
+) -> Optional[str]:
+    """Inspect a sequence of dumped batch JSON files for unsupported capabilities."""
+    sec_counter = 0
+    for jp in batch_json_paths:
+        if not jp or not os.path.isfile(jp):
+            continue
+        try:
+            with open(jp, "r", encoding="utf-8") as jf:
+                dump_data = json.load(jf)
+        except Exception:
+            continue
+        if not isinstance(dump_data, dict):
+            continue
+        err = check_context_dict_capability(
+            dump_data,
+            setup_name=setup_name,
+            is_turning=is_turning,
+            check_probing=check_probing,
+            start_sec_idx=sec_counter,
+        )
+        if err:
+            return err
+        sec_counter += len(dump_data.get("sections") or [])
+    return None

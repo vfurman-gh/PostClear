@@ -965,6 +965,67 @@ class TestMillHeightfieldVerifier(unittest.TestCase):
         self.assertEqual(rep.total_volume_removed_mm3, 0.0)
         self.assertEqual(rep.promoted_events, set())
 
+    def test_decoupled_multisection_holder_strike_and_margin_clearance(self):
+        """Decoupled core/holder subgrids preserve multi-section HOLDER_STRIKE and holder margin blocking even when tool tip is outside grid."""
+        wp = WorkpieceDefinition(stock=BoxStock3D(-20.0, 20.0, -20.0, 20.0, -20.0, 0.0))
+        verifier = MillHeightfieldVerifier(cell_size_mm=0.5, pad_mm=5.0, promote_margin_mm=0.5, holder_margin_mm=1.0)
+        verifier.reset(wp)
+
+        stepped_tool = ToolAssembly(
+            tool_id="T99",
+            name="4mm Short Ball + Stepped CAT40",
+            geometry=MillToolGeometry(
+                diameter=4.0,
+                corner_radius=2.0,
+                flute_length=10.0,
+                overall_length=40.0,
+                body_length=20.0,
+                shaft_diameter=4.0,
+                holder_diameter=50.0,
+                holder_length=35.0,
+                holder_sections=[(10.0, 20.0), (25.0, 50.0)],
+            ),
+        )
+        verifier.load_tool(stepped_tool)
+
+        # 1. Tool tip at X = +38 mm is completely outside grid_x_max (~25 mm) for core_r (~3 mm),
+        #    but upper 50mm flange (r=25 mm, reaching X = +13 mm inside stock) has bottom at Z = -35 + 20 + 10 = -5 mm < 0.
+        edge_strike = _make_segment(
+            seg_id=801,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(38.0, -5.0, -35.0),
+            end=Vector3D(38.0, 5.0, -35.0),
+            feedrate=500.0,
+        )
+        r_strike = verifier.step(edge_strike)
+        self.assertTrue(any(c.kind == CollisionKind.HOLDER_STRIKE for c in r_strike.collisions))
+        self.assertFalse(r_strike.is_air_move)
+
+        # 2. Non-cutting G1 move above stock for cutter (Z = -19.5 => holder bottom = +0.5 mm < holder_margin 1.0 mm)
+        #    where cutter is outside stock (X = +24 mm, inside pad) while collet nose (r=10 mm) overhangs stock at X <= 20 mm.
+        margin_block = _make_segment(
+            seg_id=802,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(24.0, -5.0, -19.5),
+            end=Vector3D(24.0, 5.0, -19.5),
+            feedrate=500.0,
+        )
+        r_mblock = verifier.step(margin_block)
+        self.assertEqual(r_mblock.collisions, [])
+        self.assertFalse(r_mblock.is_air_move)
+
+        # 3. Raise Z by 1.0 mm so holder bottom = +1.5 mm > holder_margin 1.0 mm => safe air move!
+        margin_ok = _make_segment(
+            seg_id=803,
+            motion=MotionKind.LINEAR,
+            start=Vector3D(24.0, -5.0, -18.5),
+            end=Vector3D(24.0, 5.0, -18.5),
+            feedrate=500.0,
+        )
+        r_mok = verifier.step(margin_ok)
+        self.assertEqual(r_mok.collisions, [])
+        self.assertTrue(r_mok.is_air_move)
+
 
 if __name__ == "__main__":
     unittest.main()

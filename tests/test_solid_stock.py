@@ -1668,6 +1668,677 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
             )
         self.assertIsNotNone(rep.stock_bounding_box)
 
+    def test_pipeline_stl_overlap_milling_thin_plate_through_drill(self):
+        """H4: Thin-plate through-hole drilling passes when >= 50% of stock Z thickness is overlapped."""
+        from pipeline import PipelineOrchestrator
+        from scripts.harvest_corpus_fusion import write_binary_stl
+
+        verts = np.array(
+            [
+                [-20.0, -20.0, -2.5], [20.0, -20.0, -2.5], [20.0, 20.0, -2.5], [-20.0, 20.0, -2.5],
+                [-20.0, -20.0, 2.5], [20.0, -20.0, 2.5], [20.0, 20.0, 2.5], [-20.0, 20.0, 2.5],
+            ],
+            dtype=np.float32,
+        )
+        idxs = np.array(
+            [
+                [0, 1, 2], [0, 2, 3],
+                [4, 6, 5], [4, 7, 6],
+                [0, 4, 5], [0, 5, 1],
+                [1, 5, 6], [1, 6, 2],
+                [2, 6, 7], [2, 7, 3],
+                [3, 7, 4], [3, 4, 0],
+            ],
+            dtype=np.int32,
+        )
+        plate_stl = os.path.join(self.tmp_dir, "thin_plate.stl")
+        write_binary_stl(plate_stl, verts, idxs)
+
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_plate.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_plate.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z5\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+
+        tp_pass = {
+            "programName": "ThinPlateThroughDrill",
+            "stockMode": "previous-setup",
+            "stockPath": plate_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "tool": {"number": 1, "type": 3, "diameter": 6.35},
+                    "events": [
+                        {"type": "onLinear", "sx": 0.0, "sy": 0.0, "sz": 2.5, "x": 0.0, "y": 0.0, "z": -12.7, "f": 500.0},
+                    ],
+                }
+            ],
+        }
+        json_pass = os.path.join(self.tmp_dir, "thin_plate_pass.json")
+        with open(json_pass, "w", encoding="utf-8") as f:
+            json.dump(tp_pass, f)
+
+        with patch.object(orchestrator, "replay_combined_context", return_value="G1 X0 Y0 Z-12.7\n"):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[json_pass],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIsNotNone(rep.stock_bounding_box)
+
+        # Misaligned deep plunge overlapping only 1.0 mm (20% < 50%) of the 5.0 mm plate still fails H4
+        tp_fail = {
+            "programName": "ThinPlateShallowFail",
+            "stockMode": "previous-setup",
+            "stockPath": plate_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "tool": {"number": 1, "type": 3, "diameter": 6.35},
+                    "events": [
+                        {"type": "onLinear", "sx": 0.0, "sy": 0.0, "sz": -1.5, "x": 0.0, "y": 0.0, "z": -15.0, "f": 500.0},
+                    ],
+                }
+            ],
+        }
+        json_fail = os.path.join(self.tmp_dir, "thin_plate_fail.json")
+        with open(json_fail, "w", encoding="utf-8") as f:
+            json.dump(tp_fail, f)
+
+        with self.assertRaises(ValueError) as cm:
+            orchestrator.run(
+                context_dump_paths=[json_fail],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIn("insufficient volume overlap", str(cm.exception))
+
+    def test_h4_rejects_plus_and_minus_z_wcs_shifts_with_retracts(self):
+        """H4: +Z and -Z WCS shifts cannot be masked by vertical G1 plunge/retract legs."""
+        from pipeline import PipelineOrchestrator
+
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_wcs_shift.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_wcs_shift.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z50\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+
+        # 1. +Z WCS shift grazing top 0.5 mm of Z=[0, 20] stock (cuts Z=19.5..35.0 + retract Z=45.0)
+        tp_plus_z = {
+            "programName": "PlusZWcsShift",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "tool": {"number": 1, "type": 9, "diameter": 6.0},
+                    "events": [
+                        {"type": "onLinear", "sx": 0.0, "sy": 0.0, "sz": 45.0, "x": 0.0, "y": 0.0, "z": 19.5, "feed": 500.0},
+                        {"type": "onLinear", "sx": 0.0, "sy": 0.0, "sz": 19.5, "x": 5.0, "y": 0.0, "z": 35.0, "feed": 1000.0},
+                        {"type": "onLinear", "sx": 5.0, "sy": 0.0, "sz": 35.0, "x": 5.0, "y": 0.0, "z": 45.0, "feed": 1000.0},
+                    ],
+                }
+            ],
+        }
+        p_plus = os.path.join(self.tmp_dir, "plus_z_shift.json")
+        with open(p_plus, "w", encoding="utf-8") as f:
+            json.dump(tp_plus_z, f)
+
+        with self.assertRaises(ValueError) as cm_plus:
+            orchestrator.run(
+                context_dump_paths=[p_plus],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIn("insufficient volume overlap", str(cm_plus.exception))
+
+        # 2. -Z WCS shift below Z=[0, 20] stock connected by vertical G1 plunge/retract to Z=+25.0
+        tp_minus_z = {
+            "programName": "MinusZWcsShift",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "tool": {"number": 1, "type": 9, "diameter": 6.0},
+                    "events": [
+                        {"type": "onLinear", "sx": 0.0, "sy": 0.0, "sz": 25.0, "x": 0.0, "y": 0.0, "z": -40.0, "feed": 500.0},
+                        {"type": "onLinear", "sx": 0.0, "sy": 0.0, "sz": -40.0, "x": 5.0, "y": 5.0, "z": -25.0, "feed": 1000.0},
+                        {"type": "onLinear", "sx": 5.0, "sy": 5.0, "sz": -25.0, "x": 5.0, "y": 5.0, "z": 25.0, "feed": 1000.0},
+                    ],
+                }
+            ],
+        }
+        p_minus = os.path.join(self.tmp_dir, "minus_z_shift.json")
+        with open(p_minus, "w", encoding="utf-8") as f:
+            json.dump(tp_minus_z, f)
+
+        with self.assertRaises(ValueError) as cm_minus:
+            orchestrator.run(
+                context_dump_paths=[p_minus],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIn("insufficient volume overlap", str(cm_minus.exception))
+
+    def test_h4_passes_finish_facing_on_stock_top_with_lead_and_xy_park(self):
+        """H4: Finish facing directly on Z == st_max_z with vertical lead-in and XY park passes."""
+        from pipeline import PipelineOrchestrator
+
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_face_top.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_face_top.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z35\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+
+        # Stock is [-10, 10] x [-10, 10] x [0, 20]; ø10mm face mill extends by ~1.5*R to X=17.5,
+        # cuts on Z=20.0 (mov=14) after a 0.32 mm vertical lead-in, then parks at (100, 100, 35).
+        tp_face = {
+            "programName": "FaceOnStockTop",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "params": {"operation-comment": "Face1", "operation:zRetract": 35.0},
+                    "tool": {"number": 1, "type": 9, "diameter": 10.0},
+                    "events": [
+                        {"type": "onLinear", "sx": -15.0, "sy": 0.0, "sz": 35.0, "x": -15.0, "y": 0.0, "z": 20.32, "feed": 1000.0, "movement": 2},
+                        {"type": "onLinear", "sx": -15.0, "sy": 0.0, "sz": 20.32, "x": -14.5, "y": 0.0, "z": 20.0, "feed": 1000.0},
+                        {"type": "onLinear", "sx": -14.5, "sy": 0.0, "sz": 20.0, "x": 17.5, "y": 0.0, "z": 20.0, "feed": 1500.0, "movement": 14},
+                        {"type": "onLinear", "sx": 17.5, "sy": 0.0, "sz": 20.0, "x": 17.5, "y": 0.0, "z": 35.0, "feed": 1500.0},
+                        {"type": "onLinear", "sx": 17.5, "sy": 0.0, "sz": 35.0, "x": 100.0, "y": 100.0, "z": 35.0, "feed": 3000.0},
+                    ],
+                }
+            ],
+        }
+        p_face = os.path.join(self.tmp_dir, "face_top.json")
+        with open(p_face, "w", encoding="utf-8") as f:
+            json.dump(tp_face, f)
+
+        with patch.object(orchestrator, "replay_combined_context", return_value="G1 X0 Y0\n"):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[p_face],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIsNotNone(rep.stock_bounding_box)
+
+    def test_h4_multi_instance_pattern_passes_and_blocks_outside_promotions(self):
+        """H4: Multi-instance CAM pattern passes alignment on Instance #1 and blocks promotions on unmodeled copies."""
+        from pipeline import PipelineOrchestrator
+
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_pattern.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_pattern.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z30\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+
+        # Instance #1 (sec 0) cuts inside [-10, 10] x [-10, 10] x [0, 20] with an above-stock air traverse at Z=25;
+        # Instance #2 (sec 1) is a CAM pattern duplicate ("Pocket1") at X=[195, 205] outside solid_stock.stl.
+        tp_pattern = {
+            "programName": "PatternSetup",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "params": {"operation-comment": "Pocket1"},
+                    "tool": {"number": 1, "type": 9, "diameter": 6.0},
+                    "events": [
+                        {"type": "onLinear", "sx": -6.0, "sy": -6.0, "sz": 25.0, "x": 6.0, "y": 6.0, "z": 25.0, "feed": 2000.0, "movement": 2},
+                        {"type": "onLinear", "sx": -5.0, "sy": -5.0, "sz": 15.0, "x": 5.0, "y": 5.0, "z": 10.0, "feed": 1000.0, "movement": 13},
+                    ],
+                },
+                {
+                    "id": 1,
+                    "type": 0,
+                    "params": {"operation-comment": "Pocket1"},
+                    "tool": {"number": 1, "type": 9, "diameter": 6.0},
+                    "events": [
+                        {"type": "onLinear", "sx": 195.0, "sy": -5.0, "sz": 15.0, "x": 205.0, "y": 5.0, "z": 10.0, "feed": 1000.0, "movement": 13},
+                    ],
+                },
+            ],
+        }
+        p_pat = os.path.join(self.tmp_dir, "pattern_pass.json")
+        with open(p_pat, "w", encoding="utf-8") as f:
+            json.dump(tp_pattern, f)
+
+        with patch.object(orchestrator, "replay_combined_context", return_value="G0 X6 Y6\n"):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[p_pat],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=True,
+            )
+        # Instance #1's verified air link in sec 0 may be promoted, whereas Instance #2 (sec 1) MUST NEVER be promoted!
+        self.assertIn((0, 0), rep.promoted_events)
+        self.assertFalse(any(sec_i == 1 for sec_i, _ in rep.promoted_events))
+
+        # By contrast, an unrelated out-of-bounds operation ("OtherMisalignedOp") MUST fail H4!
+        tp_non_pattern = json.loads(json.dumps(tp_pattern))
+        tp_non_pattern["sections"][1]["params"]["operation-comment"] = "OtherMisalignedOp"
+        p_non_pat = os.path.join(self.tmp_dir, "non_pattern_fail.json")
+        with open(p_non_pat, "w", encoding="utf-8") as f:
+            json.dump(tp_non_pattern, f)
+
+        with self.assertRaises(ValueError) as cm_np:
+            orchestrator.run(
+                context_dump_paths=[p_non_pat],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=True,
+            )
+        self.assertIn("insufficient volume overlap", str(cm_np.exception))
+
+    def test_h4_turning_link_retract_passes_and_shifted_straddle_fails(self):
+        """H4: Turning keeps MOVEMENT_CUTTING==2 cuts, ignores MOVEMENT_LINK_TRANSITION==4 retracts, and rejects shifted cuts."""
+        from pipeline import PipelineOrchestrator
+
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_turn_h4_fix.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_TURNING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_turn_h4_fix.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X20 Z25\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+        mock_tool = MagicMock()
+
+        # Stock Z=[0, 20]: cutting (MOVEMENT_CUTTING=2) at Z=[2, 18] with a MOVEMENT_LINK_TRANSITION=4 safe-Z retract to Z=60 passes
+        tp_turn_ok = {
+            "programName": "TurnSafeZPass",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 1,
+                    "tool": {"_isTurningTool": True, "type": 1},
+                    "events": [
+                        {"type": "onLinear", "sx": 8.0, "sy": 0.0, "sz": 18.0, "x": 8.0, "y": 0.0, "z": 2.0, "feed": 100.0, "movement": 2},
+                        {"type": "onLinear", "sx": 8.0, "sy": 0.0, "sz": 2.0, "x": 25.0, "y": 0.0, "z": 60.0, "feed": 1000.0, "movement": 4},
+                    ],
+                }
+            ],
+        }
+        p_ok = os.path.join(self.tmp_dir, "turn_safez_ok.json")
+        with open(p_ok, "w", encoding="utf-8") as f:
+            json.dump(tp_turn_ok, f)
+
+        with patch.object(orchestrator, "replay_combined_context", return_value="G1 Z2\n"), \
+             patch("pipeline.extract_tools_from_context", return_value={"0": mock_tool}):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[p_ok],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+                is_turning=True,
+            )
+        self.assertIsNotNone(rep.stock_bounding_box)
+
+        # Shifted turning cut at Z=[-30, -10] with MOVEMENT_LINK_TRANSITION=4 safe-Z retract to Z=+35 MUST fail!
+        tp_turn_bad = {
+            "programName": "TurnShiftedStraddleFail",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 1,
+                    "tool": {"_isTurningTool": True, "type": 1},
+                    "events": [
+                        {"type": "onLinear", "sx": 8.0, "sy": 0.0, "sz": -10.0, "x": 8.0, "y": 0.0, "z": -30.0, "feed": 100.0, "movement": 2},
+                        {"type": "onLinear", "sx": 8.0, "sy": 0.0, "sz": -30.0, "x": 25.0, "y": 0.0, "z": 35.0, "feed": 1000.0, "movement": 4},
+                    ],
+                }
+            ],
+        }
+        p_bad = os.path.join(self.tmp_dir, "turn_safez_bad.json")
+        with open(p_bad, "w", encoding="utf-8") as f:
+            json.dump(tp_turn_bad, f)
+
+        with patch("pipeline.extract_tools_from_context", return_value={"0": mock_tool}):
+            with self.assertRaises(ValueError) as cm_tbad:
+                orchestrator.run(
+                    context_dump_paths=[p_bad],
+                    base_post_path=dummy_cps,
+                    bootstrap_cnc_path=dummy_cnc,
+                    promote=False,
+                    is_turning=True,
+                )
+        self.assertIn("insufficient overlap", str(cm_tbad.exception))
+
+        # Shifted +Z MOVEMENT_CUTTING=2 pass (Z=19.5 -> 45.0) after a short lead-in at Z=19.5..20.0 MUST also fail!
+        tp_turn_mov2_shift = {
+            "programName": "TurnMov2PlusZFail",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 1,
+                    "tool": {"_isTurningTool": True, "type": 1},
+                    "events": [
+                        {"type": "onLinear", "sx": 8.0, "sy": 0.0, "sz": 20.0, "x": 8.0, "y": 0.0, "z": 19.5, "feed": 100.0, "movement": 1},
+                        {"type": "onLinear", "sx": 8.0, "sy": 0.0, "sz": 19.5, "x": 8.0, "y": 0.0, "z": 45.0, "feed": 200.0, "movement": 2},
+                    ],
+                }
+            ],
+        }
+        p_m2_bad = os.path.join(self.tmp_dir, "turn_mov2_bad.json")
+        with open(p_m2_bad, "w", encoding="utf-8") as f:
+            json.dump(tp_turn_mov2_shift, f)
+
+        with patch("pipeline.extract_tools_from_context", return_value={"0": mock_tool}):
+            with self.assertRaises(ValueError) as cm_tm2:
+                orchestrator.run(
+                    context_dump_paths=[p_m2_bad],
+                    base_post_path=dummy_cps,
+                    bootstrap_cnc_path=dummy_cnc,
+                    promote=False,
+                    is_turning=True,
+                )
+        self.assertIn("insufficient overlap", str(cm_tm2.exception))
+
+    def test_h4_movement2_cutting_with_helical_leadin_passes_and_sloped_shift_fails(self):
+        """H4: MOVEMENT_CUTTING==2 horizontal finishing with above-stock MOVEMENT_LEAD_IN==1 ramp passes."""
+        from pipeline import PipelineOrchestrator
+
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_mov2_mill.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_mov2_mill.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z30\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+
+        # Stock is [-10, 10] x [-10, 10] x [0, 20]. Helical lead-in (movement=1) starts at Z=28 -> Z=18,
+        # followed by horizontal finishing cuts (movement=2 == MOVEMENT_CUTTING) at Z=18.
+        tp_mov2_ok = {
+            "programName": "PillCrusherHorizFinish",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "params": {"operation-comment": "Horizontal Top finish"},
+                    "tool": {"number": 1, "type": 9, "diameter": 6.0},
+                    "events": [
+                        {
+                            "type": "onLinear",
+                            "sx": -4.0, "sy": -4.0, "sz": 28.0,
+                            "x": -3.0, "y": -3.0, "z": 18.0,
+                            "feed": 600.0,
+                            "movement": 1,
+                        },
+                        {
+                            "type": "onLinear",
+                            "sx": -3.0, "sy": -3.0, "sz": 18.0,
+                            "x": 5.0, "y": 5.0, "z": 18.0,
+                            "feed": 1200.0,
+                            "movement": 2,
+                        },
+                    ],
+                }
+            ],
+        }
+        p_mov2_ok = os.path.join(self.tmp_dir, "mov2_horiz_ok.json")
+        with open(p_mov2_ok, "w", encoding="utf-8") as f:
+            json.dump(tp_mov2_ok, f)
+
+        with patch.object(orchestrator, "replay_combined_context", return_value="G1 X5 Y5\n"):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[p_mov2_ok],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIsNotNone(rep.stock_bounding_box)
+
+        # A +Z WCS shift where a sloped movement=2 cut runs Z=19.5 -> Z=35.0 MUST still fail!
+        tp_mov2_shift = {
+            "programName": "Mov2PlusZShift",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "tool": {"number": 1, "type": 9, "diameter": 6.0},
+                    "events": [
+                        {
+                            "type": "onLinear",
+                            "sx": -5.0, "sy": -5.0, "sz": 19.5,
+                            "x": 5.0, "y": 5.0, "z": 35.0,
+                            "feed": 1200.0,
+                            "movement": 2,
+                        },
+                    ],
+                }
+            ],
+        }
+        p_mov2_shift = os.path.join(self.tmp_dir, "mov2_plusz_shift.json")
+        with open(p_mov2_shift, "w", encoding="utf-8") as f:
+            json.dump(tp_mov2_shift, f)
+
+        with self.assertRaises(ValueError) as cm_m2:
+            orchestrator.run(
+                context_dump_paths=[p_mov2_shift],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIn("insufficient volume overlap", str(cm_m2.exception))
+
+    def test_h4_spoilboard_breakthrough_passes_with_matching_workpiece_hint_and_rejects_mismatch(self):
+        """H4: Spoilboard dowel breakthrough passes when workpieceHint confirms WCS, rejects when mismatched/absent."""
+        from pipeline import PipelineOrchestrator
+
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_spoilboard.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_spoilboard.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z30\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+
+        # Stock is [-10, 10] x [-10, 10] x [0, 20]; dowel boring starts inside pocket floor at Z=2.0
+        # and penetrates 12 mm into spoilboard bed (Z=-12.0), so raw Z overlap is 2/14 = 14.3% < 50%.
+        tp_spoil_ok = {
+            "programName": "DowelHolesInBed",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "workpieceHint": {
+                "lower": {"x": -10.0, "y": -10.0, "z": 0.0},
+                "upper": {"x": 10.0, "y": 10.0, "z": 20.0},
+            },
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "params": {"operation-comment": "HolesInBed"},
+                    "tool": {"number": 1, "type": 9, "diameter": 6.0},
+                    "events": [
+                        {
+                            "type": "onLinear",
+                            "sx": -3.0, "sy": -3.0, "sz": 2.0,
+                            "x": 3.0, "y": 3.0, "z": -12.0,
+                            "feed": 800.0,
+                            "movement": 6,
+                        },
+                    ],
+                }
+            ],
+        }
+        p_spoil_ok = os.path.join(self.tmp_dir, "spoil_ok.json")
+        with open(p_spoil_ok, "w", encoding="utf-8") as f:
+            json.dump(tp_spoil_ok, f)
+
+        with patch.object(orchestrator, "replay_combined_context", return_value="G1 Z-12\n"):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[p_spoil_ok],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIsNotNone(rep.stock_bounding_box)
+
+        # Without workpieceHint, or when workpieceHint disagrees with a WCS-shifted STL, H4 MUST reject!
+        tp_no_hint = json.loads(json.dumps(tp_spoil_ok))
+        del tp_no_hint["workpieceHint"]
+        p_no_hint = os.path.join(self.tmp_dir, "spoil_no_hint.json")
+        with open(p_no_hint, "w", encoding="utf-8") as f:
+            json.dump(tp_no_hint, f)
+
+        with self.assertRaises(ValueError) as cm_nh:
+            orchestrator.run(
+                context_dump_paths=[p_no_hint],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIn("insufficient volume overlap", str(cm_nh.exception))
+
+        tp_bad_hint = json.loads(json.dumps(tp_spoil_ok))
+        tp_bad_hint["workpieceHint"] = {
+            "lower": {"x": -10.0, "y": -10.0, "z": -15.0},
+            "upper": {"x": 10.0, "y": 10.0, "z": 5.0},
+        }
+        p_bad_hint = os.path.join(self.tmp_dir, "spoil_bad_hint.json")
+        with open(p_bad_hint, "w", encoding="utf-8") as f:
+            json.dump(tp_bad_hint, f)
+
+        with self.assertRaises(ValueError) as cm_bh:
+            orchestrator.run(
+                context_dump_paths=[p_bad_hint],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIn("insufficient volume overlap", str(cm_bh.exception))
+
+    def test_h4_face_on_stock_top_with_circular_zx_lead_in_and_out_passes(self):
+        """H4: Facing on Z == st_max_z with ZX circular lead-in (movement=1) and lead-out (movement=3) arcs passes."""
+        from pipeline import PipelineOrchestrator
+
+        dummy_cps = os.path.join(self.tmp_dir, "dummy_circ_lead.cps")
+        with open(dummy_cps, "w", encoding="utf-8") as f:
+            f.write('description = "Dummy Post";\ncapabilities = CAPABILITY_MILLING;\n')
+        dummy_cnc = os.path.join(self.tmp_dir, "dummy_circ_lead.cnc")
+        with open(dummy_cnc, "w", encoding="utf-8") as f:
+            f.write("N10 G00 X0 Y0 Z30\n")
+
+        orchestrator = PipelineOrchestrator(dumper_cps="universal_dumper.cps", replayer_cps="universal_replayer.cps")
+
+        # Stock is [-10, 10] x [-10, 10] x [0, 20]; ZX circular lead-in (Z=20.32 -> 20.0, movement=1),
+        # finish face cut at Z=20.0 (movement=14), ZX circular lead-out (Z=20.0 -> 20.32, movement=3).
+        tp_circ_face = {
+            "programName": "PinsProjectFace",
+            "stockMode": "previous-setup",
+            "stockPath": self.bin_stl,
+            "unit": 1,
+            "sections": [
+                {
+                    "id": 0,
+                    "type": 0,
+                    "params": {"operation-comment": "Face1", "operation:retractHeight_value": 25.0},
+                    "tool": {"number": 12, "type": 9, "diameter": 3.175},
+                    "events": [
+                        {
+                            "type": "onLinear",
+                            "sx": 4.2, "sy": -4.6, "sz": 25.0,
+                            "x": 4.2, "y": -4.6, "z": 20.32,
+                            "feed": 76.2,
+                            "movement": 10,
+                        },
+                        {
+                            "type": "onCircular",
+                            "cw": 0,
+                            "plane": 1,
+                            "sx": 4.2, "sy": -4.6, "sz": 20.32,
+                            "x": 3.88, "y": -4.6, "z": 20.0,
+                            "cx": 3.88, "cy": -4.6, "cz": 20.32,
+                            "radius": 0.32,
+                            "sweep": 1.5707963,
+                            "feed": 579.0,
+                            "movement": 1,
+                        },
+                        {
+                            "type": "onLinear",
+                            "sx": 3.88, "sy": -4.6, "sz": 20.0,
+                            "x": -3.88, "y": -4.6, "z": 20.0,
+                            "feed": 579.0,
+                            "movement": 14,
+                        },
+                        {
+                            "type": "onCircular",
+                            "cw": 0,
+                            "plane": 1,
+                            "sx": -3.88, "sy": -4.6, "sz": 20.0,
+                            "x": -4.2, "y": -4.6, "z": 20.32,
+                            "cx": -3.88, "cy": -4.6, "cz": 20.32,
+                            "radius": 0.32,
+                            "sweep": 1.5707963,
+                            "feed": 579.0,
+                            "movement": 3,
+                        },
+                    ],
+                }
+            ],
+        }
+        p_cf = os.path.join(self.tmp_dir, "circ_face_ok.json")
+        with open(p_cf, "w", encoding="utf-8") as f:
+            json.dump(tp_circ_face, f)
+
+        with patch.object(orchestrator, "replay_combined_context", return_value="G1 X-3.88\n"):
+            rep, _ = orchestrator.run(
+                context_dump_paths=[p_cf],
+                base_post_path=dummy_cps,
+                bootstrap_cnc_path=dummy_cnc,
+                promote=False,
+            )
+        self.assertIsNotNone(rep.stock_bounding_box)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ unsuppressed CAM Setup into a self-contained offline fixture bundle under
 
 from __future__ import annotations
 
+import argparse
 import datetime
 import json
 import os
@@ -245,6 +246,114 @@ def _serialize_workpiece(wp: Any, kind: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _is_stale_or_temp_path(path_val: Any, temp_root: Optional[str]) -> bool:
+    if not path_val:
+        return False
+    p_str = str(path_val)
+    if not os.path.isfile(p_str):
+        return True
+    if temp_root:
+        abs_tmp = os.path.abspath(temp_root)
+        abs_p = os.path.abspath(p_str)
+        if abs_p == abs_tmp or abs_p.startswith(abs_tmp + os.sep):
+            return True
+    return False
+
+
+def _rewrite_dump_stock_paths(
+    dump_data: Dict[str, Any],
+    rel_stock_path: Optional[str],
+    json_path: str,
+    temp_root: Optional[str] = None,
+) -> None:
+    """Persist relative STL references or remove stale/temp `stockPath` entries from a dump JSON."""
+    changed = False
+    if rel_stock_path:
+        if dump_data.get("stockPath") != rel_stock_path:
+            dump_data["stockPath"] = rel_stock_path
+            changed = True
+        se = dump_data.get("stockExport")
+        if isinstance(se, dict) and se.get("destPath") != rel_stock_path:
+            se["destPath"] = rel_stock_path
+            changed = True
+    else:
+        if _is_stale_or_temp_path(dump_data.get("stockPath"), temp_root):
+            dump_data.pop("stockPath", None)
+            changed = True
+        se = dump_data.get("stockExport")
+        if isinstance(se, dict) and _is_stale_or_temp_path(se.get("destPath"), temp_root):
+            se.pop("destPath", None)
+            changed = True
+    if changed:
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(dump_data, jf)
+
+
+def _workpiece_dict_from_stl(
+    stl_path: str,
+    is_turning: bool,
+    is_inch: bool,
+    fixtures: Optional[List[Any]] = None,
+    kind_override: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build and serialize a metric `workpiece_mm` dictionary from an STL mesh file."""
+    from geometry.solid_mesh import extract_workpiece_from_stl
+
+    wp = extract_workpiece_from_stl(
+        stl_path,
+        is_turning=is_turning,
+        is_inch=is_inch,
+        fixtures=fixtures,
+    )
+    kind = kind_override or ("turning" if is_turning else "box")
+    return _serialize_workpiece(wp, kind=kind)
+
+
+def _build_setup_manifest(
+    *,
+    project_name: str,
+    doc_name: str,
+    setup_name: str,
+    setup_index: int,
+    is_turning: bool,
+    stock_mode: str,
+    unit: Any,
+    stock_unit: Any,
+    configured_post: Optional[str],
+    post_props: Dict[str, Any],
+    cnc_batches: List[str],
+    json_batches: List[str],
+    prev_stock_rel: Optional[str],
+    prev_stock_is_inch: bool,
+    solid_stock_rel: Optional[str],
+    workpiece_mm_dict: Optional[Dict[str, Any]],
+    wcs_dict: Optional[Dict[str, List[float]]],
+) -> Dict[str, Any]:
+    """Build a canonical schema v1 `setup_manifest.json` dictionary."""
+    return {
+        "schema_version": 1,
+        "harvested_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "project_name": project_name,
+        "document_name": doc_name,
+        "setup_name": setup_name,
+        "setup_index": setup_index,
+        "is_turning": bool(is_turning),
+        "stock_mode": stock_mode,
+        "unit": unit,
+        "stock_unit": stock_unit,
+        "configured_post": configured_post,
+        "post_properties": post_props,
+        "cnc_batches": cnc_batches,
+        "json_batches": json_batches,
+        "prev_stock_stl": prev_stock_rel,
+        "prev_stock_is_inch": bool(prev_stock_is_inch),
+        "solid_stock_stl": solid_stock_rel,
+        "post_setup_ipw_stl": None,
+        "workpiece_mm": workpiece_mm_dict,
+        "wcs": wcs_dict,
+    }
+
+
 def _get_op_tool_number(op: Any) -> int:
     try:
         tool = getattr(op, "tool", None)
@@ -258,6 +367,52 @@ def _get_op_tool_number(op: Any) -> int:
     return 0
 
 
+def _is_supported_setup_type(setup: Any, adsk_cam: Any = None) -> bool:
+    """Return True only for Milling and Turning setups (skip Jet, Additive, etc.)."""
+    op_type = getattr(setup, "operationType", None)
+    if op_type is None:
+        return True
+    op_enum = getattr(adsk_cam, "OperationTypes", None) if adsk_cam is not None else None
+    mill_val = getattr(op_enum, "MillingOperation", 0) if op_enum is not None else 0
+    turn_val = getattr(op_enum, "TurningOperation", 1) if op_enum is not None else 1
+    return op_type in (mill_val, turn_val)
+
+
+def _get_param_raw_value(params: Any, name: str) -> Any:
+    if params is None or not hasattr(params, "itemByName"):
+        return None
+    try:
+        p = params.itemByName(name)
+        if p is None:
+            return None
+        v_obj = getattr(p, "value", None)
+        return getattr(v_obj, "value", v_obj)
+    except Exception:
+        return None
+
+
+def _is_supported_cutting_op(op: Any) -> bool:
+    """Return False for non-cutting (probing, inspection, jet, or additive) operations."""
+    if getattr(op, "isProbing", False) is True:
+        return False
+    op_params = getattr(op, "parameters", None)
+    for flag_name in (
+        "operation:isProbingStrategy",
+        "isProbingStrategy",
+        "operation:isInspectionStrategy",
+        "isInspectionStrategy",
+        "operation:isJetStrategy",
+        "isJetStrategy",
+        "operation:isAdditiveStrategy",
+        "isAdditiveStrategy",
+    ):
+        if _get_param_raw_value(op_params, flag_name) in (True, 1, "1", "true", "True"):
+            return False
+    tool = getattr(op, "tool", None)
+    tool_params = getattr(tool, "parameters", None) if tool is not None else None
+    return str(_get_param_raw_value(tool_params, "tool_type") or "").strip().lower() != "probe"
+
+
 def _partition_tool_batches(setup: Any, PostClear: Any) -> List[Tuple[int, List[Any]]]:
     cand_list = PostClear._extract_cam_collection(getattr(setup, "allOperations", []))
     active_ops = [
@@ -265,6 +420,7 @@ def _partition_tool_batches(setup: Any, PostClear: Any) -> List[Tuple[int, List[
         if not getattr(op, "isSuppressed", False)
         and getattr(op, "hasToolpath", True)
         and getattr(op, "isToolpathValid", True)
+        and _is_supported_cutting_op(op)
     ]
     batches: List[Tuple[int, List[Any]]] = []
     i = 0
@@ -284,6 +440,68 @@ def _partition_tool_batches(setup: Any, PostClear: Any) -> List[Tuple[int, List[
     return batches
 
 
+def _read_post_failure_hint(b_tmp: str) -> str:
+    try:
+        for fn in sorted(os.listdir(b_tmp)):
+            if fn.lower().endswith(".failed"):
+                with open(os.path.join(b_tmp, fn), "r", encoding="utf-8", errors="replace") as ff:
+                    txt = " ".join(ff.read(600).split())
+                if txt:
+                    return txt
+    except Exception:
+        pass
+    return ""
+
+
+class _SkipSetupCapability(Exception):
+    """Internal signal raised when a setup uses commercial-only multi-axis / 3+2 / mill-turn features."""
+
+
+def _is_personal_use_multiaxis_post_block(hint: str) -> bool:
+    """Return True if a post failure hint reflects Fusion Personal Use blocking 3+2 / multi-axis."""
+    if not hint:
+        return False
+    low = hint.lower()
+    return any(
+        tok in low
+        for tok in (
+            "cannot locate the simple error log generated from the post processing",
+            "tool orientation is not supported",
+            "work plane is tilted",
+            "multi-axis",
+            "multiaxis",
+            "5-axis",
+            "4-axis",
+        )
+    )
+
+
+def _setup_has_unsupported_capability(setup: Any, PostClear: Any, adsk_cam: Any = None) -> Optional[str]:
+    """
+    Return an error reason if `setup` uses an unsupported setup type or any unsuppressed
+    operation uses 3+2 Tool Orientation, 4-axis rotary wrap, simultaneous 5-axis, or mill-turn.
+    """
+    if not _is_supported_setup_type(setup, adsk_cam):
+        return "unsupported setup type"
+    op_enum = getattr(adsk_cam, "OperationTypes", None) if adsk_cam is not None else None
+    turn_val = getattr(op_enum, "TurningOperation", 1) if op_enum is not None else 1
+    op_type = getattr(setup, "operationType", None)
+    is_turning = (op_type in (turn_val, 1)) and not isinstance(op_type, bool)
+
+    check_op_fn = getattr(PostClear, "_CheckOperationCapability", None)
+    if not callable(check_op_fn):
+        return None
+    for op in PostClear._extract_cam_collection(getattr(setup, "allOperations", [])):
+        if getattr(op, "isSuppressed", False):
+            continue
+        if not _is_supported_cutting_op(op):
+            continue
+        err = check_op_fn(op, setup=setup, is_turning=is_turning, check_probing=False)
+        if err:
+            return err
+    return None
+
+
 def harvest_setup(
     doc: Any,
     cam: Any,
@@ -301,171 +519,296 @@ def harvest_setup(
     import adsk.cam
     import adsk.core
 
+    setup_name = getattr(setup, "name", f"Setup_{setup_idx}")
+    if not _is_supported_setup_type(setup, adsk.cam):
+        return {"status": "skipped_capability", "setup_name": setup_name}
+
     PostClear = _get_postclear_module()
+    if _setup_has_unsupported_capability(setup, PostClear, adsk.cam) is not None:
+        return {"status": "skipped_capability", "setup_name": setup_name}
+
     is_turning = (getattr(setup, "operationType", None) == adsk.cam.OperationTypes.TurningOperation)
     stock_mode = PostClear._GetSetupStockMode(setup)
     batches = _partition_tool_batches(setup, PostClear)
     if not batches:
-        return {"status": "no_active_ops", "setup_name": getattr(setup, "name", f"Setup_{setup_idx}")}
+        return {"status": "no_active_ops", "setup_name": setup_name}
 
     prog_obj, dump_post_path, post_props = _find_nc_program_for_setup(cam, setup, is_turning, PostClear)
     configured_post = os.path.basename(dump_post_path) if prog_obj is not None else None
 
     os.makedirs(bundle_dir, exist_ok=True)
-
-    enum_cls = getattr(adsk.cam, "PostOutputUnitOptions", None)
-    mm_opt = getattr(enum_cls, "MillimetersOutput", 2) if enum_cls else 2
-    in_opt = getattr(enum_cls, "InchesOutput", 1) if enum_cls else 1
-    try:
-        doc_settings = PostClear.loadSettings(doc) if hasattr(PostClear, "loadSettings") else {}
-    except Exception:
-        doc_settings = {}
-    units = PostClear._GetNCProgramOutputUnits(prog_obj, docSettings=doc_settings)
-    dumper_unit = 1 if units == mm_opt else (0 if units == in_opt else None)
-    stock_unit = PostClear._GetDocumentStockUnit(doc)
-    is_prev_stock = any(k in stock_mode for k in ("previous", "preceding", "prev", "rest"))
-    is_solid_stock = any(k in stock_mode for k in ("solid", "body"))
-
-    cnc_batches: List[str] = []
-    json_batches: List[str] = []
-    prev_stock_rel: Optional[str] = None
-    prev_stock_is_inch = False
-    first_dump_data: Optional[Dict[str, Any]] = None
-
-    with tempfile.TemporaryDirectory(prefix="pc_harvest_") as tmp_root:
-        for b_idx, (_t_num, op_list) in enumerate(batches):
-            b_tmp = os.path.join(tmp_root, f"b_{b_idx}")
-            os.makedirs(b_tmp, exist_ok=True)
-            num_name = str(1001 + b_idx)
-            target_cnc = os.path.join(bundle_dir, f"batch_{b_idx}.cnc")
-            want_export = bool(is_prev_stock and b_idx == 0)
-
-            cfg_path = PostClear._WriteDumperConfig(
-                base_post_path=dump_post_path,
-                target_cnc_path=target_cnc,
-                post_properties=post_props,
-                target_dir=b_tmp,
-                stock_mode=stock_mode,
-                unit=dumper_unit,
-                stock_unit=stock_unit,
-                set_env=False,
-                export_stock=want_export,
-            )
-
-            dumper_cps = PostClear.constDumperScript
-            if want_export:
-                staged = os.path.join(b_tmp, "universal_dumper_export_stock.cps")
-                shutil.copy2(PostClear.constDumperScript, staged)
-                dumper_cps = staged
-
-            if len(op_list) == 1:
-                target_ops = op_list[0]
-            else:
-                target_ops = adsk.core.ObjectCollection.create()
-                for op in op_list:
-                    target_ops.add(op)
-
-            env_updates = {
-                "BASE_POST": os.path.abspath(dump_post_path),
-                "TARGET_INTERMEDIATE_CNC": os.path.abspath(target_cnc),
-                "DUMPER_CONFIG_PATH": cfg_path,
-            }
-            with PostClear._ScopedEnv(env_updates):
-                post_input = adsk.cam.PostProcessInput.create(num_name, dumper_cps, b_tmp, units)
-                post_input.isOpenInEditor = False
-                cam.postProcess(target_ops, post_input)
-
-            json_cand = os.path.join(b_tmp, f"{num_name}.json")
-            if not os.path.isfile(json_cand):
-                pattern = re.compile(rf"^{re.escape(num_name)}(_\d+)?\.json$")
-                for fn in sorted(os.listdir(b_tmp)):
-                    if pattern.match(fn):
-                        json_cand = os.path.join(b_tmp, fn)
-                        break
-            if not os.path.isfile(json_cand):
-                raise RuntimeError(f"Harvester failed to emit JSON context for batch {b_idx} of '{setup.name}'")
-
-            out_json = os.path.join(bundle_dir, f"batch_{b_idx}.json")
-            shutil.copy2(json_cand, out_json)
-            json_batches.append(f"batch_{b_idx}.json")
-
-            if not os.path.isfile(target_cnc):
-                fallback_cnc = json_cand + ".intermediate.cnc"
-                if os.path.isfile(fallback_cnc):
-                    shutil.copy2(fallback_cnc, target_cnc)
-            if not os.path.isfile(target_cnc):
-                raise RuntimeError(f"Harvester failed to capture .cnc intermediate file for batch {b_idx} of '{setup.name}'")
-            cnc_batches.append(f"batch_{b_idx}.cnc")
-
-            with open(out_json, "r", encoding="utf-8") as jf:
-                dump_data = json.load(jf)
-            if first_dump_data is None:
-                first_dump_data = dump_data
-
-            if want_export:
-                src_stl = None
-                dest_in_dump = (dump_data.get("stockExport") or {}).get("destPath") or dump_data.get("stockPath")
-                if dest_in_dump and os.path.isfile(dest_in_dump):
-                    src_stl = dest_in_dump
-                else:
-                    fallback_stl = os.path.join(b_tmp, f"{num_name}_stock.stl")
-                    if os.path.isfile(fallback_stl):
-                        src_stl = fallback_stl
-                if src_stl and os.path.isfile(src_stl):
-                    out_prev_stl = os.path.join(bundle_dir, "prev_stock.stl")
-                    shutil.copy2(src_stl, out_prev_stl)
-                    prev_stock_rel = "prev_stock.stl"
-                    prev_stock_is_inch = detect_stl_is_inch(out_prev_stl, dump_data)
-
-    solid_stock_rel: Optional[str] = None
-    workpiece_mm_dict: Optional[Dict[str, Any]] = None
-
-    if is_solid_stock:
-        from geometry.solid_mesh import extract_solid_workpiece_from_fusion_setup
-
-        solid_3d_wp = extract_solid_workpiece_from_fusion_setup(setup, is_turning=False)
-        if solid_3d_wp is not None and getattr(solid_3d_wp, "stock", None) is not None:
-            out_solid_stl = os.path.join(bundle_dir, "solid_stock.stl")
-            write_binary_stl(out_solid_stl, solid_3d_wp.stock.vertices, solid_3d_wp.stock.indices)
-            solid_stock_rel = "solid_stock.stl"
-        if is_turning:
-            solid_turn_wp = extract_solid_workpiece_from_fusion_setup(setup, is_turning=True)
-            workpiece_mm_dict = _serialize_workpiece(solid_turn_wp, kind="solid_turning")
-    elif is_turning:
-        turn_wp = PostClear._ExtractWorkpieceFromSetup(setup)
-        workpiece_mm_dict = _serialize_workpiece(turn_wp, kind="turning")
-    elif first_dump_data is not None:
-        from context_parser import extract_workpiece_from_context
-        box_wp = extract_workpiece_from_context(first_dump_data, is_turning=False)
-        workpiece_mm_dict = _serialize_workpiece(box_wp, kind="box")
-
-    wcs_dict = extract_wcs_dict(setup)
-
-    manifest = {
-        "schema_version": 1,
-        "harvested_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "project_name": project_name,
-        "document_name": doc_name,
-        "setup_name": getattr(setup, "name", f"Setup_{setup_idx}"),
-        "setup_index": setup_idx,
-        "is_turning": bool(is_turning),
-        "stock_mode": stock_mode,
-        "unit": first_dump_data.get("unit") if first_dump_data else None,
-        "stock_unit": stock_unit,
-        "configured_post": configured_post,
-        "post_properties": post_props,
-        "cnc_batches": cnc_batches,
-        "json_batches": json_batches,
-        "prev_stock_stl": prev_stock_rel,
-        "prev_stock_is_inch": bool(prev_stock_is_inch),
-        "solid_stock_stl": solid_stock_rel,
-        "post_setup_ipw_stl": None,
-        "workpiece_mm": workpiece_mm_dict,
-        "wcs": wcs_dict,
-    }
     manifest_path = os.path.join(bundle_dir, "setup_manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as mf:
-        json.dump(manifest, mf, indent=2)
+
+    try:
+        enum_cls = getattr(adsk.cam, "PostOutputUnitOptions", None)
+        mm_opt = getattr(enum_cls, "MillimetersOutput", 2) if enum_cls else 2
+        in_opt = getattr(enum_cls, "InchesOutput", 1) if enum_cls else 1
+        try:
+            doc_settings = PostClear.loadSettings(doc) if hasattr(PostClear, "loadSettings") else {}
+        except Exception:
+            doc_settings = {}
+        units = PostClear._GetNCProgramOutputUnits(prog_obj, docSettings=doc_settings)
+        dumper_unit = 1 if units == mm_opt else (0 if units == in_opt else None)
+        stock_unit = PostClear._GetDocumentStockUnit(doc)
+        is_prev_stock = any(k in stock_mode for k in ("previous", "preceding", "prev", "rest"))
+        is_solid_stock = any(k in stock_mode for k in ("solid", "body"))
+
+        cnc_batches: List[str] = []
+        json_batches: List[str] = []
+        prev_stock_rel: Optional[str] = None
+        prev_stock_is_inch = False
+        first_dump_data: Optional[Dict[str, Any]] = None
+
+        with tempfile.TemporaryDirectory(prefix="pc_harvest_") as tmp_root:
+            out_batch_idx = 0
+            last_batch_err: Optional[Exception] = None
+
+            def _attempt_post_ops(
+                sub_ops: List[Any],
+                attempt_tag: str,
+                target_cnc_path: str,
+                want_export_flag: bool,
+                base_post_override: str,
+            ) -> Tuple[Optional[str], str, Optional[Exception]]:
+                b_tmp = os.path.join(tmp_root, f"b_{attempt_tag}")
+                os.makedirs(b_tmp, exist_ok=True)
+                num_name = str(1001 + out_batch_idx)
+                cfg_path = PostClear._WriteDumperConfig(
+                    base_post_path=base_post_override,
+                    target_cnc_path=target_cnc_path,
+                    post_properties=post_props if base_post_override else {},
+                    target_dir=b_tmp,
+                    stock_mode=stock_mode,
+                    unit=dumper_unit,
+                    stock_unit=stock_unit,
+                    set_env=False,
+                    export_stock=want_export_flag,
+                )
+                dumper_cps = PostClear.constDumperScript
+                if want_export_flag:
+                    staged = os.path.join(b_tmp, "universal_dumper_export_stock.cps")
+                    shutil.copy2(PostClear.constDumperScript, staged)
+                    dumper_cps = staged
+
+                if len(sub_ops) == 1:
+                    target_ops = sub_ops[0]
+                else:
+                    target_ops = adsk.core.ObjectCollection.create()
+                    for op in sub_ops:
+                        target_ops.add(op)
+
+                env_updates = {
+                    "BASE_POST": os.path.abspath(base_post_override) if base_post_override else "",
+                    "TARGET_INTERMEDIATE_CNC": os.path.abspath(target_cnc_path),
+                    "DUMPER_CONFIG_PATH": cfg_path,
+                }
+                post_exc: Optional[Exception] = None
+                with PostClear._ScopedEnv(env_updates):
+                    post_input = adsk.cam.PostProcessInput.create(num_name, dumper_cps, b_tmp, units)
+                    post_input.isOpenInEditor = False
+                    try:
+                        cam.postProcess(target_ops, post_input)
+                    except Exception as exc:
+                        post_exc = exc
+
+                json_cand = os.path.join(b_tmp, f"{num_name}.json")
+                if not os.path.isfile(json_cand):
+                    pattern = re.compile(rf"^{re.escape(num_name)}(_\d+)?\.json$")
+                    for fn in sorted(os.listdir(b_tmp)):
+                        if pattern.match(fn):
+                            json_cand = os.path.join(b_tmp, fn)
+                            break
+                if os.path.isfile(json_cand) and os.path.getsize(json_cand) > 0:
+                    return json_cand, b_tmp, None
+                return None, b_tmp, post_exc
+
+            def _run_with_base_fallback(
+                sub_ops: List[Any],
+                attempt_tag: str,
+                target_cnc_path: str,
+                want_export_flag: bool,
+            ) -> Tuple[Optional[str], str, Optional[Exception]]:
+                jc, bt, p_exc = _attempt_post_ops(
+                    sub_ops, attempt_tag, target_cnc_path, want_export_flag, dump_post_path
+                )
+                if jc is not None:
+                    return jc, bt, None
+                if dump_post_path:
+                    jc2, bt2, p_exc2 = _attempt_post_ops(
+                        sub_ops, f"{attempt_tag}_nobase", target_cnc_path, want_export_flag, ""
+                    )
+                    if jc2 is not None:
+                        return jc2, bt2, None
+                    return None, bt, p_exc or p_exc2
+                return None, bt, p_exc
+
+            def _commit_batch(json_cand: str, b_tmp: str, target_cnc: str, want_export: bool) -> None:
+                nonlocal out_batch_idx, prev_stock_rel, prev_stock_is_inch, first_dump_data
+                num_name = str(1001 + out_batch_idx)
+                out_json = os.path.join(bundle_dir, f"batch_{out_batch_idx}.json")
+                shutil.copy2(json_cand, out_json)
+
+                if not os.path.isfile(target_cnc):
+                    fallback_cnc = json_cand + ".intermediate.cnc"
+                    if os.path.isfile(fallback_cnc):
+                        shutil.copy2(fallback_cnc, target_cnc)
+                if not os.path.isfile(target_cnc):
+                    os.remove(out_json)
+                    raise RuntimeError(
+                        f"Harvester failed to capture .cnc intermediate file for batch {out_batch_idx} of '{setup_name}'"
+                    )
+
+                json_batches.append(f"batch_{out_batch_idx}.json")
+                cnc_batches.append(f"batch_{out_batch_idx}.cnc")
+
+                with open(out_json, "r", encoding="utf-8") as jf:
+                    dump_data = json.load(jf)
+
+                from context_parser import check_context_dict_capability
+
+                cap_err = check_context_dict_capability(
+                    dump_data,
+                    setup_name=setup_name,
+                    is_turning=bool(is_turning),
+                    check_probing=False,
+                )
+                if cap_err:
+                    raise _SkipSetupCapability(cap_err)
+
+                if want_export:
+                    src_stl = None
+                    dest_in_dump = (dump_data.get("stockExport") or {}).get("destPath") or dump_data.get("stockPath")
+                    if dest_in_dump and os.path.isfile(dest_in_dump):
+                        src_stl = dest_in_dump
+                    else:
+                        fallback_stl = os.path.join(b_tmp, f"{num_name}_stock.stl")
+                        if os.path.isfile(fallback_stl):
+                            src_stl = fallback_stl
+                    if src_stl and os.path.isfile(src_stl):
+                        out_prev_stl = os.path.join(bundle_dir, "prev_stock.stl")
+                        shutil.copy2(src_stl, out_prev_stl)
+                        prev_stock_rel = "prev_stock.stl"
+                        prev_stock_is_inch = detect_stl_is_inch(out_prev_stl, dump_data)
+                        _rewrite_dump_stock_paths(dump_data, prev_stock_rel, out_json, temp_root=tmp_root)
+                    else:
+                        _rewrite_dump_stock_paths(dump_data, None, out_json, temp_root=tmp_root)
+                else:
+                    _rewrite_dump_stock_paths(dump_data, None, out_json, temp_root=tmp_root)
+
+                if first_dump_data is None:
+                    first_dump_data = dump_data
+                out_batch_idx += 1
+
+            for b_idx, (_t_num, op_list) in enumerate(batches):
+                want_export = bool(is_prev_stock and out_batch_idx == 0)
+                target_cnc = os.path.join(bundle_dir, f"batch_{out_batch_idx}.cnc")
+                json_cand, b_tmp, p_exc = _run_with_base_fallback(
+                    op_list, str(b_idx), target_cnc, want_export
+                )
+                if json_cand is not None:
+                    _commit_batch(json_cand, b_tmp, target_cnc, want_export)
+                    continue
+
+                # If a multi-op tool batch failed, check whether Fusion Personal blocked a 3+2/multi-axis op
+                batch_hint = _read_post_failure_hint(b_tmp) or (str(p_exc) if p_exc is not None else "")
+                if _is_personal_use_multiaxis_post_block(batch_hint):
+                    raise _SkipSetupCapability(batch_hint)
+
+                if len(op_list) > 1:
+                    recovered_any = False
+                    for sub_i, single_op in enumerate(op_list):
+                        sub_want_export = bool(is_prev_stock and out_batch_idx == 0)
+                        sub_cnc = os.path.join(bundle_dir, f"batch_{out_batch_idx}.cnc")
+                        s_jc, s_bt, s_exc = _run_with_base_fallback(
+                            [single_op], f"{b_idx}_s{sub_i}", sub_cnc, sub_want_export
+                        )
+                        if s_jc is not None:
+                            _commit_batch(s_jc, s_bt, sub_cnc, sub_want_export)
+                            recovered_any = True
+                        else:
+                            sub_hint = _read_post_failure_hint(s_bt) or (str(s_exc) if s_exc is not None else "")
+                            if _is_personal_use_multiaxis_post_block(sub_hint):
+                                raise _SkipSetupCapability(sub_hint)
+                            if s_exc is not None:
+                                last_batch_err = s_exc
+                    if recovered_any:
+                        continue
+
+                hint = _read_post_failure_hint(b_tmp)
+                if not hint and p_exc is not None:
+                    hint = str(p_exc)
+                if _is_personal_use_multiaxis_post_block(hint):
+                    raise _SkipSetupCapability(hint)
+                suffix = f" ({hint})" if hint else ""
+                last_batch_err = RuntimeError(
+                    f"Harvester failed to emit JSON context for batch {b_idx} of '{setup_name}'{suffix}"
+                )
+                raise last_batch_err
+
+            if not json_batches and last_batch_err is not None:
+                raise last_batch_err
+
+        solid_stock_rel: Optional[str] = None
+        workpiece_mm_dict: Optional[Dict[str, Any]] = None
+
+        if is_solid_stock:
+            from geometry.solid_mesh import extract_solid_workpiece_from_fusion_setup
+
+            solid_3d_wp = extract_solid_workpiece_from_fusion_setup(setup, is_turning=False)
+            if solid_3d_wp is not None and getattr(solid_3d_wp, "stock", None) is not None:
+                out_solid_stl = os.path.join(bundle_dir, "solid_stock.stl")
+                write_binary_stl(out_solid_stl, solid_3d_wp.stock.vertices, solid_3d_wp.stock.indices)
+                solid_stock_rel = "solid_stock.stl"
+            if is_turning:
+                solid_turn_wp = extract_solid_workpiece_from_fusion_setup(setup, is_turning=True)
+                workpiece_mm_dict = _serialize_workpiece(solid_turn_wp, kind="solid_turning")
+        elif prev_stock_rel:
+            turn_wp = PostClear._ExtractWorkpieceFromSetup(setup) if is_turning else None
+            prev_fixtures = list(getattr(turn_wp, "fixtures", None) or []) if turn_wp else []
+            workpiece_mm_dict = _workpiece_dict_from_stl(
+                os.path.join(bundle_dir, prev_stock_rel),
+                is_turning=is_turning,
+                is_inch=prev_stock_is_inch,
+                fixtures=prev_fixtures,
+            )
+        elif is_turning:
+            turn_wp = PostClear._ExtractWorkpieceFromSetup(setup)
+            workpiece_mm_dict = _serialize_workpiece(turn_wp, kind="turning")
+        elif first_dump_data is not None:
+            from context_parser import extract_workpiece_from_context
+            box_wp = extract_workpiece_from_context(first_dump_data, is_turning=False)
+            workpiece_mm_dict = _serialize_workpiece(box_wp, kind="box")
+
+        wcs_dict = extract_wcs_dict(setup)
+
+        manifest = _build_setup_manifest(
+            project_name=project_name,
+            doc_name=doc_name,
+            setup_name=setup_name,
+            setup_index=setup_idx,
+            is_turning=bool(is_turning),
+            stock_mode=stock_mode,
+            unit=first_dump_data.get("unit") if first_dump_data else None,
+            stock_unit=stock_unit,
+            configured_post=configured_post,
+            post_props=post_props,
+            cnc_batches=cnc_batches,
+            json_batches=json_batches,
+            prev_stock_rel=prev_stock_rel,
+            prev_stock_is_inch=bool(prev_stock_is_inch),
+            solid_stock_rel=solid_stock_rel,
+            workpiece_mm_dict=workpiece_mm_dict,
+            wcs_dict=wcs_dict,
+        )
+        with open(manifest_path, "w", encoding="utf-8") as mf:
+            json.dump(manifest, mf, indent=2)
+    except _SkipSetupCapability:
+        shutil.rmtree(bundle_dir, ignore_errors=True)
+        return {"status": "skipped_capability", "setup_name": setup_name}
+    except Exception:
+        if not os.path.isfile(manifest_path):
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+        raise
 
     # Link previous setup's post-setup IPW when this setup exports PreviousSetupStock in the same WCS
     if (
@@ -513,33 +856,52 @@ def _collect_datafiles_in_folder(folder: Any, project_name: str, folder_rel: str
 
 
 def _ensure_setups_generated(cam: Any, PostClear: Any, progress: Any = None, timeout_sec: float = 180.0) -> bool:
-    """Generate missing/invalid toolpaths on unsuppressed CAM setups with cancel + timeout guards."""
-    needs_gen = False
+    """Generate missing/invalid toolpaths on unsuppressed Milling/Turning setups with cancel + timeout guards."""
+    adsk_cam = sys.modules.get("adsk.cam")
+    adsk_core = sys.modules.get("adsk.core")
+    ops_to_gen: List[Any] = []
     for s in PostClear._extract_cam_collection(getattr(cam, "setups", None)):
         if getattr(s, "isSuppressed", False):
+            continue
+        if _setup_has_unsupported_capability(s, PostClear, adsk_cam) is not None:
             continue
         ops = PostClear._extract_cam_collection(getattr(s, "allOperations", None))
         for op in ops:
             if getattr(op, "isSuppressed", False):
                 continue
+            if not _is_supported_cutting_op(op):
+                continue
             if not getattr(op, "hasToolpath", True) or not getattr(op, "isToolpathValid", True):
-                needs_gen = True
-                break
-        if needs_gen:
-            break
-    if not needs_gen:
+                ops_to_gen.append(op)
+    if not ops_to_gen:
         return True
 
-    future = cam.generateAllToolpaths(False)
-    deadline = time.time() + timeout_sec
-    while not getattr(future, "isGenerationCompleted", True):
-        if time.time() > deadline:
-            return False
-        if progress and getattr(progress, "wasCancelled", False):
-            return False
-        if "adsk" in sys.modules and hasattr(sys.modules["adsk"], "doEvents"):
-            sys.modules["adsk"].doEvents()
-        time.sleep(0.1)
+    try:
+        gen_fn = getattr(cam, "generateToolpath", None)
+        if callable(gen_fn):
+            if len(ops_to_gen) == 1:
+                future = gen_fn(ops_to_gen[0])
+            elif adsk_core is not None and hasattr(adsk_core, "ObjectCollection"):
+                col = adsk_core.ObjectCollection.create()
+                for op in ops_to_gen:
+                    col.add(op)
+                future = gen_fn(col)
+            else:
+                future = cam.generateAllToolpaths(False)
+        else:
+            future = cam.generateAllToolpaths(False)
+
+        deadline = time.time() + timeout_sec
+        while not getattr(future, "isGenerationCompleted", True):
+            if time.time() > deadline:
+                return False
+            if progress and getattr(progress, "wasCancelled", False):
+                return False
+            if "adsk" in sys.modules and hasattr(sys.modules["adsk"], "doEvents"):
+                sys.modules["adsk"].doEvents()
+            time.sleep(0.1)
+    except Exception:
+        return False
     return True
 
 
@@ -575,7 +937,7 @@ def _harvest_document(
     cam = adsk.cam.CAM.cast(cam_prod) if hasattr(adsk.cam.CAM, "cast") else cam_prod
     setups_list = PostClear._extract_cam_collection(getattr(cam, "setups", None)) if cam is not None else []
     if cam is None or not setups_list:
-        return {"status": "no_cam", "setups": []}
+        return {"status": "no_cam", "setups": [], "errors": []}
 
     _ensure_setups_generated(cam, PostClear=PostClear, progress=progress)
 
@@ -585,33 +947,56 @@ def _harvest_document(
         _sanitize_name(doc_name, "Untitled"),
     )
     results: List[Dict[str, Any]] = []
+    setup_errors: List[str] = []
     prev_record: Optional[Dict[str, Any]] = None
 
     for s_idx, setup in enumerate(setups_list):
         if getattr(setup, "isSuppressed", False):
             continue
-        setup_slug = f"{s_idx:02d}_{_sanitize_name(getattr(setup, 'name', f'Setup_{s_idx}'))}"
+        s_name = getattr(setup, "name", f"Setup_{s_idx}")
+        setup_slug = f"{s_idx:02d}_{_sanitize_name(s_name)}"
         bundle_dir = os.path.join(doc_dir, setup_slug)
-        res = harvest_setup(
-            doc=doc,
-            cam=cam,
-            setup=setup,
-            setup_idx=s_idx,
-            bundle_dir=bundle_dir,
-            project_name=project_name,
-            doc_name=doc_name,
-            prev_setup_record=prev_record,
-        )
-        results.append(res)
-        if res.get("status") == "harvested":
-            prev_record = res
-        else:
+        try:
+            res = harvest_setup(
+                doc=doc,
+                cam=cam,
+                setup=setup,
+                setup_idx=s_idx,
+                bundle_dir=bundle_dir,
+                project_name=project_name,
+                doc_name=doc_name,
+                prev_setup_record=prev_record,
+            )
+            results.append(res)
+            if res.get("status") == "harvested":
+                prev_record = res
+            else:
+                prev_record = None
+        except Exception as exc:
             prev_record = None
+            results.append({"status": "failed", "setup_name": s_name, "error": str(exc)})
+            setup_errors.append(f"{doc_name}/{s_name}: {exc}")
 
     harvested_count = sum(1 for r in results if r.get("status") == "harvested")
+    if harvested_count == 0 and os.path.isdir(doc_dir) and not os.listdir(doc_dir):
+        try:
+            os.rmdir(doc_dir)
+        except OSError:
+            pass
+
+    if harvested_count > 0:
+        doc_status = "harvested"
+    elif setup_errors:
+        doc_status = "failed"
+    elif any(r.get("status") == "skipped_capability" for r in results):
+        doc_status = "skipped_capability"
+    else:
+        doc_status = "no_active_ops"
+
     return {
-        "status": "harvested" if harvested_count > 0 else "no_active_ops",
+        "status": doc_status,
         "setups": results,
+        "errors": setup_errors,
     }
 
 
@@ -658,6 +1043,8 @@ def harvest_projects(
         except Exception:
             progress = None
 
+    cached_ok_statuses = ("harvested", "no_cam", "no_active_ops", "skipped_capability")
+
     try:
         scope = str(scope_choice).strip()
         if scope == "1":
@@ -676,9 +1063,12 @@ def harvest_projects(
                     doc.activate()
                     res = _harvest_document(doc, f"open:{doc_name}", "OpenDocs", doc_name, target_corpus, progress)
                     stats["docs_processed"] += 1
-                    if res["status"] == "harvested":
-                        stats["setups_harvested"] += sum(1 for r in res["setups"] if r.get("status") == "harvested")
-                    else:
+                    h_cnt = sum(1 for r in res["setups"] if r.get("status") == "harvested")
+                    stats["setups_harvested"] += h_cnt
+                    if res.get("errors"):
+                        stats["docs_failed"] += 1
+                        stats["errors"].extend(res["errors"])
+                    elif res["status"] != "harvested":
                         stats["docs_no_cam"] += 1
                 except Exception as exc:
                     stats["docs_failed"] += 1
@@ -721,7 +1111,7 @@ def harvest_projects(
                     not force
                     and isinstance(cached, dict)
                     and cached.get("version") == ver
-                    and cached.get("status") in ("harvested", "no_cam", "no_active_ops")
+                    and cached.get("status") in cached_ok_statuses
                 ):
                     stats["docs_skipped_cached"] += 1
                     continue
@@ -747,17 +1137,21 @@ def harvest_projects(
                     stats["docs_processed"] += 1
                     h_cnt = sum(1 for r in res["setups"] if r.get("status") == "harvested")
                     stats["setups_harvested"] += h_cnt
-                    if res["status"] != "harvested":
+                    if res.get("errors"):
+                        stats["docs_failed"] += 1
+                        stats["errors"].extend(f"{proj_name}/{e}" for e in res["errors"])
+                    elif res["status"] != "harvested":
                         stats["docs_no_cam"] += 1
-                    index_data["documents"][df_id] = {
-                        "version": ver,
-                        "project": proj_name,
-                        "name": rel_name,
-                        "status": res["status"],
-                        "harvested_setups": h_cnt,
-                        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    }
-                    _save_index(index_path, index_data)
+                    if not res.get("errors"):
+                        index_data["documents"][df_id] = {
+                            "version": ver,
+                            "project": proj_name,
+                            "name": rel_name,
+                            "status": res["status"],
+                            "harvested_setups": h_cnt,
+                            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        }
+                        _save_index(index_path, index_data)
                 except Exception as exc:
                     stats["docs_failed"] += 1
                     stats["errors"].append(f"{proj_name}/{rel_name}: {exc}")
@@ -801,7 +1195,7 @@ def harvest_projects(
                         not force
                         and isinstance(cached, dict)
                         and cached.get("version") == ver_tag
-                        and cached.get("status") in ("harvested", "no_cam", "no_active_ops")
+                        and cached.get("status") in cached_ok_statuses
                     ):
                         stats["docs_skipped_cached"] += 1
                         continue
@@ -821,16 +1215,20 @@ def harvest_projects(
                         stats["docs_processed"] += 1
                         h_cnt = sum(1 for r in res["setups"] if r.get("status") == "harvested")
                         stats["setups_harvested"] += h_cnt
-                        if res["status"] != "harvested":
+                        if res.get("errors"):
+                            stats["docs_failed"] += 1
+                            stats["errors"].extend(res["errors"])
+                        elif res["status"] != "harvested":
                             stats["docs_no_cam"] += 1
-                        index_data["documents"][doc_key] = {
-                            "version": ver_tag,
-                            "project": "LocalArchives",
-                            "name": rel_f,
-                            "status": res["status"],
-                            "harvested_setups": h_cnt,
-                        }
-                        _save_index(index_path, index_data)
+                        if not res.get("errors"):
+                            index_data["documents"][doc_key] = {
+                                "version": ver_tag,
+                                "project": "LocalArchives",
+                                "name": rel_f,
+                                "status": res["status"],
+                                "harvested_setups": h_cnt,
+                            }
+                            _save_index(index_path, index_data)
                     except Exception as exc:
                         stats["docs_failed"] += 1
                         stats["errors"].append(f"{rel_f}: {exc}")
@@ -897,3 +1295,209 @@ def run(context: Any) -> None:
     except Exception:
         if ui:
             ui.messageBox(f"HarvestCorpus failed:\n{traceback.format_exc()}", "PostClear Corpus Harvester")
+
+
+def _find_sibling_manifest(parent_dir: str) -> Optional[Dict[str, Any]]:
+    """Return the first readable sibling `setup_manifest.json` under `parent_dir`, if any."""
+    if not parent_dir or not os.path.isdir(parent_dir):
+        return None
+    for entry in sorted(os.listdir(parent_dir)):
+        cand = os.path.join(parent_dir, entry, "setup_manifest.json")
+        if os.path.isfile(cand):
+            try:
+                with open(cand, "r", encoding="utf-8") as mf:
+                    data = json.load(mf)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+    return None
+
+
+def _collect_contiguous_batches(dirpath: str, filenames: Sequence[str]) -> Optional[Tuple[List[str], List[str]]]:
+    """Collect matching `batch_0..N-1.{cnc,json}` files from a bundle directory."""
+    cnc_map: Dict[int, str] = {}
+    json_map: Dict[int, str] = {}
+    for fn in filenames:
+        mc = re.match(r"^batch_(\d+)\.cnc$", fn)
+        if mc:
+            cnc_map[int(mc.group(1))] = fn
+            continue
+        mj = re.match(r"^batch_(\d+)\.json$", fn)
+        if mj:
+            json_map[int(mj.group(1))] = fn
+    if not cnc_map or set(cnc_map.keys()) != set(json_map.keys()):
+        return None
+    expected = set(range(len(cnc_map)))
+    if set(cnc_map.keys()) != expected:
+        return None
+    n = len(cnc_map)
+    return [cnc_map[i] for i in range(n)], [json_map[i] for i in range(n)]
+
+
+def recover_incomplete_bundles(corpus_dir: str) -> List[str]:
+    """
+    Synthesize `setup_manifest.json` and sanitize stale temp `stockPath` values
+    for setup bundles that captured `batch_*.cnc` / `batch_*.json` (and optional STLs)
+    but aborted before writing their manifest.
+
+    Returns a sorted list of newly written `setup_manifest.json` paths.
+    """
+    from context_parser import extract_workpiece_from_context
+
+    corpus_abs = os.path.abspath(corpus_dir)
+    if not os.path.isdir(corpus_abs):
+        return []
+
+    recovered: List[str] = []
+    for dirpath, dirs, files in os.walk(corpus_abs):
+        dirs.sort()
+        files.sort()
+        if "setup_manifest.json" in files:
+            continue
+        if "batch_0.cnc" not in files or "batch_0.json" not in files:
+            continue
+
+        batch_pair = _collect_contiguous_batches(dirpath, files)
+        if batch_pair is None:
+            continue
+        cnc_batches, json_batches = batch_pair
+
+        sibling_manifest = _find_sibling_manifest(os.path.dirname(dirpath))
+        rel_parts = os.path.relpath(dirpath, corpus_abs).split(os.sep)
+        fallback_proj = rel_parts[0] if len(rel_parts) >= 3 else "Recovered"
+        fallback_doc = (
+            "/".join(rel_parts[1:-1])
+            if len(rel_parts) >= 3
+            else (rel_parts[0] if len(rel_parts) == 2 else "Untitled")
+        )
+        project_name = str((sibling_manifest or {}).get("project_name") or fallback_proj)
+        doc_name = str((sibling_manifest or {}).get("document_name") or fallback_doc)
+
+        setup_slug = os.path.basename(dirpath)
+        slug_match = re.match(r"^(\d+)_(.+)$", setup_slug)
+        if slug_match:
+            setup_index = int(slug_match.group(1))
+            setup_name = slug_match.group(2)
+        else:
+            setup_index = 0
+            setup_name = setup_slug
+
+        all_dumps: List[Dict[str, Any]] = []
+        for jb in json_batches:
+            with open(os.path.join(dirpath, jb), "r", encoding="utf-8") as jf:
+                all_dumps.append(json.load(jf))
+        first_dump_data = all_dumps[0]
+
+        is_turning = any(
+            sec.get("type") == 1 or bool((sec.get("tool") or {}).get("_isTurningTool", False))
+            for dump in all_dumps
+            for sec in (dump.get("sections") or [])
+        )
+        from context_parser import check_context_dict_capability
+
+        if any(
+            check_context_dict_capability(
+                dump,
+                setup_name=setup_name,
+                is_turning=is_turning,
+                check_probing=False,
+            )
+            for dump in all_dumps
+        ):
+            continue
+        unit = first_dump_data.get("unit")
+        stock_unit = first_dump_data.get("stockUnit")
+        post_props = dict(first_dump_data.get("postProperties") or {})
+
+        if "SB3v36" in post_props:
+            configured_post: Optional[str] = "shopbot.cps"
+        elif "smartCoolEquipped" in post_props or "useG64" in post_props:
+            configured_post = "tormach.cps"
+        elif sibling_manifest and sibling_manifest.get("configured_post"):
+            configured_post = str(sibling_manifest["configured_post"])
+        else:
+            configured_post = "centroid_turning.cps" if is_turning else "grbl.cps"
+
+        batch0_path = os.path.join(dirpath, json_batches[0])
+        prev_stl_abs = os.path.join(dirpath, "prev_stock.stl")
+        if os.path.isfile(prev_stl_abs):
+            prev_stock_rel: Optional[str] = "prev_stock.stl"
+            prev_stock_is_inch = detect_stl_is_inch(prev_stl_abs, first_dump_data)
+            _rewrite_dump_stock_paths(first_dump_data, prev_stock_rel, batch0_path)
+        else:
+            prev_stock_rel = None
+            prev_stock_is_inch = False
+            _rewrite_dump_stock_paths(first_dump_data, None, batch0_path)
+
+        solid_stl_abs = os.path.join(dirpath, "solid_stock.stl")
+        solid_stock_rel: Optional[str] = "solid_stock.stl" if os.path.isfile(solid_stl_abs) else None
+        stock_mode = str(
+            first_dump_data.get("stockMode")
+            or ("previous-setup" if prev_stock_rel else ("solid" if solid_stock_rel else "default"))
+        )
+
+        if prev_stock_rel:
+            workpiece_mm_dict = _workpiece_dict_from_stl(
+                prev_stl_abs,
+                is_turning=is_turning,
+                is_inch=prev_stock_is_inch,
+            )
+        elif solid_stock_rel:
+            workpiece_mm_dict = _workpiece_dict_from_stl(
+                solid_stl_abs,
+                is_turning=is_turning,
+                is_inch=False,
+                kind_override="solid_turning" if is_turning else "box",
+            )
+        else:
+            wp = extract_workpiece_from_context(first_dump_data, is_turning=is_turning)
+            workpiece_mm_dict = _serialize_workpiece(wp, kind="turning" if is_turning else "box")
+
+        manifest = _build_setup_manifest(
+            project_name=project_name,
+            doc_name=doc_name,
+            setup_name=setup_name,
+            setup_index=setup_index,
+            is_turning=is_turning,
+            stock_mode=stock_mode,
+            unit=unit,
+            stock_unit=stock_unit,
+            configured_post=configured_post,
+            post_props=post_props,
+            cnc_batches=cnc_batches,
+            json_batches=json_batches,
+            prev_stock_rel=prev_stock_rel,
+            prev_stock_is_inch=prev_stock_is_inch,
+            solid_stock_rel=solid_stock_rel,
+            workpiece_mm_dict=workpiece_mm_dict,
+            wcs_dict=None,
+        )
+        manifest_path = os.path.join(dirpath, "setup_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as mf:
+            json.dump(manifest, mf, indent=2)
+        recovered.append(manifest_path)
+
+    return recovered
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="PostClear Corpus Harvester utilities")
+    parser.add_argument(
+        "--recover",
+        metavar="CORPUS_DIR",
+        help="Recover incomplete corpus bundles missing setup_manifest.json",
+    )
+    args = parser.parse_args(argv)
+    if args.recover:
+        manifests = recover_incomplete_bundles(args.recover)
+        print(f"Recovered {len(manifests)} setup manifest(s):")
+        for mp in manifests:
+            print(f"  - {mp}")
+        return 0
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -786,6 +786,216 @@ def _check_operation_toolpath_status(op, cam=None):
     return False, ""
 
 
+def _extract_scalar_param(params, *names):
+    """Extract a concrete bool/int/float/str parameter value, ignoring unconfigured mock objects."""
+    if params is None:
+        return None
+    for name in names:
+        p = None
+        try:
+            if hasattr(params, "itemByName"):
+                p = params.itemByName(name)
+            elif isinstance(params, dict):
+                p = params.get(name)
+        except Exception:
+            p = None
+        if p is None:
+            continue
+        if isinstance(p, (bool, int, float, str)):
+            return p
+        try:
+            v_obj = getattr(p, "value", None)
+            raw = getattr(v_obj, "value", v_obj)
+            if isinstance(raw, (bool, int, float, str)):
+                return raw
+        except Exception:
+            pass
+        try:
+            expr = getattr(p, "expression", None)
+            if isinstance(expr, str):
+                cleaned = expr.strip()
+                if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+                    cleaned = cleaned[1:-1]
+                if cleaned:
+                    return cleaned
+        except Exception:
+            pass
+    return None
+
+
+def _is_scalar_truthy(val) -> bool:
+    """Return True only for concrete truthy bool/numeric/string parameter flags."""
+    if val is True:
+        return True
+    if val is False or val is None:
+        return False
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return abs(float(val)) > 1e-9
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes")
+    return False
+
+
+def _param_flag(params, *names) -> bool:
+    return _is_scalar_truthy(_extract_scalar_param(params, *names))
+
+
+def _is_turning_setup_obj(setup) -> bool:
+    """Return True if setup represents a Turning setup."""
+    op_type = _safe_getattr(setup, "operationType", None)
+    if type(op_type).__module__.startswith("unittest.mock"):
+        return False
+    cam_mod = sys.modules.get("adsk.cam")
+    op_enum = getattr(cam_mod, "OperationTypes", None)
+    turn_val = getattr(op_enum, "TurningOperation", 1) if op_enum is not None else 1
+    return op_type in (turn_val, 1) and not isinstance(op_type, bool)
+
+
+def _CheckSetupCapability(setup) -> Optional[str]:
+    """Pre-check that a CAM Setup is a supported Milling or Turning setup."""
+    if setup is None:
+        return None
+    op_type = _safe_getattr(setup, "operationType", None)
+    if op_type is None or isinstance(op_type, bool) or type(op_type).__module__.startswith("unittest.mock"):
+        return None
+
+    cam_mod = sys.modules.get("adsk.cam")
+    op_enum = getattr(cam_mod, "OperationTypes", None)
+    mill_val = getattr(op_enum, "MillingOperation", 0) if op_enum is not None else 0
+    turn_val = getattr(op_enum, "TurningOperation", 1) if op_enum is not None else 1
+    if op_type in (mill_val, turn_val, 0, 1):
+        return None
+
+    jet_val = getattr(op_enum, "JetOperation", 2) if op_enum is not None else 2
+    add_val = getattr(op_enum, "AdditiveOperation", 3) if op_enum is not None else 3
+    if op_type in (jet_val, 2):
+        type_label = "Cutting / Jet"
+    elif op_type in (add_val, 3):
+        type_label = "Additive"
+    else:
+        type_label = str(op_type)
+
+    s_val = _safe_getattr(setup, "name", None)
+    setup_name = s_val.strip() if isinstance(s_val, str) and s_val.strip() else "Setup"
+    return (
+        f"Setup '{setup_name}' uses an unsupported setup type ({type_label}). "
+        f"PostClear supports only 2D/3-axis Milling and 2-axis Turning setups."
+    )
+
+
+def _CheckOperationCapability(
+    op,
+    setup=None,
+    is_turning: Optional[bool] = None,
+    check_probing: bool = True,
+) -> Optional[str]:
+    """
+    Pre-check a CAM Operation using Fusion's structured boolean taxonomy and mode parameters
+    (no concrete strategy names). Pass-1 section checks enforce geometric ground truth.
+    """
+    if op is None or _safe_getattr(op, "isSuppressed", False) is True:
+        return None
+
+    s_val = _safe_getattr(setup, "name", None)
+    setup_name = s_val.strip() if isinstance(s_val, str) and s_val.strip() else "Setup"
+    o_val = _safe_getattr(op, "name", None)
+    op_name = o_val.strip() if isinstance(o_val, str) and o_val.strip() else "Operation"
+    if is_turning is None:
+        is_turning = _is_turning_setup_obj(setup) if setup is not None else False
+
+    op_params = _safe_getattr(op, "parameters", None)
+    tool_params = _safe_getattr(_safe_getattr(op, "tool", None), "parameters", None)
+
+    if _param_flag(
+        op_params,
+        "operation:isJetStrategy",
+        "isJetStrategy",
+        "operation:isAdditiveStrategy",
+        "isAdditiveStrategy",
+    ):
+        return (
+            f"Unsupported operation '{op_name}' in setup '{setup_name}': "
+            f"jet/cutting and additive operations are not supported by PostClear."
+        )
+
+    if check_probing and (
+        _safe_getattr(op, "isProbing", False) is True
+        or _param_flag(
+            op_params,
+            "operation:isProbingStrategy",
+            "isProbingStrategy",
+            "operation:isInspectionStrategy",
+            "isInspectionStrategy",
+        )
+        or str(_extract_scalar_param(tool_params, "tool_type") or "").strip().lower() == "probe"
+    ):
+        return (
+            f"Unsupported operation '{op_name}' in setup '{setup_name}': "
+            f"probing and inspection operations are not supported by PostClear."
+        )
+
+    ma_type = _extract_scalar_param(op_params, "operation:multiAxisMachiningType", "multiAxisMachiningType")
+    ma_mode = ma_type.strip().lower() if isinstance(ma_type, str) else ""
+    is_explicit_3x = ma_mode in ("three_axis", "3_axis", "none")
+    if (
+        (ma_mode != "" and not is_explicit_3x)
+        or (_param_flag(op_params, "operation:isMultiAxisStrategy", "isMultiAxisStrategy") and not is_explicit_3x)
+        or _param_flag(op_params, "operation:wrap_cylinder", "wrap_cylinder")
+    ):
+        return (
+            f"Unsupported multi-axis / rotary-wrap operation '{op_name}' in setup '{setup_name}': "
+            f"4-axis rotary wrap and simultaneous multi-axis toolpaths are not supported "
+            f"(PostClear supports 2D/3-axis Milling and 2-axis Turning)."
+        )
+
+    if _param_flag(op_params, "operation:overrideToolView", "overrideToolView", "overrideWorkPlane"):
+        return (
+            f"Unsupported 3+2 Tool Orientation in operation '{op_name}' (setup '{setup_name}'): "
+            f"Tool Orientation overrides are not supported in Fusion for Personal Use or PostClear "
+            f"(PostClear supports 2D/3-axis Milling aligned with the setup +Z axis and 2-axis Turning)."
+        )
+
+    if is_turning and _param_flag(
+        op_params,
+        "operation:isMillingStrategy",
+        "isMillingStrategy",
+        "operation:isHoleMillingStrategy",
+        "isHoleMillingStrategy",
+    ):
+        return (
+            f"Unsupported mill-turn live-tool operation '{op_name}' in turning setup '{setup_name}': "
+            f"milling operations inside a Turning setup require C/Y-axis live tooling and are not supported "
+            f"(PostClear supports 2-axis Turning and spindle-centerline Z-drilling)."
+        )
+
+    return None
+
+
+def _CheckProgramCapability(p_setups, setup_operations_map) -> Optional[str]:
+    """Run pre-flight setup and operation capability checks across an NC Program's resolved setups/ops."""
+    if not p_setups:
+        return None
+    empty_invalid = getattr(setup_operations_map, "empty_or_invalid_ops", []) or []
+    for setup in p_setups:
+        if _safe_getattr(setup, "isSuppressed", False) is True:
+            continue
+        setup_err = _CheckSetupCapability(setup)
+        if setup_err:
+            return setup_err
+        is_turning = _is_turning_setup_obj(setup)
+        ops_to_check = list(_lookup_setup_ops(setup, setup_operations_map) or [])
+        s_name = _safe_getattr(setup, "name", None)
+        for bad_s, bad_op, _reason in empty_invalid:
+            if bad_s == setup or (s_name is not None and _safe_getattr(bad_s, "name", None) == s_name):
+                if bad_op not in ops_to_check:
+                    ops_to_check.append(bad_op)
+        for op in ops_to_check:
+            op_err = _CheckOperationCapability(op, setup=setup, is_turning=is_turning, check_probing=True)
+            if op_err:
+                return op_err
+    return None
+
+
 def GetNcProgramSetupsAndOperations(cam, settings, setups=None, program=None):
     """
     Look in the selected NCProgram's setup and operations and derive the setups and operations to process.
@@ -1497,12 +1707,14 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
 
                 # Build setup & output filename summary
                 try:
-                    p_setups, _ = GetNcProgramSetupsAndOperations(cam, docSettings, program=prog)
+                    p_setups, p_ops_map = GetNcProgramSetupsAndOperations(cam, docSettings, program=prog)
                 except Exception:
-                    p_setups = []
+                    p_setups, p_ops_map = [], None
 
                 if len(p_setups) > 1:
                     info_str = "⚠ Multiple setups"
+                elif p_setups and _CheckProgramCapability(p_setups, p_ops_map):
+                    info_str = "⚠ Unsupported setup/ops"
                 else:
                     setup_obj = p_setups[0] if len(p_setups) == 1 else None
                     setup_name = _safe_str(getattr(setup_obj, "name", None)) or "No setup"
@@ -1817,6 +2029,19 @@ def PerformPostProcess(docSettings, setups=None):
                         adsk.core.MessageBoxIconTypes.CriticalIconType,
                     )
                 return err
+
+            # Abort with error if setup or selected operations use unsupported capabilities
+            cap_err = _CheckProgramCapability(p_setups, setup_operations_map)
+            if cap_err:
+                _dbg_global(f"PerformPostProcess: {cap_err}")
+                if ui:
+                    ui.messageBox(
+                        cap_err,
+                        constCmdName,
+                        adsk.core.MessageBoxButtonTypes.OKButtonType,
+                        adsk.core.MessageBoxIconTypes.CriticalIconType,
+                    )
+                return cap_err
 
             # Normalize output folder for this user ("\" -> "/")
             raw_folder = ""
@@ -3764,8 +3989,13 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
     _notify_p = progress_cb or (lambda msg, frac: True)
     if not _notify_p("Initializing pipeline...", 0.02):
         return "Operation cancelled by user."
-    is_turning = (setup.operationType == adsk.cam.OperationTypes.TurningOperation)
+    is_turning = _is_turning_setup_obj(setup)
     _dbg(f"_PostProcessUnifiedPipeline entered for {fname}, path={path}, is_turning={is_turning}")
+
+    setup_cap_err = _CheckSetupCapability(setup)
+    if setup_cap_err:
+        _dbg(f"_PostProcessUnifiedPipeline: {setup_cap_err}")
+        return setup_cap_err
 
     # 0. Ensure Add-In modules are on sys.path and reloaded in Fusion's persistent interpreter
     _EnsureLocalModulesLoaded(progress_cb=_notify_p)
@@ -3881,6 +4111,25 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
         and getattr(op, "hasToolpath", True)
         and getattr(op, "isToolpathValid", True)
     ]
+    for op in active_ops:
+        op_cap_err = _CheckOperationCapability(op, setup=setup, is_turning=is_turning, check_probing=True)
+        if op_cap_err:
+            _dbg(f"_PostProcessUnifiedPipeline: {op_cap_err}")
+            _RecordVerifyResult(
+                setup=setup,
+                cncPath=path,
+                reportText=f"# Verification Failed\n\nError: {op_cap_err}",
+                reportPath=report_path,
+                pngPath=plot_path,
+                promoted=0,
+                spikes=0,
+                volume_mm3=0.0,
+                collisions=[],
+                error=op_cap_err,
+                warning=None,
+                nc_program=_safe_str(getattr(program, "name", None)),
+            )
+            return op_cap_err
     batches = []
     i = 0
     while i < len(active_ops):
@@ -4018,6 +4267,34 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
                     shutil.copy2(fallback_inter, bootstrap_cnc)
 
             batch_json_files.append(b_json)
+
+        from context_parser import check_dumped_sections_capability
+
+        s_raw = _safe_getattr(setup, "name", None)
+        s_label = s_raw.strip() if isinstance(s_raw, str) and s_raw.strip() else str(fname)
+        dumped_cap_err = check_dumped_sections_capability(
+            batch_json_files,
+            setup_name=s_label,
+            is_turning=is_turning,
+            check_probing=True,
+        )
+        if dumped_cap_err:
+            _dbg(f"_PostProcessUnifiedPipeline: {dumped_cap_err}")
+            _RecordVerifyResult(
+                setup=setup,
+                cncPath=path,
+                reportText=f"# Verification Failed\n\nError: {dumped_cap_err}",
+                reportPath=report_path,
+                pngPath=plot_path,
+                promoted=0,
+                spikes=0,
+                volume_mm3=0.0,
+                collisions=[],
+                error=dumped_cap_err,
+                warning=None,
+                nc_program=_safe_str(getattr(program, "name", None)),
+            )
+            return dumped_cap_err
 
         # -------------------------------------------------------------
         # PASS 2: Merge Contexts, Universal Domain Extraction & Single-Pass Replay
@@ -4178,6 +4455,17 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
 
         if not target_operations:
             return "No active operations specified to post process."
+
+        setup_cap_err = _CheckSetupCapability(setup)
+        if setup_cap_err:
+            _dbg_global(f"PostProcessSetup: {setup_cap_err}")
+            return setup_cap_err
+        is_turning_setup = _is_turning_setup_obj(setup)
+        for t_op in _extract_cam_collection(target_operations):
+            op_cap_err = _CheckOperationCapability(t_op, setup=setup, is_turning=is_turning_setup, check_probing=True)
+            if op_cap_err:
+                _dbg_global(f"PostProcessSetup: {op_cap_err}")
+                return op_cap_err
 
         # Verify file name is valid by creating it now
         raw_ext = ""

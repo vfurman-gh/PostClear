@@ -762,6 +762,738 @@ class TestHarvestCorpusFusion(unittest.TestCase):
                 )
             )
 
+    def test_harvest_setup_previous_setup_stock_writes_manifest_after_temp_cleanup(self):
+        sample_cnc = os.path.join(REPO_ROOT, "tests", "fixtures", "milling_drill_test.cnc")
+        verts_in = np.array(
+            [
+                [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.5], [2.0, 0.0, 0.5], [2.0, 1.0, 0.5], [0.0, 1.0, 0.5],
+            ],
+            dtype=np.float32,
+        )
+        idxs = np.array(
+            [
+                [0, 1, 2], [0, 2, 3],
+                [4, 6, 5], [4, 7, 6],
+                [0, 4, 5], [0, 5, 1],
+                [1, 5, 6], [1, 6, 2],
+                [2, 6, 7], [2, 7, 3],
+                [3, 7, 4], [3, 4, 0],
+            ],
+            dtype=np.int32,
+        )
+
+        class _FakeParamVal:
+            def __init__(self, v):
+                self.value = v
+
+        class _FakeParams:
+            def __init__(self, d):
+                self._d = d
+
+            def itemByName(self, k):
+                return _FakeParamVal(_FakeParamVal(self._d[k])) if k in self._d else None
+
+        op = types.SimpleNamespace(
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            operationId=21,
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 1})),
+        )
+        setup = types.SimpleNamespace(
+            name="Flip",
+            isSuppressed=False,
+            operationType=0,  # MillingOperation
+            stockMode=7,      # PreviousSetupStock
+            allOperations=[op],
+            parameters=_FakeParams({}),
+            workCoordinateSystem=None,
+        )
+
+        class _FakeCAM:
+            def __init__(self):
+                self.setups = [setup]
+                self.ncPrograms = []
+
+            def postProcess(self, target_ops, post_input):
+                p_name = post_input.programName
+                temp_stl = os.path.join(post_input.outputFolder, f"{p_name}_stock.stl")
+                harvest_corpus_fusion.write_binary_stl(temp_stl, verts_in, idxs)
+                dump_payload = {
+                    "unit": 0,
+                    "stockUnit": "mm",
+                    "stockMode": "previous-setup",
+                    "stockPath": temp_stl,
+                    "stockExport": {"enabled": True, "destPath": temp_stl},
+                    "workpieceHint": {
+                        "lower": {"x": 0.0, "y": 0.0, "z": 0.0},
+                        "upper": {"x": 2.0, "y": 1.0, "z": 0.5},
+                    },
+                    "sections": [
+                        {
+                            "id": 0,
+                            "type": 0,
+                            "tool": {"number": 1, "diameter": 0.25},
+                            "params": {"operation-comment": "Pocket1"},
+                            "events": [],
+                        }
+                    ],
+                }
+                out_json = os.path.join(post_input.outputFolder, f"{p_name}.json")
+                with open(out_json, "w", encoding="utf-8") as jf:
+                    json.dump(dump_payload, jf)
+                target_cnc = os.environ.get("TARGET_INTERMEDIATE_CNC")
+                shutil.copy2(sample_cnc, target_cnc or (out_json + ".intermediate.cnc"))
+                return True
+
+        cam = _FakeCAM()
+        doc = MagicMock()
+        doc.unitsManager = types.SimpleNamespace(defaultLengthUnits="mm")
+
+        with tempfile.TemporaryDirectory() as td:
+            bundle_dir = os.path.join(td, "Admin Project", "Part", "01_Flip")
+            res = harvest_corpus_fusion.harvest_setup(
+                doc=doc,
+                cam=cam,
+                setup=setup,
+                setup_idx=1,
+                bundle_dir=bundle_dir,
+                project_name="Admin Project",
+                doc_name="Part",
+            )
+            self.assertEqual(res["status"], "harvested")
+            manifest_path = os.path.join(bundle_dir, "setup_manifest.json")
+            self.assertTrue(os.path.isfile(manifest_path))
+
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                manifest = json.load(mf)
+            self.assertTrue(manifest["prev_stock_is_inch"])
+            self.assertEqual(manifest["prev_stock_stl"], "prev_stock.stl")
+            self.assertIsNotNone(manifest["workpiece_mm"])
+            self.assertAlmostEqual(manifest["workpiece_mm"]["x_max"], 50.8, places=2)
+            self.assertAlmostEqual(manifest["workpiece_mm"]["y_max"], 25.4, places=2)
+            self.assertAlmostEqual(manifest["workpiece_mm"]["z_max"], 12.7, places=2)
+
+            with open(os.path.join(bundle_dir, "batch_0.json"), "r", encoding="utf-8") as bf:
+                b0 = json.load(bf)
+            self.assertEqual(b0["stockPath"], "prev_stock.stl")
+            self.assertEqual(b0["stockExport"]["destPath"], "prev_stock.stl")
+
+    def test_recover_incomplete_bundles_recovers_previous_setup_and_rotary(self):
+        sample_cnc = os.path.join(REPO_ROOT, "tests", "fixtures", "milling_drill_test.cnc")
+        verts_in = np.array(
+            [
+                [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.5], [2.0, 0.0, 0.5], [2.0, 1.0, 0.5], [0.0, 1.0, 0.5],
+            ],
+            dtype=np.float32,
+        )
+        idxs = np.array(
+            [
+                [0, 1, 2], [0, 2, 3],
+                [4, 6, 5], [4, 7, 6],
+                [0, 4, 5], [0, 5, 1],
+                [1, 5, 6], [1, 6, 2],
+                [2, 6, 7], [2, 7, 3],
+                [3, 7, 4], [3, 4, 0],
+            ],
+            dtype=np.int32,
+        )
+
+        with tempfile.TemporaryDirectory() as corpus_dir:
+            # 1. Existing sibling bundle
+            sib_dir = os.path.join(corpus_dir, "Admin Project", "Butt_Plate", "01_Setup1")
+            os.makedirs(sib_dir)
+            shutil.copy2(sample_cnc, os.path.join(sib_dir, "batch_0.cnc"))
+            with open(os.path.join(sib_dir, "setup_manifest.json"), "w", encoding="utf-8") as mf:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "project_name": "Admin Project",
+                        "document_name": "Butt/Plate",
+                        "setup_name": "Setup1",
+                        "setup_index": 1,
+                        "is_turning": False,
+                        "stock_mode": "fixed-box",
+                        "configured_post": "tormach.cps",
+                        "cnc_batches": ["batch_0.cnc"],
+                        "json_batches": ["batch_0.json"],
+                    },
+                    mf,
+                )
+
+            # 2. Incomplete prev_stock bundle with stale temp stockPath
+            flip_dir = os.path.join(corpus_dir, "Admin Project", "Butt_Plate", "02_Flip")
+            os.makedirs(flip_dir)
+            shutil.copy2(sample_cnc, os.path.join(flip_dir, "batch_0.cnc"))
+            harvest_corpus_fusion.write_binary_stl(os.path.join(flip_dir, "prev_stock.stl"), verts_in, idxs)
+            with open(os.path.join(flip_dir, "batch_0.json"), "w", encoding="utf-8") as bf:
+                json.dump(
+                    {
+                        "unit": 0,
+                        "stockUnit": "in",
+                        "stockMode": "previous-setup",
+                        "stockPath": "/tmp/nonexistent/1001_stock.stl",
+                        "stockExport": {"destPath": "/tmp/nonexistent/1001_stock.stl"},
+                        "postProperties": {"smartCoolEquipped": False},
+                        "sections": [
+                            {"id": 0, "type": 0, "tool": {"number": 1, "diameter": 0.25}, "events": []}
+                        ],
+                    },
+                    bf,
+                )
+
+            # 3. Incomplete fixed-cylinder rotary bundle
+            rot_dir = os.path.join(corpus_dir, "Admin Project", "Butt_Front_proj", "05_Rotary")
+            os.makedirs(rot_dir)
+            shutil.copy2(sample_cnc, os.path.join(rot_dir, "batch_0.cnc"))
+            with open(os.path.join(rot_dir, "batch_0.json"), "w", encoding="utf-8") as bf:
+                json.dump(
+                    {
+                        "unit": 0,
+                        "stockMode": "fixed-cylinder",
+                        "workpiece": {
+                            "lower": {"x": -2.0, "y": -1.5, "z": -1.5},
+                            "upper": {"x": 0.0, "y": 1.5, "z": 1.5},
+                        },
+                        "sections": [
+                            {"id": 0, "type": 0, "tool": {"number": 2, "diameter": 0.375}, "events": []}
+                        ],
+                    },
+                    bf,
+                )
+
+            recovered = harvest_corpus_fusion.recover_incomplete_bundles(corpus_dir)
+            self.assertEqual(len(recovered), 2)
+
+            with open(os.path.join(flip_dir, "setup_manifest.json"), "r", encoding="utf-8") as mf:
+                flip_m = json.load(mf)
+            self.assertEqual(flip_m["document_name"], "Butt/Plate")
+            self.assertEqual(flip_m["setup_index"], 2)
+            self.assertEqual(flip_m["setup_name"], "Flip")
+            self.assertEqual(flip_m["configured_post"], "tormach.cps")
+            self.assertTrue(flip_m["prev_stock_is_inch"])
+            self.assertAlmostEqual(flip_m["workpiece_mm"]["x_max"], 50.8, places=2)
+
+            with open(os.path.join(flip_dir, "batch_0.json"), "r", encoding="utf-8") as bf:
+                flip_b0 = json.load(bf)
+            self.assertEqual(flip_b0["stockPath"], "prev_stock.stl")
+            self.assertEqual(flip_b0["stockExport"]["destPath"], "prev_stock.stl")
+
+            with open(os.path.join(rot_dir, "setup_manifest.json"), "r", encoding="utf-8") as mf:
+                rot_m = json.load(mf)
+            self.assertEqual(rot_m["setup_index"], 5)
+            self.assertEqual(rot_m["setup_name"], "Rotary")
+            self.assertEqual(rot_m["stock_mode"], "fixed-cylinder")
+            self.assertAlmostEqual(rot_m["workpiece_mm"]["x_min"], -50.8, places=2)
+
+            discovered = run_corpus.discover_fixtures(corpus_dir=corpus_dir, include_builtin_fixtures=False)
+            self.assertEqual(len(discovered), 3)
+
+    def test_harvester_skips_jet_setups_and_probing_ops_and_isolates_setup_errors(self):
+        class _FakeParamVal:
+            def __init__(self, v):
+                self.value = v
+
+        class _FakeParams:
+            def __init__(self, d):
+                self._d = d
+
+            def itemByName(self, k):
+                return _FakeParamVal(_FakeParamVal(self._d[k])) if k in self._d else None
+
+        probe_op = types.SimpleNamespace(
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            strategy="probe",
+            parameters=_FakeParams({"operation:isProbingStrategy": 1}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 99, "tool_type": "probe"})),
+        )
+        mill_op = types.SimpleNamespace(
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            strategy="face",
+            parameters=_FakeParams({"operation:isProbingStrategy": 0}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 1, "tool_type": "face mill"})),
+        )
+
+        PostClear = harvest_corpus_fusion._get_postclear_module()
+
+        # 1. Mixed Probe + Mill setup keeps only Milling op batch
+        mixed_setup = types.SimpleNamespace(
+            name="1st op",
+            operationType=0,
+            allOperations=[probe_op, mill_op],
+        )
+        batches = harvest_corpus_fusion._partition_tool_batches(mixed_setup, PostClear)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0][0], 1)
+        self.assertEqual(batches[0][1], [mill_op])
+
+        # 2. Pure Probing setup returns empty batches -> no_active_ops without creating bundle_dir
+        pure_probe_setup = types.SimpleNamespace(
+            name="ProbeOnly",
+            operationType=0,
+            parameters=_FakeParams({"job_stockMode": "default"}),
+            allOperations=[probe_op],
+        )
+        # 3. JetOperation (operationType=2) is skipped_capability without creating bundle_dir
+        jet_setup = types.SimpleNamespace(
+            name="PlasmaSign",
+            operationType=2,
+            allOperations=[mill_op],
+        )
+        # 4. Setup whose post writes 0-byte JSON cleans up partial bundle_dir and does not block next setup
+        bad_setup = types.SimpleNamespace(
+            name="BadSetup",
+            operationType=0,
+            isSuppressed=False,
+            parameters=_FakeParams({"job_stockMode": "default"}),
+            allOperations=[mill_op],
+            workCoordinateSystem=None,
+        )
+        good_setup = types.SimpleNamespace(
+            name="GoodSetup",
+            operationType=0,
+            isSuppressed=False,
+            parameters=_FakeParams({"job_stockMode": "default"}),
+            allOperations=[mill_op],
+            workCoordinateSystem=None,
+        )
+
+        sample_cnc = os.path.join(REPO_ROOT, "tests", "fixtures", "milling_drill_test.cnc")
+
+        def _fake_post_process(ops, p_in):
+            out_json = os.path.join(p_in.outputFolder, f"{p_in.programName}.json")
+            cfg_path = os.environ.get("DUMPER_CONFIG_PATH", "")
+            target_cnc = os.environ.get("TARGET_INTERMEDIATE_CNC", "")
+            if "00_BadSetup" in target_cnc:
+                with open(out_json, "w", encoding="utf-8") as f:
+                    f.write("")  # 0-byte failed post output
+                with open(os.path.join(p_in.outputFolder, f"{p_in.programName}.failed"), "w", encoding="utf-8") as ff:
+                    ff.write("Error: simulated post kernel abort")
+                return
+            shutil.copy2(sample_cnc, target_cnc)
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "unit": 1,
+                        "stockMode": "default",
+                        "workpiece": {"lower": {"x": 0, "y": 0, "z": -10}, "upper": {"x": 50, "y": 50, "z": 0}},
+                        "sections": [{"id": 0, "type": 0, "tool": {"number": 1, "diameter": 6.0}, "events": []}],
+                    },
+                    f,
+                )
+            _ = cfg_path
+
+        cam = types.SimpleNamespace(
+            setups=[bad_setup, good_setup, jet_setup, pure_probe_setup],
+            ncPrograms=[],
+            postProcess=_fake_post_process,
+        )
+        doc = types.SimpleNamespace(
+            name="MultiSetupSample",
+            products=types.SimpleNamespace(itemByProductType=lambda pt: cam if pt == "CAMProductType" else None),
+            unitsManager=types.SimpleNamespace(defaultLengthUnits="mm"),
+        )
+
+        with tempfile.TemporaryDirectory() as corpus_dir:
+            jet_bundle = os.path.join(corpus_dir, "jet_bundle")
+            jet_res = harvest_corpus_fusion.harvest_setup(doc, cam, jet_setup, 0, jet_bundle)
+            self.assertEqual(jet_res["status"], "skipped_capability")
+            self.assertFalse(os.path.exists(jet_bundle))
+
+            probe_bundle = os.path.join(corpus_dir, "probe_bundle")
+            probe_res = harvest_corpus_fusion.harvest_setup(doc, cam, pure_probe_setup, 0, probe_bundle)
+            self.assertEqual(probe_res["status"], "no_active_ops")
+            self.assertFalse(os.path.exists(probe_bundle))
+
+            doc_res = harvest_corpus_fusion._harvest_document(
+                doc=doc,
+                doc_key="open:MultiSetupSample",
+                project_name="OpenDocs",
+                doc_name="MultiSetupSample",
+                corpus_dir=corpus_dir,
+            )
+            self.assertEqual(doc_res["status"], "harvested")
+            self.assertEqual(len(doc_res["errors"]), 1)
+            self.assertIn("simulated post kernel abort", doc_res["errors"][0])
+
+            doc_root = os.path.join(corpus_dir, "OpenDocs", "MultiSetupSample")
+            self.assertFalse(os.path.exists(os.path.join(doc_root, "00_BadSetup")))
+            self.assertTrue(os.path.isfile(os.path.join(doc_root, "01_GoodSetup", "setup_manifest.json")))
+
+    def test_universal_dumper_guards_unoptimized_5x_abc_and_probing_cycles(self):
+        dumper_path = os.path.join(REPO_ROOT, "universal_dumper.cps")
+        with open(dumper_path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("_safeToolAxisABC", src)
+        self.assertIn("isOptimizedForMachine", src)
+        self.assertIn("isProbeOrInspect", src)
+
+    def test_harvester_handles_generation_not_started_and_postprocess_fallbacks(self):
+        class _BrokenFuture:
+            @property
+            def isGenerationCompleted(self):
+                raise RuntimeError("3 : Generation not started")
+
+        class _FakeParamVal:
+            def __init__(self, v):
+                self.value = v
+
+        class _FakeParams:
+            def __init__(self, d):
+                self._d = d
+
+            def itemByName(self, k):
+                return _FakeParamVal(_FakeParamVal(self._d[k])) if k in self._d else None
+
+        # Structured boolean taxonomy detection (no dependency on concrete strategy names)
+        surf_inspect_op = types.SimpleNamespace(
+            isSuppressed=False,
+            hasToolpath=False,
+            isToolpathValid=False,
+            parameters=_FakeParams({"operation:isInspectionStrategy": 1}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 99})),
+        )
+        self.assertFalse(harvest_corpus_fusion._is_supported_cutting_op(surf_inspect_op))
+
+        ungenerated_mill = types.SimpleNamespace(
+            isSuppressed=False,
+            hasToolpath=False,
+            isToolpathValid=False,
+            strategy="adaptive2d",
+            parameters=_FakeParams({}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 2})),
+        )
+        valid_mill_1 = types.SimpleNamespace(
+            name="ValidOp1",
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            strategy="face",
+            parameters=_FakeParams({}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 1})),
+        )
+        blocked_mill_2 = types.SimpleNamespace(
+            name="BlockedOp2",
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            strategy="contour2d",
+            parameters=_FakeParams({}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 1})),
+        )
+
+        setup_with_mixed_batch = types.SimpleNamespace(
+            name="1st op",
+            operationType=0,
+            isSuppressed=False,
+            parameters=_FakeParams({"job_stockMode": "default"}),
+            allOperations=[surf_inspect_op, ungenerated_mill, valid_mill_1, blocked_mill_2],
+            workCoordinateSystem=None,
+        )
+        fallback_3axis_setup = types.SimpleNamespace(
+            name="Pure3AxisFallback",
+            operationType=0,
+            isSuppressed=False,
+            parameters=_FakeParams({"job_stockMode": "default"}),
+            allOperations=[surf_inspect_op, ungenerated_mill, valid_mill_1],
+            workCoordinateSystem=None,
+        )
+
+        sample_cnc = os.path.join(REPO_ROOT, "tests", "fixtures", "milling_drill_test.cnc")
+
+        def _fake_post_process(ops, p_in):
+            # Multi-op collection or BlockedOp2 throws Fusion Personal's 3+2 C++ exception;
+            # ValidOp1 fails only when a broken vendor BASE_POST is passed, succeeding with BASE_POST="".
+            is_single_valid = getattr(ops, "name", None) == "ValidOp1"
+            base_post_env = os.environ.get("BASE_POST", "")
+            if not is_single_valid or base_post_env:
+                raise RuntimeError("3 : Cannot locate the simple error log generated from the Post Processing.")
+            out_json = os.path.join(p_in.outputFolder, f"{p_in.programName}.json")
+            target_cnc = os.environ.get("TARGET_INTERMEDIATE_CNC", "")
+            shutil.copy2(sample_cnc, target_cnc)
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "unit": 1,
+                        "stockMode": "default",
+                        "workpiece": {"lower": {"x": 0, "y": 0, "z": -10}, "upper": {"x": 50, "y": 50, "z": 0}},
+                        "sections": [{"id": 0, "type": 0, "tool": {"number": 1, "diameter": 6.0}, "events": []}],
+                    },
+                    f,
+                )
+
+        cam = types.SimpleNamespace(
+            setups=[setup_with_mixed_batch, fallback_3axis_setup],
+            ncPrograms=[],
+            generateToolpath=lambda _ops: _BrokenFuture(),
+            postProcess=_fake_post_process,
+        )
+        doc = types.SimpleNamespace(
+            name="MotorBracket",
+            products=types.SimpleNamespace(itemByProductType=lambda pt: cam if pt == "CAMProductType" else None),
+            unitsManager=types.SimpleNamespace(defaultLengthUnits="mm"),
+        )
+
+        with tempfile.TemporaryDirectory() as corpus_dir:
+            doc_res = harvest_corpus_fusion._harvest_document(
+                doc=doc,
+                doc_key="open:MotorBracket",
+                project_name="OpenDocs",
+                doc_name="MotorBracket",
+                corpus_dir=corpus_dir,
+            )
+            self.assertEqual(doc_res["status"], "harvested")
+            self.assertEqual(doc_res["errors"], [])
+            self.assertEqual(doc_res["setups"][0]["status"], "skipped_capability")
+            self.assertEqual(doc_res["setups"][1]["status"], "harvested")
+            skipped_dir = os.path.join(corpus_dir, "OpenDocs", "MotorBracket", "00_1st op")
+            self.assertFalse(os.path.exists(skipped_dir))
+            manifest_p = os.path.join(corpus_dir, "OpenDocs", "MotorBracket", "01_Pure3AxisFallback", "setup_manifest.json")
+            self.assertTrue(os.path.isfile(manifest_p))
+
+    def test_harvester_and_corpus_runner_skip_3plus2_multiaxis_and_millturn(self):
+        class _FakeParamVal:
+            def __init__(self, v):
+                self.value = v
+
+        class _FakeParams:
+            def __init__(self, d):
+                self._d = dict(d)
+
+            def itemByName(self, k):
+                return _FakeParamVal(_FakeParamVal(self._d[k])) if k in self._d else None
+
+        tilted_op = types.SimpleNamespace(
+            name="TiltedPocket",
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            strategy="pocket2d",
+            parameters=_FakeParams({"overrideToolView": 1, "view_orientation_mode": "axesZX"}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 1})),
+        )
+        wrap_op = types.SimpleNamespace(
+            name="WrapAdaptive",
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            strategy="adaptive2d",
+            parameters=_FakeParams({"operation:multiAxisMachiningType": "wrapped"}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 2})),
+        )
+        millturn_op = types.SimpleNamespace(
+            name="LiveHexMill",
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            strategy="contour2d",
+            parameters=_FakeParams({"operation:isMillingStrategy": 1}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 3})),
+        )
+        pattern_child_op = types.SimpleNamespace(
+            name="PatternFace",
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            strategy="face",
+            parameters=_FakeParams({"operation:view_orientation_mode": "useWCS"}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 4})),
+        )
+        clean_mill_op = types.SimpleNamespace(
+            name="TopFace",
+            isSuppressed=False,
+            hasToolpath=True,
+            isToolpathValid=True,
+            strategy="face",
+            parameters=_FakeParams({"operation:isRotaryStrategy": 1, "operation:view_orientation_mode": "useWCS"}),
+            tool=types.SimpleNamespace(parameters=_FakeParams({"tool_number": 5})),
+        )
+
+        s_3plus2 = types.SimpleNamespace(
+            name="Setup3Plus2",
+            operationType=0,
+            isSuppressed=False,
+            parameters=_FakeParams({"job_stockMode": "default"}),
+            allOperations=[clean_mill_op, tilted_op],
+        )
+        s_wrap = types.SimpleNamespace(
+            name="SetupWrap",
+            operationType=0,
+            isSuppressed=False,
+            parameters=_FakeParams({"job_stockMode": "default"}),
+            allOperations=[wrap_op],
+        )
+        s_millturn = types.SimpleNamespace(
+            name="SetupMillTurn",
+            operationType=1,
+            isSuppressed=False,
+            parameters=_FakeParams({"job_stockMode": "default"}),
+            allOperations=[millturn_op],
+        )
+        s_rotary_pattern = types.SimpleNamespace(
+            name="SetupRotaryPattern",
+            operationType=0,
+            isSuppressed=False,
+            parameters=_FakeParams({"job_stockMode": "default"}),
+            allOperations=[clean_mill_op, pattern_child_op],
+        )
+
+        sample_cnc = os.path.join(REPO_ROOT, "tests", "fixtures", "milling_drill_test.cnc")
+        post_calls = []
+
+        def _fake_post(ops, p_in):
+            post_calls.append(getattr(ops, "name", "col"))
+            out_json = os.path.join(p_in.outputFolder, f"{p_in.programName}.json")
+            target_cnc = os.environ.get("TARGET_INTERMEDIATE_CNC", "")
+            shutil.copy2(sample_cnc, target_cnc)
+            is_pat = getattr(ops, "name", "") == "PatternFace"
+            fwd = {"x": 0.0, "y": -0.8660254, "z": -0.5} if is_pat else {"x": 0.0, "y": 0.0, "z": 1.0}
+            with open(out_json, "w", encoding="utf-8") as jf:
+                json.dump(
+                    {
+                        "unit": 1,
+                        "stockMode": "default",
+                        "workpiece": {"lower": {"x": 0, "y": 0, "z": -10}, "upper": {"x": 50, "y": 50, "z": 0}},
+                        "sections": [
+                            {
+                                "id": 0,
+                                "type": 0,
+                                "workPlane": {"forward": fwd},
+                                "params": {"operation-comment": getattr(ops, "name", "Op")},
+                                "events": [],
+                            }
+                        ],
+                    },
+                    jf,
+                )
+
+        cam = types.SimpleNamespace(
+            setups=[s_3plus2, s_wrap, s_millturn, s_rotary_pattern],
+            ncPrograms=[],
+            postProcess=_fake_post,
+        )
+        doc = types.SimpleNamespace(
+            name="CommercialSample",
+            products=types.SimpleNamespace(itemByProductType=lambda pt: cam if pt == "CAMProductType" else None),
+            unitsManager=types.SimpleNamespace(defaultLengthUnits="mm"),
+        )
+
+        with tempfile.TemporaryDirectory() as corpus_dir:
+            # 1-3: Pre-post capability check skips without invoking cam.postProcess or creating bundle_dir
+            for idx, s_obj in enumerate((s_3plus2, s_wrap, s_millturn)):
+                b_dir = os.path.join(corpus_dir, f"b_{idx}")
+                res = harvest_corpus_fusion.harvest_setup(doc, cam, s_obj, idx, b_dir)
+                self.assertEqual(res["status"], "skipped_capability")
+                self.assertFalse(os.path.exists(b_dir))
+            self.assertEqual(post_calls, [])
+
+            # 4: Post-dump capability check catches rotary CAMPattern on batch 1, cleans up bundle_dir, 0 errors
+            doc_res = harvest_corpus_fusion._harvest_document(
+                doc=doc,
+                doc_key="open:CommercialSample",
+                project_name="OpenDocs",
+                doc_name="CommercialSample",
+                corpus_dir=corpus_dir,
+            )
+            self.assertEqual(doc_res["status"], "skipped_capability")
+            self.assertEqual(doc_res["errors"], [])
+            self.assertFalse(os.path.exists(os.path.join(corpus_dir, "OpenDocs", "CommercialSample", "03_SetupRotaryPattern")))
+
+            # 5: run_corpus.discover_fixtures skips pre-harvested 3+2 bundle while keeping valid 2-axis centerline-drill lathe bundle
+            tilted_bundle = os.path.join(corpus_dir, "PreCached", "Sample3Plus2", "00_Setup1")
+            lathe_bundle = os.path.join(corpus_dir, "PreCached", "LatheCenterDrill", "00_Setup1")
+            os.makedirs(tilted_bundle)
+            os.makedirs(lathe_bundle)
+            shutil.copy2(sample_cnc, os.path.join(tilted_bundle, "batch_0.cnc"))
+            shutil.copy2(sample_cnc, os.path.join(lathe_bundle, "batch_0.cnc"))
+            with open(os.path.join(tilted_bundle, "batch_0.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "unit": 1,
+                        "sections": [{"id": 0, "type": 0, "workPlane": {"forward": {"x": 1.0, "y": 0.0, "z": 0.0}}, "events": []}],
+                    },
+                    f,
+                )
+            with open(os.path.join(tilted_bundle, "setup_manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "project_name": "PreCached",
+                        "document_name": "Sample3Plus2",
+                        "setup_name": "Setup1",
+                        "is_turning": False,
+                        "cnc_batches": ["batch_0.cnc"],
+                        "json_batches": ["batch_0.json"],
+                        "workpiece_mm": {"kind": "box", "x_min": 0, "x_max": 50, "y_min": 0, "y_max": 50, "z_min": -10, "z_max": 0},
+                    },
+                    f,
+                )
+            with open(os.path.join(lathe_bundle, "batch_0.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "unit": 1,
+                        "sections": [
+                            {
+                                "id": 0,
+                                "type": 0,
+                                "workPlane": {"forward": {"x": 0.0, "y": 0.0, "z": 1.0}},
+                                "params": {"operation:strategy": "drill", "operation:isDrillingStrategy": 1},
+                                "events": [{"type": "onCyclePoint", "x": 0.0, "y": 0.0, "z": -15.0}],
+                            }
+                        ],
+                    },
+                    f,
+                )
+            with open(os.path.join(lathe_bundle, "setup_manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "project_name": "PreCached",
+                        "document_name": "LatheCenterDrill",
+                        "setup_name": "Setup1",
+                        "is_turning": True,
+                        "cnc_batches": ["batch_0.cnc"],
+                        "json_batches": ["batch_0.json"],
+                        "workpiece_mm": {"kind": "turning", "z_min": -30, "z_max": 0, "outer_radius": 20, "inner_radius": 0},
+                    },
+                    f,
+                )
+
+            additive_bundle = os.path.join(corpus_dir, "PreCached", "StockFenceAdditive", "00_Setup1")
+            os.makedirs(additive_bundle)
+            shutil.copy2(sample_cnc, os.path.join(additive_bundle, "batch_0.cnc"))
+            with open(os.path.join(additive_bundle, "batch_0.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "unit": 1,
+                        "sections": [{"id": 0, "type": 4, "strategy": "additive_buildstyle", "events": []}],
+                    },
+                    f,
+                )
+            with open(os.path.join(additive_bundle, "setup_manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "schema_version": 1,
+                        "project_name": "PreCached",
+                        "document_name": "StockFenceAdditive",
+                        "setup_name": "Setup1",
+                        "is_turning": False,
+                        "cnc_batches": ["batch_0.cnc"],
+                        "json_batches": ["batch_0.json"],
+                        "workpiece_mm": {"kind": "box", "x_min": 0, "x_max": 50, "y_min": 0, "y_max": 50, "z_min": -10, "z_max": 0},
+                    },
+                    f,
+                )
+
+            discovered = run_corpus.discover_fixtures(corpus_dir=corpus_dir, include_builtin_fixtures=False)
+            self.assertEqual([fx.name for fx in discovered], ["PreCached/LatheCenterDrill/Setup1"])
+
 
 if __name__ == "__main__":
     unittest.main()

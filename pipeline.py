@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 from geometry.models import (
     MotionKind,
     MotionSegment,
+    SolidMeshStock3D,
     ToolAssembly,
     WorkpieceDefinition,
     VerificationReport,
@@ -653,82 +654,52 @@ class PipelineOrchestrator:
             )
             tp_box_log = None
             st_box_log = None
+            unmodeled_pattern_sec_indices: Set[int] = set()
             if is_stl_stock and segments:
-                cutting_segments = [s for s in segments if s.motion != MotionKind.RAPID]
-                if cutting_segments:
-                    tp_xs = [s.start.x for s in cutting_segments] + [s.end.x for s in cutting_segments]
-                    tp_ys = [s.start.y for s in cutting_segments] + [s.end.y for s in cutting_segments]
-                    tp_zs = [s.start.z for s in cutting_segments] + [s.end.z for s in cutting_segments]
-                    tp_min_x, tp_max_x = min(tp_xs), max(tp_xs)
-                    tp_min_y, tp_max_y = min(tp_ys), max(tp_ys)
-                    tp_min_z, tp_max_z = min(tp_zs), max(tp_zs)
+                wh_mm: Optional[Tuple[float, float, float, float, float, float]] = None
+                wh_raw = combined_ctx.get("workpieceHint")
+                if isinstance(wh_raw, dict):
+                    wh_lo = wh_raw.get("lower")
+                    wh_hi = wh_raw.get("upper")
+                    if isinstance(wh_lo, dict) and isinstance(wh_hi, dict):
+                        try:
+                            wh_scale = 25.4 if int(combined_ctx.get("unit", 0)) == 0 else 1.0
+                            wx0 = float(wh_lo["x"]) * wh_scale
+                            wx1 = float(wh_hi["x"]) * wh_scale
+                            wy0 = float(wh_lo["y"]) * wh_scale
+                            wy1 = float(wh_hi["y"]) * wh_scale
+                            wz0 = float(wh_lo["z"]) * wh_scale
+                            wz1 = float(wh_hi["z"]) * wh_scale
+                            if wx1 > wx0 + 1e-6 and wy1 > wy0 + 1e-6 and wz1 > wz0 + 1e-6:
+                                wh_mm = (
+                                    min(wx0, wx1),
+                                    max(wx0, wx1),
+                                    min(wy0, wy1),
+                                    max(wy0, wy1),
+                                    min(wz0, wz1),
+                                    max(wz0, wz1),
+                                )
+                        except (KeyError, TypeError, ValueError):
+                            wh_mm = None
 
-                    st = getattr(workpiece, "stock", None)
-                    if hasattr(st, "x_min") and hasattr(st, "x_max"):
-                        st_min_x, st_max_x = st.x_min, st.x_max
-                        st_min_y, st_max_y = st.y_min, st.y_max
-                        st_min_z, st_max_z = st.z_min, st.z_max
-                    elif hasattr(st, "outer_radius") and hasattr(st, "z_min"):
-                        st_r = st.outer_radius
-                        st_min_x, st_max_x = -st_r, st_r
-                        st_min_y, st_max_y = -st_r, st_r
-                        st_min_z, st_max_z = st.z_min, st.z_max
-                    else:
-                        st_min_x = st_max_x = st_min_y = st_max_y = st_min_z = st_max_z = 0.0
+                from geometry.heightfield_engine import check_stl_stock_alignment
 
-                    tp_box_log = f"[{tp_min_x:.2f}, {tp_max_x:.2f}] x [{tp_min_y:.2f}, {tp_max_y:.2f}] x [{tp_min_z:.2f}, {tp_max_z:.2f}]"
-                    st_box_log = f"[{st_min_x:.2f}, {st_max_x:.2f}] x [{st_min_y:.2f}, {st_max_y:.2f}] x [{st_min_z:.2f}, {st_max_z:.2f}]"
-
-                    if is_turning:
-                        tp_z_span = max(0.0, tp_max_z - tp_min_z)
-                        ov_z = max(0.0, min(tp_max_z, st_max_z) - max(tp_min_z, st_min_z))
-                        if tp_z_span > 1e-6:
-                            z_ratio = ov_z / tp_z_span
-                        else:
-                            z_ratio = 1.0 if (st_min_z <= tp_min_z <= st_max_z) else 0.0
-                        _dbg_pipe(f"H4 turning Z overlap: toolpath={tp_box_log}, stock={st_box_log}, ratio={z_ratio*100:.1f}%")
-                        if z_ratio < 0.5:
-                            raise ValueError(
-                                f"Cutting toolpath Z span [{tp_min_z:.2f}, {tp_max_z:.2f}] has insufficient overlap ({z_ratio*100:.1f}% < 50%) "
-                                f"with stock Z span [{st_min_z:.2f}, {st_max_z:.2f}]. "
-                                f"Toolpath bounding box: {tp_box_log}; Stock bounding box: {st_box_log}."
-                            )
-                    else:
-                        max_tool_r = max(
-                            (
-                                float(getattr(getattr(t, "geometry", None), "diameter", 0.0) or 0.0) * 0.5
-                                for t in (tools_by_op or {}).values()
-                            ),
-                            default=0.0,
-                        )
-                        eff_st_min_x = st_min_x - max_tool_r
-                        eff_st_max_x = st_max_x + max_tool_r
-                        eff_st_min_y = st_min_y - max_tool_r
-                        eff_st_max_y = st_max_y + max_tool_r
-                        # When the toolpath enters below the top of the stock, vertical G1 plunges/retracts
-                        # to the clearance plane above st_max_z are in-air positioning moves and should not
-                        # inflate the cutting Z span.
-                        eff_tp_max_z = min(tp_max_z, st_max_z) if tp_min_z < st_max_z else tp_max_z
-
-                        tp_dx = max(0.0, tp_max_x - tp_min_x)
-                        tp_dy = max(0.0, tp_max_y - tp_min_y)
-                        tp_dz = max(0.0, eff_tp_max_z - tp_min_z)
-
-                        ov_dx = max(0.0, min(tp_max_x, eff_st_max_x) - max(tp_min_x, eff_st_min_x))
-                        ov_dy = max(0.0, min(tp_max_y, eff_st_max_y) - max(tp_min_y, eff_st_min_y))
-                        ov_dz = max(0.0, min(eff_tp_max_z, st_max_z) - max(tp_min_z, st_min_z))
-
-                        r_x = (ov_dx / tp_dx) if tp_dx > 1e-6 else (1.0 if eff_st_min_x <= tp_min_x <= eff_st_max_x else 0.0)
-                        r_y = (ov_dy / tp_dy) if tp_dy > 1e-6 else (1.0 if eff_st_min_y <= tp_min_y <= eff_st_max_y else 0.0)
-                        r_z = (ov_dz / tp_dz) if tp_dz > 1e-6 else (1.0 if st_min_z <= tp_min_z <= st_max_z else 0.0)
-                        vol_ratio = r_x * r_y * r_z
-
-                        _dbg_pipe(f"H4 milling volume overlap: toolpath={tp_box_log}, stock={st_box_log}, ratio={vol_ratio*100:.1f}%")
-                        if vol_ratio < 0.5:
-                            raise ValueError(
-                                f"Toolpath bounding box {tp_box_log} has insufficient volume overlap ({vol_ratio*100:.1f}% < 50%) "
-                                f"with Stock bounding box {st_box_log}."
-                            )
+                tp_box_log, st_box_log, unmodeled_pattern_sec_indices = check_stl_stock_alignment(
+                    segments=segments,
+                    workpiece=workpiece,
+                    tools_by_op=tools_by_op,
+                    is_turning=is_turning,
+                    workpiece_hint_mm=wh_mm,
+                    dbg_fn=_dbg_pipe,
+                )
+            elif not is_turning and segments and workpiece is not None:
+                try:
+                    from geometry.heightfield_engine import detect_unmodeled_pattern_sections
+                    unmodeled_pattern_sec_indices = detect_unmodeled_pattern_sections(
+                        segments, workpiece, tools_by_op
+                    )
+                except Exception:
+                    unmodeled_pattern_sec_indices = set()
 
             if segments:
                 all_x = [s.start.x for s in segments] + [s.end.x for s in segments]
@@ -784,7 +755,7 @@ class PipelineOrchestrator:
                     if seg.op_id and seg.op_id not in multi_axis_ops:
                         multi_axis_ops.append(seg.op_id)
 
-            blocked_sec_indices = tilted_sec_indices | multi_axis_sec_indices
+            blocked_sec_indices = tilted_sec_indices | multi_axis_sec_indices | unmodeled_pattern_sec_indices
             if blocked_sec_indices and report.promoted_events:
                 report.promoted_events = {
                     ev for ev in report.promoted_events
