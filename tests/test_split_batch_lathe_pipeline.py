@@ -36,13 +36,16 @@ class TestSplitBatchLathePipeline(unittest.TestCase):
         )
 
     def test_01_merge_and_parse_context_batches_tags_metadata(self):
-        """Verify merge_context_dumps and parse_context_dump set batch_idx and sec_id monotonically."""
+        """Verify merge_context_dumps and parse_context_dump re-index sections monotonically."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_path = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.fixture_cnc, self.centroid_cps, b0_path)
+            self.orchestrator.dump_intermediate_to_json(self.fixture_cnc, self.centroid_cps, b0_path)
+            with open(b0_path, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
 
             combined_ctx = merge_context_dumps([b0_ctx, b0_ctx])
-            self.assertEqual(len(combined_ctx["sections"]), len(b0_ctx["sections"]) * 2)
+            n_b0_secs = len(b0_ctx["sections"])
+            self.assertEqual(len(combined_ctx["sections"]), n_b0_secs * 2)
 
             # Verify section IDs are monotonically re-indexed 0..N-1
             for idx, sec in enumerate(combined_ctx["sections"]):
@@ -51,8 +54,8 @@ class TestSplitBatchLathePipeline(unittest.TestCase):
             segments = parse_context_dump(combined_ctx)
             self.assertGreater(len(segments), 20, "Expected non-trivial motion segments")
 
-            b0_segs = [s for s in segments if s.metadata.get("batch_idx") == 0]
-            b1_segs = [s for s in segments if s.metadata.get("batch_idx") == 1]
+            b0_segs = [s for s in segments if s.sec_id < n_b0_secs]
+            b1_segs = [s for s in segments if s.sec_id >= n_b0_secs]
 
             self.assertEqual(len(b0_segs), len(segments) // 2)
             self.assertEqual(len(b1_segs), len(segments) // 2)
@@ -64,7 +67,9 @@ class TestSplitBatchLathePipeline(unittest.TestCase):
         """Verify global promotion decisions are stamped onto events across all merged batches."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_path = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.fixture_cnc, self.centroid_cps, b0_path)
+            self.orchestrator.dump_intermediate_to_json(self.fixture_cnc, self.centroid_cps, b0_path)
+            with open(b0_path, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
 
             b1_ctx = copy.deepcopy(b0_ctx)
             for sec in b1_ctx["sections"]:
@@ -107,17 +112,16 @@ class TestSplitBatchLathePipeline(unittest.TestCase):
             self.assertGreater(promoted_cnt, 0)
 
             # Verify both batch 0 and batch 1 sections received promoted events
+            n_b0_secs = len(b0_ctx["sections"])
             b0_promoted = sum(
                 1
-                for sec in combined_ctx["sections"]
-                if sec.get("batchIdx") == 0
+                for sec in combined_ctx["sections"][:n_b0_secs]
                 for ev in sec.get("events", [])
                 if ev.get("promote")
             )
             b1_promoted = sum(
                 1
-                for sec in combined_ctx["sections"]
-                if sec.get("batchIdx") == 1
+                for sec in combined_ctx["sections"][n_b0_secs:]
                 for ev in sec.get("events", [])
                 if ev.get("promote")
             )
@@ -128,7 +132,9 @@ class TestSplitBatchLathePipeline(unittest.TestCase):
         """Verify replay_combined_context emits a unified multi-tool program without text stitching."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_path = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.fixture_cnc, self.centroid_cps, b0_path)
+            self.orchestrator.dump_intermediate_to_json(self.fixture_cnc, self.centroid_cps, b0_path)
+            with open(b0_path, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
 
             b1_ctx = copy.deepcopy(b0_ctx)
             b1_ctx["sections"] = [copy.deepcopy(b0_ctx["sections"][-1])]

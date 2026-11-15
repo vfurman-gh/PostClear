@@ -59,7 +59,7 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
 
     def _run_native_post(self, cps_path: str, cnc_path: str, out_dir: str) -> str:
         out_prefix = os.path.join(out_dir, "native_out")
-        cmd = [self.orchestrator.post_bin_path, "--quiet", cps_path, cnc_path, out_prefix]
+        cmd = [self.orchestrator.post_bin, "--quiet", cps_path, cnc_path, out_prefix]
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         self.assertEqual(
             res.returncode,
@@ -76,7 +76,9 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             native_out = self._run_native_post(cps_path, cnc_path, tmp_dir)
             dump_json = os.path.join(tmp_dir, "dump.json")
-            ctx = self.orchestrator.dump_context(cnc_path, cps_path, dump_json)
+            self.orchestrator.dump_intermediate_to_json(cnc_path, cps_path, dump_json)
+            with open(dump_json, "r", encoding="utf-8") as f:
+                ctx = json.load(f)
             replay_out_path = os.path.join(tmp_dir, "replayed_out.nc")
             replayed_out = self.orchestrator.replay_combined_context(
                 combined_context=ctx,
@@ -128,7 +130,9 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
           linear cutting moves, and a 90-degree CW circular arc in XY plane.
         """
         b0_json = os.path.join(tmp_dir, "batch_0.json")
-        b0_ctx = self.orchestrator.dump_context(self.milling_cnc, base_post_path, b0_json)
+        self.orchestrator.dump_intermediate_to_json(self.milling_cnc, base_post_path, b0_json)
+        with open(b0_json, "r", encoding="utf-8") as f:
+            b0_ctx = json.load(f)
 
         # Construct Batch 1 (Tool 20 Endmill with high-feed move + linear cut + CW arc)
         b1_ctx = copy.deepcopy(b0_ctx)
@@ -227,7 +231,9 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_json = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.turning_cnc, self.centroid_cps, b0_json)
+            self.orchestrator.dump_intermediate_to_json(self.turning_cnc, self.centroid_cps, b0_json)
+            with open(b0_json, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
 
             # Create Batch 1 with Tool 8 (take the finishing section and assign Tool 8)
             b1_ctx = copy.deepcopy(b0_ctx)
@@ -487,7 +493,9 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_json = os.path.join(tmp_dir, "batch_0.json")
-            ctx = self.orchestrator.dump_context(self.turning_cnc, self.centroid_cps, b0_json)
+            self.orchestrator.dump_intermediate_to_json(self.turning_cnc, self.centroid_cps, b0_json)
+            with open(b0_json, "r", encoding="utf-8") as f:
+                ctx = json.load(f)
             ctx["postProperties"] = {"showSequenceNumbers": "false"}
             out_nc = os.path.join(tmp_dir, "centroid_no_seq.cnc")
             gcode = self.orchestrator.replay_combined_context(
@@ -508,7 +516,9 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_json = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.milling_cnc, self.tormach_cps, b0_json)
+            self.orchestrator.dump_intermediate_to_json(self.milling_cnc, self.tormach_cps, b0_json)
+            with open(b0_json, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
 
             multi_ctx = copy.deepcopy(b0_ctx)
             base_sec = b0_ctx["sections"][0]
@@ -557,7 +567,9 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_json = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.milling_cnc, self.tormach_cps, b0_json)
+            self.orchestrator.dump_intermediate_to_json(self.milling_cnc, self.tormach_cps, b0_json)
+            with open(b0_json, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
 
             multi_ctx = copy.deepcopy(b0_ctx)
             base_sec = b0_ctx["sections"][0]
@@ -612,7 +624,9 @@ class TestUniversalReplayerFourPosts(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_json = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.milling_cnc, self.tormach_cps, b0_json)
+            self.orchestrator.dump_intermediate_to_json(self.milling_cnc, self.tormach_cps, b0_json)
+            with open(b0_json, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
             large_ctx = copy.deepcopy(b0_ctx)
 
             base_events = list(large_ctx["sections"][0]["events"])

@@ -19,18 +19,28 @@ import math
 import os
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-try:
-    import numpy as np
-except (ImportError, OSError):
-    np = None
-
 from geometry.models import (
     MotionKind,
     MotionSegment,
     Vector3D,
-    VectorKey,
     PromotedEventKey,
 )
+
+
+def classify_stock_mode(raw: Any) -> str:
+    """Normalize a Fusion/context stockMode string into a canonical stock category."""
+    s = str(raw or "").lower().strip()
+    if any(k in s for k in ("previous", "preceding", "prev", "rest")):
+        return "previous_setup"
+    if any(k in s for k in ("solid", "body")):
+        return "solid"
+    if "tube" in s:
+        return "tube"
+    if "cylinder" in s or "round" in s:
+        return "cylinder"
+    if any(k in s for k in ("box", "fixed", "relative")):
+        return "box"
+    return "unknown"
 
 
 def load_context_dump(source: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -74,15 +84,13 @@ def merge_context_dumps(sources: Sequence[Union[str, Dict[str, Any]]]) -> Dict[s
                 break
 
     global_sec_id = 0
-    for batch_idx, d in enumerate(dumps):
+    for d in dumps:
         for k, v in d.get("globalParams", {}).items():
             if k not in merged["globalParams"]:
                 merged["globalParams"][k] = v
 
         for sec in d.get("sections", []):
             sec_copy = copy.deepcopy(sec)
-            sec_copy["origSecId"] = sec.get("id", 0)
-            sec_copy["batchIdx"] = batch_idx
             sec_copy["id"] = global_sec_id
             merged["sections"].append(sec_copy)
             global_sec_id += 1
@@ -110,12 +118,9 @@ def parse_context_dump(
     # check section feedMode or parameter
     for sec_idx, sec in enumerate(data.get("sections", [])):
         sec_id = sec.get("id", sec_idx)
-        batch_idx = sec.get("batchIdx", 0)
-        orig_sec_id = sec.get("origSecId", sec_id)
         params = sec.get("params", {})
         op_name = params.get("operation-comment", f"Section_{sec_id}")
         tool_info = sec.get("tool", {})
-        tool_id = int(tool_info.get("number", 0))
         spindle_rpm = float(sec.get("initSpindleSpeed", tool_info.get("spindleRPM", 1000.0)) or 1000.0)
         sec_type = sec.get("type", 0)  # 0 = TYPE_MILLING, 1 = TYPE_TURNING
         feed_mode = sec.get("feedMode", 0)
@@ -275,15 +280,6 @@ def parse_context_dump(
 
             return feed_mmpm, active_rpm
 
-        def _to_mmpm(raw_feed: float, rpm: float, fm: int) -> float:
-            feed_mm = float(raw_feed) * scale
-            # In turning (sec_type == 1), feedMode == 1 or small per-rev values when fm != 0
-            # Wait: in Fusion Post Kernel, FEED_PER_MINUTE = 0, FEED_PER_REVOLUTION = 1
-            if fm == 1 or (sec_type == 1 and fm != 0 and float(raw_feed) < 2.0):
-                eff_rpm = rpm if rpm > 0 else 1000.0
-                return feed_mm * eff_rpm
-            return feed_mm
-
         pending_rc_event = False
         prev_linear_rc = int(sec.get("initRadiusComp", 0) or 0)
         in_cycle_active = False
@@ -333,15 +329,11 @@ def parse_context_dump(
                         feedrate_mmpm=default_rapid_feed_mmpm,
                         spindle_rpm=float(ev.get("rpm", spindle_rpm) or spindle_rpm),
                         duration_sec=duration,
-                        vector_key=VectorKey.from_floats(sec_id, start_pos, end_pos),
                         is_arc=False,
                         arc_center=None,
                         arc_plane="ZX" if sec_type == 1 else "XY",
                         metadata={
-                            "tool_id": tool_id,
                             "in_cycle": in_cycle_active,
-                            "batch_idx": batch_idx,
-                            "batch_sec_id": orig_sec_id,
                             "sec_idx": sec_idx,
                             "event_idx": ev_idx,
                             "z_clearance_mm": z_clearance_mm,
@@ -384,17 +376,13 @@ def parse_context_dump(
                         feedrate_mmpm=feed_mmpm,
                         spindle_rpm=rpm,
                         duration_sec=duration,
-                        vector_key=VectorKey.from_floats(sec_id, start_pos, end_pos),
                         is_arc=False,
                         arc_center=None,
                         arc_plane="ZX" if sec_type == 1 else "XY",
                         metadata={
-                            "tool_id": tool_id,
                             "in_cycle": in_cycle_active or bool(ev.get("sync", False)),
                             "sync": bool(ev.get("sync", False)),
                             "movement": ev.get("movement", 1),
-                            "batch_idx": batch_idx,
-                            "batch_sec_id": orig_sec_id,
                             "sec_idx": sec_idx,
                             "event_idx": ev_idx,
                             "z_clearance_mm": z_clearance_mm,
@@ -507,16 +495,12 @@ def parse_context_dump(
                                 feedrate_mmpm=sub_f,
                                 spindle_rpm=sub_rpm,
                                 duration_sec=sub_dur,
-                                vector_key=VectorKey.from_floats(sec_id, prev_pt, nxt_pt),
                                 is_arc=False,
                                 arc_center=None,
                                 arc_plane="ZX" if sec_type == 1 else "XY",
                                 metadata={
-                                    "tool_id": tool_id,
                                     "in_cycle": True,
                                     "movement": lin_mv.get("movement", ev.get("movement")),
-                                    "batch_idx": batch_idx,
-                                    "batch_sec_id": orig_sec_id,
                                     "sec_idx": sec_idx,
                                     "event_idx": ev_idx,
                                     "z_clearance_mm": z_clearance_mm,
@@ -540,16 +524,12 @@ def parse_context_dump(
                             feedrate_mmpm=feed_mmpm,
                             spindle_rpm=rpm,
                             duration_sec=duration,
-                            vector_key=VectorKey.from_floats(sec_id, start_pos, end_pos),
                             is_arc=True,
                             arc_center=center_pos,
                             arc_plane=plane_str,
                             metadata={
-                                "tool_id": tool_id,
                                 "in_cycle": in_cycle_active,
                                 "movement": ev.get("movement"),
-                                "batch_idx": batch_idx,
-                                "batch_sec_id": orig_sec_id,
                                 "sec_idx": sec_idx,
                                 "event_idx": ev_idx,
                                 "z_clearance_mm": z_clearance_mm,
@@ -561,20 +541,36 @@ def parse_context_dump(
 
             elif ev_type == "onCyclePoint":
                 # Use pre-captured expandedMoves to simulate full physical hole/cycle trajectory in IPW
+                if any(k in ev for k in ("sx", "sy", "sz")):
+                    prev_sub_pos = _to_wcs_pos(
+                        float(ev.get("sx", 0.0)),
+                        float(ev.get("sy", 0.0)),
+                        float(ev.get("sz", 0.0)),
+                    )
+                elif segments:
+                    prev_sub_pos = segments[-1].end
+                else:
+                    init_p = sec.get("initialPosition", {"x": 0.0, "y": 0.0, "z": 0.0})
+                    prev_sub_pos = _to_wcs_pos(float(init_p["x"]), float(init_p["y"]), float(init_p["z"]))
+
                 for sub_mv in ev.get("expandedMoves", []):
                     sub_t = sub_mv.get("type")
                     if sub_t not in ("onRapid", "onLinear"):
                         continue
-                    s_pos = _to_wcs_pos(
-                        float(sub_mv.get("sx", 0.0)),
-                        float(sub_mv.get("sy", 0.0)),
-                        float(sub_mv.get("sz", 0.0)),
-                    )
+                    if any(k in sub_mv for k in ("sx", "sy", "sz")):
+                        s_pos = _to_wcs_pos(
+                            float(sub_mv.get("sx", 0.0)),
+                            float(sub_mv.get("sy", 0.0)),
+                            float(sub_mv.get("sz", 0.0)),
+                        )
+                    else:
+                        s_pos = prev_sub_pos
                     e_pos = _to_wcs_pos(
                         float(sub_mv.get("x", 0.0)),
                         float(sub_mv.get("y", 0.0)),
                         float(sub_mv.get("z", 0.0)),
                     )
+                    prev_sub_pos = e_pos
                     is_rap = (sub_t == "onRapid")
                     if is_rap:
                         f_mmpm = default_rapid_feed_mmpm
@@ -596,15 +592,11 @@ def parse_context_dump(
                             feedrate_mmpm=f_mmpm,
                             spindle_rpm=rpm,
                             duration_sec=duration,
-                            vector_key=VectorKey.from_floats(sec_id, s_pos, e_pos),
                             is_arc=False,
                             arc_center=None,
                             arc_plane="ZX" if sec_type == 1 else "XY",
                             metadata={
-                                "tool_id": tool_id,
                                 "in_cycle": True,
-                                "batch_idx": batch_idx,
-                                "batch_sec_id": orig_sec_id,
                                 "sec_idx": sec_idx,
                                 "event_idx": ev_idx,
                             },
@@ -630,14 +622,10 @@ def parse_context_dump(
                         feedrate_mmpm=0.0,
                         spindle_rpm=spindle_rpm,
                         duration_sec=dwell_sec,
-                        vector_key=VectorKey.from_floats(sec_id, cur_p, cur_p),
                         is_arc=False,
                         arc_center=None,
                         metadata={
-                            "tool_id": tool_id,
                             "in_cycle": in_cycle_active,
-                            "batch_idx": batch_idx,
-                            "batch_sec_id": orig_sec_id,
                             "sec_idx": sec_idx,
                             "event_idx": ev_idx,
                         },
@@ -773,7 +761,8 @@ def extract_workpiece_from_context(
     ).lower()
     _dbg_ctx(f"extract_workpiece_from_context: stock_mode='{stock_mode}', fallback={fallback_workpiece}")
 
-    is_previous_mode = any(k in stock_mode for k in ("previous", "preceding", "prev", "rest"))
+    mode_cat = classify_stock_mode(stock_mode)
+    is_previous_mode = (mode_cat == "previous_setup")
 
     # 1. Native exported STL stock mesh (only for previous/preceding modes)
     stl_path = context_data.get("stockPath")
@@ -783,22 +772,19 @@ def extract_workpiece_from_context(
                 raise FileNotFoundError(
                     f"Exported stock STL mesh file not found: '{stl_path}'."
                 )
-            if np is None:
-                try:
-                    import numpy as _np
-                    globals()["np"] = _np
-                except ImportError as exc:
-                    raise RuntimeError(
-                        "Loading in-process STL stock requires 'numpy', which is not installed "
-                        "(offline first-time setup failed). Connect to the internet and re-run Post Clear."
-                    ) from exc
+            try:
+                import numpy as np
+            except (ImportError, OSError) as exc:
+                raise RuntimeError(
+                    "Loading in-process STL stock requires 'numpy', which is not installed "
+                    "(offline first-time setup failed). Connect to the internet and re-run Post Clear."
+                ) from exc
             try:
                 from geometry.solid_mesh import (
                     load_stl_mesh,
                     revolve_mesh_to_lathe_stock,
                     SolidMeshStock3D,
                 )
-                from geometry.models import WorkpieceDefinition
 
                 try:
                     raw_verts, raw_indices = load_stl_mesh(stl_path, is_inch=False)
@@ -880,6 +866,8 @@ def extract_workpiece_from_context(
                         max_radial_offset_mm=None,
                         fixtures=fb_fixtures,
                     )
+                    if not wp.fixtures and isinstance(wp.stock, AxisymmetricStock2D):
+                        wp.fixtures = [AxisymmetricChuckObstacle.from_stock(wp.stock)]
                 else:
                     stock = SolidMeshStock3D.from_mesh(vertices_mm, raw_indices)
                     _dbg_ctx(
@@ -901,9 +889,7 @@ def extract_workpiece_from_context(
                 f"because stockMode is '{stock_mode}' (not previous/preceding)"
             )
 
-    if is_previous_mode:
-        return fallback_workpiece
-    if any(k in stock_mode for k in ("solid", "body")):
+    if mode_cat in ("previous_setup", "solid"):
         return fallback_workpiece
 
     wp = context_data.get("workpiece")
@@ -990,6 +976,12 @@ def extract_workpiece_from_context(
         if 0.0 < fb_r_in < r_outer:
             r_inner = fb_r_in
 
+    stock = AxisymmetricStock2D(
+        z_min=z_min,
+        z_max=z_max,
+        outer_radius=r_outer,
+        inner_radius=r_inner,
+    )
     fixtures = []
     fb_fixtures = getattr(fallback_workpiece, "fixtures", None) if fallback_workpiece else None
     if fb_fixtures:
@@ -997,23 +989,18 @@ def extract_workpiece_from_context(
         for f in fb_fixtures:
             if hasattr(f, "z_min") and hasattr(f, "z_max"):
                 fixtures.append(
-                    AxisymmetricChuckObstacle(
+                    AxisymmetricChuckObstacle.from_stock(
+                        stock,
                         z_min=float(f.z_min) + dz,
                         z_max=float(f.z_max) + dz,
                         outer_radius=max(float(getattr(f, "outer_radius", r_outer + 30.0)), r_outer + 10.0),
-                        clamping_radius=r_outer,
                     )
                 )
             else:
                 fixtures.append(f)
 
     return WorkpieceDefinition(
-        stock=AxisymmetricStock2D(
-            z_min=z_min,
-            z_max=z_max,
-            outer_radius=r_outer,
-            inner_radius=r_inner,
-        ),
+        stock=stock,
         fixtures=fixtures,
     )
 

@@ -18,6 +18,7 @@ Validates:
 """
 
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -315,14 +316,25 @@ class TestBatch5DumperConfigSecurity(unittest.TestCase):
 
     def test_m1_mkdtemp_0o700_permissions(self):
         """Verify per-run temp directory created for dumper config has mode 0o700."""
-        with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
-            cfg_path = PostClear._WriteDumperConfig(base_post_path=tmp_cps.name)
-            self.assertTrue(os.path.isfile(cfg_path))
-            dir_path = os.path.dirname(cfg_path)
-            # Check filesystem permission bits
-            mode = stat.S_IMODE(os.stat(dir_path).st_mode)
-            self.assertEqual(mode, 0o700, f"Expected 0o700 directory mode, got {oct(mode)}")
-            PostClear._ClearDumperConfig(dir_path)
+        orig_env = os.environ.get("DUMPER_CONFIG_PATH")
+        dir_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
+                cfg_path = PostClear._WriteDumperConfig(base_post_path=tmp_cps.name)
+                self.assertTrue(os.path.isfile(cfg_path))
+                dir_path = os.path.dirname(cfg_path)
+                # Check filesystem permission bits
+                mode = stat.S_IMODE(os.stat(dir_path).st_mode)
+                self.assertEqual(mode, 0o700, f"Expected 0o700 directory mode, got {oct(mode)}")
+        finally:
+            if orig_env is None:
+                os.environ.pop("DUMPER_CONFIG_PATH", None)
+            else:
+                os.environ["DUMPER_CONFIG_PATH"] = orig_env
+            os.environ.pop("BASE_POST", None)
+            os.environ.pop("TARGET_INTERMEDIATE_CNC", None)
+            if dir_path:
+                shutil.rmtree(dir_path, ignore_errors=True)
 
     def test_m1_dumper_config_only_written_to_dumper_config_path(self):
         """Verify _WriteDumperConfig writes ONLY to DUMPER_CONFIG_PATH and never $TMPDIR or /tmp."""
@@ -338,24 +350,29 @@ class TestBatch5DumperConfigSecurity(unittest.TestCase):
                 except Exception:
                     pass
 
-        with tempfile.TemporaryDirectory() as target_dir:
-            os.chmod(target_dir, 0o700)
-            with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
-                cfg_path = PostClear._WriteDumperConfig(
-                    base_post_path=tmp_cps.name,
-                    target_dir=target_dir,
-                )
-                self.assertEqual(os.environ.get("DUMPER_CONFIG_PATH"), cfg_path)
-                self.assertTrue(os.path.isfile(cfg_path))
+        orig_env = os.environ.get("DUMPER_CONFIG_PATH")
+        try:
+            with tempfile.TemporaryDirectory() as target_dir:
+                os.chmod(target_dir, 0o700)
+                with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
+                    cfg_path = PostClear._WriteDumperConfig(
+                        base_post_path=tmp_cps.name,
+                        target_dir=target_dir,
+                    )
+                    self.assertEqual(os.environ.get("DUMPER_CONFIG_PATH"), cfg_path)
+                    self.assertTrue(os.path.isfile(cfg_path))
 
-                # Verify neither $TMPDIR nor /tmp received the config
-                self.assertFalse(os.path.isfile(stray_tmpdir), "Dumper config must NOT be written to $TMPDIR")
-                if os.path.isdir("/tmp") and os.path.abspath(tmp_sys) != "/tmp":
-                    self.assertFalse(os.path.isfile(stray_tmp), "Dumper config must NOT be written to /tmp")
-
-                PostClear._ClearDumperConfig(target_dir)
-                self.assertFalse(os.path.isfile(cfg_path))
-                self.assertNotIn("DUMPER_CONFIG_PATH", os.environ)
+                    # Verify neither $TMPDIR nor /tmp received the config
+                    self.assertFalse(os.path.isfile(stray_tmpdir), "Dumper config must NOT be written to $TMPDIR")
+                    if os.path.isdir("/tmp") and os.path.abspath(tmp_sys) != "/tmp":
+                        self.assertFalse(os.path.isfile(stray_tmp), "Dumper config must NOT be written to /tmp")
+        finally:
+            if orig_env is None:
+                os.environ.pop("DUMPER_CONFIG_PATH", None)
+            else:
+                os.environ["DUMPER_CONFIG_PATH"] = orig_env
+            os.environ.pop("BASE_POST", None)
+            os.environ.pop("TARGET_INTERMEDIATE_CNC", None)
 
     def test_m1_universal_dumper_ignores_tmp_fallbacks(self):
         """Verify universal_dumper.cps contains no /tmp or getTemporaryFolder fallback candidates in _getDumperConfig."""

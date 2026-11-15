@@ -226,7 +226,6 @@ class TestCallerOnlyPromotionLengthFilter(unittest.TestCase):
             ToolAssembly,
             ToolCompensationQuadrant,
             Vector3D,
-            VectorKey,
             WorkpieceDefinition,
         )
 
@@ -248,7 +247,6 @@ class TestCallerOnlyPromotionLengthFilter(unittest.TestCase):
             feedrate_mmpm=500.0,
             spindle_rpm=5000.0,
             duration_sec=0.03,
-            vector_key=VectorKey.from_floats(0, p1, p2),
             metadata={"sec_idx": 0, "event_idx": 0},
         )
         self.assertTrue(verifier.step(short_seg).is_air_move)
@@ -281,7 +279,6 @@ class TestCallerOnlyPromotionLengthFilter(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1500.0,
             duration_sec=0.03,
-            vector_key=VectorKey.from_floats(0, lp1, lp2),
             metadata={"sec_idx": 0, "event_idx": 0},
         )
         self.assertTrue(lathe_v.step(lathe_short).is_air_move)

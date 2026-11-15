@@ -979,8 +979,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         self.current_time_sec += max(0.0, float(move.duration_sec))
         self.total_machining_time_sec += max(0.0, float(move.duration_sec))
 
-        v_key_str = move.vector_key.to_wrapper_str()
-
         meta = move.metadata or {}
         if bool(meta.get("tilted_section", False)) or bool(meta.get("multi_axis", False)):
             sec_idx = meta.get("sec_idx", move.sec_id)
@@ -990,7 +988,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
             self.record_event_evaluation(move, is_air_move=False, collisions=[])
             return MoveEvaluation(
                 segment_id=move.segment_id,
-                vector_key=v_key_str,
                 is_air_move=False,
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
@@ -1003,14 +1000,13 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         if move.is_arc and move.arc_center is not None:
             return self._step_arc(move)
 
-        return self._step_linear(move.start, move.end, move, v_key_str)
+        return self._step_linear(move.start, move.end, move)
 
     def _step_linear(
         self,
         p1: Vector3D,
         p2: Vector3D,
         move: MotionSegment,
-        v_key_str: str = "",
         record_metrics: bool = True,
     ) -> MoveEvaluation:
         """Process a single linear kinematic move."""
@@ -1072,7 +1068,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                 self.record_event_evaluation(move, is_air_move=is_air_outside, collisions=[])
             return MoveEvaluation(
                 segment_id=move.segment_id,
-                vector_key=v_key_str,
                 is_air_move=is_air_outside,
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
@@ -1154,7 +1149,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                             if pen_vol >= self.min_collision_volume_mm3:
                                 col = CollisionRecord(
                                     segment_id=move.segment_id,
-                                    vector_key=v_key_str,
                                     kind=CollisionKind.HOLDER_STRIKE,
                                     timestamp_sec=self.current_time_sec,
                                     contact_point=Vector3D(p2.x, p2.y, float(p2.z + body_len)),
@@ -1193,7 +1187,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                     if pen_vol >= self.min_collision_volume_mm3:
                         col = CollisionRecord(
                             segment_id=move.segment_id,
-                            vector_key=v_key_str,
                             kind=CollisionKind.SHANK_RUB,
                             timestamp_sec=self.current_time_sec,
                             contact_point=Vector3D(p2.x, p2.y, float(p2.z + flute_len)),
@@ -1221,7 +1214,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
                 pen_vol = float(np.sum(stock_cut_depth[rapid_into_stock_mask])) * self.grid.cell_area_mm2
                 col = CollisionRecord(
                     segment_id=move.segment_id,
-                    vector_key=v_key_str,
                     kind=CollisionKind.RAPID_INTO_STOCK,
                     timestamp_sec=self.current_time_sec,
                     contact_point=Vector3D(p2.x, p2.y, p2.z),
@@ -1241,7 +1233,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
             # Rapid moves do not modify stock or get promoted
             return MoveEvaluation(
                 segment_id=move.segment_id,
-                vector_key=v_key_str,
                 is_air_move=True,
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
@@ -1399,7 +1390,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
 
         return MoveEvaluation(
             segment_id=move.segment_id,
-            vector_key=v_key_str,
             is_air_move=is_air_move,
             material_removed_mm3=vol_removed,
             instantaneous_mrr=mrr_rate,
@@ -1415,7 +1405,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         p2 = move.end
         center = move.arc_center
         assert center is not None
-        v_key_str = move.vector_key.to_wrapper_str()
 
         plane = str(getattr(move, "arc_plane", "XY") or "XY").upper()
         # Right-handed cyclic plane axes (u, v) with normal u x v and linear axis w:
@@ -1444,7 +1433,7 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         r1 = math.hypot(u1 - cu, v1 - cv)
         r2 = math.hypot(u2 - cu, v2 - cv)
         if r1 < 1e-6 and r2 < 1e-6:
-            return self._step_linear(p1, p2, move, v_key_str, record_metrics=True)
+            return self._step_linear(p1, p2, move, record_metrics=True)
 
         theta1 = math.atan2(v1 - cv, u1 - cu)
         theta2 = math.atan2(v2 - cv, u2 - cu)
@@ -1485,7 +1474,7 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
             sub_p1 = _to_vec(cu + r_a * math.cos(ang_a), cv + r_a * math.sin(ang_a), w1 + t_a * (w2 - w1))
             sub_p2 = _to_vec(cu + r_b * math.cos(ang_b), cv + r_b * math.sin(ang_b), w1 + t_b * (w2 - w1))
 
-            sub_eval = self._step_linear(sub_p1, sub_p2, move, v_key_str, record_metrics=False)
+            sub_eval = self._step_linear(sub_p1, sub_p2, move, record_metrics=False)
             tot_vol += sub_eval.material_removed_mm3
             max_doc = max(max_doc, sub_eval.depth_of_cut_mm)
             if not sub_eval.is_air_move:
@@ -1517,7 +1506,6 @@ class MillHeightfieldVerifier(BaseVerificationEngine):
         meta_arc = getattr(move, "metadata", None) or {}
         return MoveEvaluation(
             segment_id=move.segment_id,
-            vector_key=v_key_str,
             is_air_move=is_air_all,
             material_removed_mm3=tot_vol,
             instantaneous_mrr=mrr_rate,

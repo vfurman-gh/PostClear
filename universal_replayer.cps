@@ -158,7 +158,6 @@ function makeSection(s, idx, allRawSections) {
     getWCSPlane: function() { return wp; },
     getSpindle: function() { return s.spindle; },
     getFeedMode: function() { return s.feedMode; },
-    toolOrientation: s.toolOrientation || 0,
     getToolOrientation: function() { return s.toolOrientation || 0; },
     getPartCatcher: function() { return s.partCatcher; },
     getTailstock: function() { return s.tailstock; },
@@ -555,9 +554,6 @@ function onClose() {
   }
 
   var buildVendor = new Function(
-    "writeln",
-    "writeWords",
-    "writeWords2",
     "var currentSection, tool, movement, radiusCompensation, spindleSpeed, cycle, cycleType, cycleExpanded, programName, programComment;\n" +
     "var onOpen, onComment, onPassThrough, onParameter, onSection, onSpindleSpeed, onOrientateSpindle, onMovement, onFeedMode, onRadiusCompensation, onDwell, onCommand, onManualNC, onRapid, onLinear, onCircular, onCycle, onCyclePoint, onCycleEnd, onSectionEnd, onClose;\n" +
     "var __didRepos = false;\n" +
@@ -731,7 +727,7 @@ function onClose() {
     "function expandCyclePoint(x, y, z) {\n" +
     "  cycleExpanded = true;\n" +
     "  var cEv = __getCurEv();\n" +
-    "  var list = (cEv && __didRepos) ? cEv.afterReposMoves : (cEv ? cEv.expandedMoves : null);\n" +
+    "  var list = cEv ? ((__didRepos && cEv.afterReposMoves) ? cEv.afterReposMoves : cEv.expandedMoves) : null;\n" +
     "  if (list) {\n" +
     "    for (var m = 0; m < list.length; ++m) {\n" +
     "      var mv = list[m];\n" +
@@ -779,7 +775,7 @@ function onClose() {
     "      break;\n" +
     "    }\n" +
     "  }\n" +
-    "  if (matched && matched.expanded && matched.expanded.length > 0) {\n" +
+    "  if (matched && Array.isArray(matched.expanded)) {\n" +
     "    for (var mi = 0; mi < matched.expanded.length; ++mi) {\n" +
     "      var mev = matched.expanded[mi];\n" +
     "      if (mev.type === 'onComment') { if (typeof onComment === 'function') onComment(mev.c); }\n" +
@@ -806,7 +802,7 @@ function onClose() {
     "  setGlobals: function(pn, pc) { programName = pn; programComment = pc; },\n" +
     "  setInSection: function(v) { __inSection = !!v; },\n" +
     "  enqueueManualNC: function(rec) {\n" +
-    "    __manualNCQueue.push({command: rec.command, value: rec.value, expanded: rec.expanded || [], used: false});\n" +
+    "    __manualNCQueue.push({command: rec.command, value: rec.value, expanded: Array.isArray(rec.expanded) ? rec.expanded : null, used: false});\n" +
     "  },\n" +
     "  getProperty: getProperty,\n" +
     "  setState: function(st) {\n" +
@@ -838,7 +834,6 @@ function onClose() {
     "    }\n" +
     "    return { highFeedMapping: hfm, useG0: ug };\n" +
     "  },\n" +
-    "  formatComment: (typeof formatComment === 'function') ? formatComment : null,\n" +
     "  writeComment: (typeof writeComment === 'function') ? writeComment : null,\n" +
     "  onOpen: (typeof onOpen === 'function') ? onOpen : null,\n" +
     "  onComment: (typeof onComment === 'function') ? onComment : null,\n" +
@@ -864,39 +859,7 @@ function onClose() {
     "};"
   );
 
-  var _origWriteln = writeln;
-  var _origWriteWords = writeWords;
-  var _origWriteWords2 = writeWords2;
-  var _promoCommentSuffix = "";
-  var _customWriteln = function(text) {
-    if (_promoCommentSuffix && typeof text === "string" && text.trim().length > 0) {
-      var sfx = _promoCommentSuffix;
-      _promoCommentSuffix = "";
-      _origWriteln(text + " " + sfx);
-    } else {
-      _origWriteln(text);
-    }
-  };
-  var _customWriteWords = function() {
-    var args = Array.prototype.slice.call(arguments);
-    if (_promoCommentSuffix) {
-      var sfx = _promoCommentSuffix;
-      _promoCommentSuffix = "";
-      args.push(sfx);
-    }
-    _origWriteWords.apply(null, args);
-  };
-  var _customWriteWords2 = function() {
-    var args = Array.prototype.slice.call(arguments);
-    if (_promoCommentSuffix) {
-      var sfx = _promoCommentSuffix;
-      _promoCommentSuffix = "";
-      args.push(sfx);
-    }
-    _origWriteWords2.apply(null, args);
-  };
-
-  var vendor = buildVendor(_customWriteln, _customWriteWords, _customWriteWords2);
+  var vendor = buildVendor();
   _vendorGetProperty = function(name, def) {
     return (vendor && typeof vendor.getProperty === "function") ? vendor.getProperty(name, def) : def;
   };
@@ -966,15 +929,6 @@ function onClose() {
         }
       } catch (e) {}
     }
-    if (hfm === null && typeof highFeedMapping !== "undefined") {
-      hfm = highFeedMapping;
-    }
-    if (ug === null && typeof getProperty === "function") {
-      try {
-        var p = getProperty("useG0");
-        if (typeof p === "boolean") ug = p;
-      } catch (e) {}
-    }
     var isDogLeg = false;
     if (hfm !== null && hfm !== 0) {
       isDogLeg = true;
@@ -989,12 +943,6 @@ function onClose() {
     try {
       if (vendor && typeof vendor.writeComment === "function") {
         vendor.writeComment(msg);
-        return;
-      }
-    } catch (e) {}
-    try {
-      if (typeof writeComment === "function") {
-        writeComment(msg);
         return;
       }
     } catch (e) {}
@@ -1186,14 +1134,8 @@ function onClose() {
           }
           if (shouldPromote && !inCycle && !(ev.rc) && !curSync) {
             restoredCount += 1;
-            _promoCommentSuffix = (typeof vendor.formatComment === "function")
-              ? vendor.formatComment("Rapid restored")
-              : "(Rapid restored)";
-            try {
-              if (vendor.onRapid) vendor.onRapid(lEnd.x, lEnd.y, lEnd.z);
-            } finally {
-              _promoCommentSuffix = "";
-            }
+            _logReplayerComment("Rapid restored");
+            if (vendor.onRapid) vendor.onRapid(lEnd.x, lEnd.y, lEnd.z);
           } else {
             if (vendor.onLinear) vendor.onLinear(lEnd.x, lEnd.y, lEnd.z, ev.feed);
           }
@@ -1281,9 +1223,9 @@ function onClose() {
       diagWritten = true;
     } catch (e) {}
   }
-  if (!diagWritten && (frameMismatchSections.length > 0 || multiAxisSections.length > 0 || diagPath)) {
+  if (!diagWritten && (frameMismatchSections.length > 0 || multiAxisSections.length > 0)) {
     try {
-      _origWriteln("(POSTCLEAR_REPLAY_DIAG:" + JSON.stringify(replayDiag) + ")");
+      writeln("(POSTCLEAR_REPLAY_DIAG:" + JSON.stringify(replayDiag) + ")");
     } catch (e) {}
   }
 }

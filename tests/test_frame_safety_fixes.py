@@ -85,7 +85,9 @@ class TestFrameSafetyAndToolDataFixes(unittest.TestCase):
             with open(base_post, "w", encoding="utf-8") as f:
                 f.write('description = "Base"; capabilities = CAPABILITY_MILLING; unit = IN;\n')
             dump_json = os.path.join(tmp_dir, "dump.json")
-            ctx = orch.dump_context(self.milling_cnc, base_post, dump_json)
+            orch.dump_intermediate_to_json(self.milling_cnc, base_post, dump_json)
+            with open(dump_json, "r", encoding="utf-8") as f:
+                ctx = json.load(f)
             self.assertGreater(len(ctx["sections"]), 0)
             t = ctx["sections"][0]["tool"]
             self.assertIn("_holderSections", t)
@@ -517,7 +519,10 @@ class TestFrameSafetyAndToolDataFixes(unittest.TestCase):
             if not os.path.isfile(post_path):
                 continue
             with self.subTest(post=post_name), tempfile.TemporaryDirectory() as tmp_dir:
-                b0 = orch.dump_context(self.milling_cnc, post_path, os.path.join(tmp_dir, "b0.json"))
+                b0_json = os.path.join(tmp_dir, "b0.json")
+                orch.dump_intermediate_to_json(self.milling_cnc, post_path, b0_json)
+                with open(b0_json, "r", encoding="utf-8") as f:
+                    b0 = json.load(f)
                 two_sec = copy.deepcopy(b0)
                 if not str(two_sec.get("programName", "")).strip().isdigit():
                     two_sec["programName"] = "1001"

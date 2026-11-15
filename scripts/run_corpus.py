@@ -502,7 +502,10 @@ def load_standalone_cnc_fixture(
     abs_cnc = os.path.abspath(cnc_path)
     orch = orchestrator or PipelineOrchestrator()
     with tempfile.TemporaryDirectory() as td:
-        ctx = orch.dump_context(abs_cnc, probe_post_path, os.path.join(td, "probe.json"))
+        probe_json = os.path.join(td, "probe.json")
+        orch.dump_intermediate_to_json(abs_cnc, probe_post_path, probe_json)
+        with open(probe_json, "r", encoding="utf-8") as f:
+            ctx = json.load(f)
     is_turning = any(
         s.get("type", 0) == 1 or bool(s.get("tool", {}).get("_isTurningTool", False))
         for s in ctx.get("sections", [])
@@ -621,7 +624,7 @@ _TIMESTAMP_DATE_RE = re.compile(r"\b(?:19|20)\d{2}[-/]\d{2}[-/]\d{2}\b")
 _TIMESTAMP_TIME_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 _CANNED_CYCLE_RE = re.compile(r"\bG0*(?:32|33|73|74|76|8[1-9])\b", re.IGNORECASE)
 _PURE_WRAPPER_COMMENT_RE = re.compile(
-    r"^\s*(?:N\d+\s+)?(?:[;'(]\s*)?UNIVERSAL WRAPPER:?\s+RESTORED \d+ G0 RAPID MOVES\s*\)?\s*$",
+    r"^\s*(?:N\d+\s+)?(?:[;'(]\s*)?(?:UNIVERSAL WRAPPER:?\s+RESTORED \d+ G0 RAPID MOVES|RAPID RESTORED)\s*\)?\s*$",
     re.IGNORECASE,
 )
 _AXIS_TOKEN_RE = re.compile(r"([XYZABC])\s*([+-]?(?:\d+\.?\d*|\.\d+))", re.IGNORECASE)

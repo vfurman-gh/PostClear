@@ -124,7 +124,6 @@ from geometry.models import (
     SolidMeshStock3D,
     ToolAssembly,
     Vector3D,
-    VectorKey,
     VerificationReport,
     WorkpieceDefinition,
 )
@@ -240,8 +239,6 @@ class TestCorpusRunnerTop10AndOracles(unittest.TestCase):
         self.assertIn("Canned cycle", cyc_msg)
 
     def test_noop_verifier_returns_empty_report_with_operation_names(self):
-        vk0 = VectorKey.from_floats(0, Vector3D(0, 0, 10), Vector3D(10, 0, 10))
-        vk1 = VectorKey.from_floats(1, Vector3D(10, 0, 10), Vector3D(20, 0, 10))
         segs = [
             MotionSegment(
                 segment_id=0,
@@ -253,7 +250,6 @@ class TestCorpusRunnerTop10AndOracles(unittest.TestCase):
                 feedrate_mmpm=500.0,
                 spindle_rpm=10000.0,
                 duration_sec=1.2,
-                vector_key=vk0,
             ),
             MotionSegment(
                 segment_id=1,
@@ -265,7 +261,6 @@ class TestCorpusRunnerTop10AndOracles(unittest.TestCase):
                 feedrate_mmpm=500.0,
                 spindle_rpm=10000.0,
                 duration_sec=0.6,
-                vector_key=vk0,
             ),
             MotionSegment(
                 segment_id=2,
@@ -277,7 +272,6 @@ class TestCorpusRunnerTop10AndOracles(unittest.TestCase):
                 feedrate_mmpm=5000.0,
                 spindle_rpm=10000.0,
                 duration_sec=0.1,
-                vector_key=vk1,
             ),
         ]
         v = run_corpus._NoOpVerifier()
@@ -303,7 +297,6 @@ class TestCorpusRunnerTop10AndOracles(unittest.TestCase):
                 ),
             )
         }
-        vk = VectorKey.from_floats(0, Vector3D(0, 0, 5), Vector3D(20, 0, 5))
         seg = MotionSegment(
             segment_id=0,
             op_id="Op1",
@@ -314,7 +307,6 @@ class TestCorpusRunnerTop10AndOracles(unittest.TestCase):
             feedrate_mmpm=600.0,
             spindle_rpm=12000.0,
             duration_sec=2.0,
-            vector_key=vk,
             metadata={"sec_idx": 0, "event_idx": 1},
         )
 
@@ -367,7 +359,6 @@ class TestCorpusRunnerTop10AndOracles(unittest.TestCase):
                 feedrate_mmpm=600.0,
                 spindle_rpm=12000.0,
                 duration_sec=2.5,
-                vector_key=vk,
                 metadata={"sec_idx": 0, "event_idx": 1},
             )
             rep3 = mv.verify_toolpath([seg_diff], tools, wp)

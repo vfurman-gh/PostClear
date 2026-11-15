@@ -54,7 +54,6 @@ class PipelineMockVerifier(IVerificationEngine):
         is_air = move.start.x > 10.0 and move.end.x < 7.0 and abs(move.start.z - move.end.z) < 1e-3
         return MoveEvaluation(
             segment_id=move.segment_id,
-            vector_key=move.vector_key.to_wrapper_str(),
             is_air_move=is_air,
             material_removed_mm3=0.0 if is_air else 25.0,
             instantaneous_mrr=0.0 if is_air else 250.0,
@@ -139,7 +138,7 @@ class TestFullPipelineMock(unittest.TestCase):
             # 2. Assertions on Final G-Code
             self.assertTrue(os.path.isfile(out_cnc))
             self.assertIn("G21", gcode)
-            self.assertIn("N32 G0 X11.938 ;RAPID RESTORED", gcode, "Expected promoted G0 move with inline comment in block N32")
+            self.assertIn(";RAPID RESTORED\nN32 G0 X11.938", gcode, "Expected promoted G0 move with standalone comment above block N32")
             self.assertIn("N33 G1 Z-1.524 F0.0508", gcode, "Expected restored modal G1 on block N33")
             self.assertIn(";UNIVERSAL WRAPPER RESTORED", gcode)
 
@@ -434,7 +433,9 @@ class TestUniversalReplayerPromotions(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_path = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.fixture_cnc, self.base_cps, b0_path)
+            self.orchestrator.dump_intermediate_to_json(self.fixture_cnc, self.base_cps, b0_path)
+            with open(b0_path, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
 
             # Subtest 1: With ev.promote = True on a moving linear event
             ctx_promoted = copy.deepcopy(b0_ctx)
@@ -479,7 +480,9 @@ class TestUniversalReplayerPromotions(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_path = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.fixture_cnc, self.base_cps, b0_path)
+            self.orchestrator.dump_intermediate_to_json(self.fixture_cnc, self.base_cps, b0_path)
+            with open(b0_path, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
 
             ctx_sync = copy.deepcopy(b0_ctx)
             ctx_sync["sections"][0]["params"]["operation:threadPitch"] = 1.5
@@ -494,12 +497,13 @@ class TestUniversalReplayerPromotions(unittest.TestCase):
 
             # Plant an old-style PROMOTED_MOVES_JSON file
             map_file = os.path.join(tmp_dir, "promoted_map.json")
-            from geometry.models import VectorKey, Vector3D
-            k = VectorKey.from_floats(
-                0,
-                Vector3D(float(target_ev["sx"]), float(target_ev["sy"]), float(target_ev["sz"])),
-                Vector3D(float(target_ev["x"]), float(target_ev["y"]), float(target_ev["z"])),
-            ).to_wrapper_str()
+            sx_i = round(float(target_ev["sx"]) * 10000)
+            sy_i = round(float(target_ev["sy"]) * 10000)
+            sz_i = round(float(target_ev["sz"]) * 10000)
+            ex_i = round(float(target_ev["x"]) * 10000)
+            ey_i = round(float(target_ev["y"]) * 10000)
+            ez_i = round(float(target_ev["z"]) * 10000)
+            k = f"0:{sx_i},{sy_i},{sz_i}->{ex_i},{ey_i},{ez_i}"
             with open(map_file, "w") as f:
                 json.dump({k: {"minOccur": 1}}, f)
 
@@ -532,7 +536,9 @@ class TestUniversalReplayerPromotions(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
             b0_path = os.path.join(tmp_dir, "batch_0.json")
-            b0_ctx = self.orchestrator.dump_context(self.fixture_cnc, self.base_cps, b0_path)
+            self.orchestrator.dump_intermediate_to_json(self.fixture_cnc, self.base_cps, b0_path)
+            with open(b0_path, "r", encoding="utf-8") as f:
+                b0_ctx = json.load(f)
 
             ctx_promoted = copy.deepcopy(b0_ctx)
             target_ev = None

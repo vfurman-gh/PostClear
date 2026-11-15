@@ -52,36 +52,6 @@ class Vector3D:
     z: float
 
 
-@dataclass(frozen=True)
-class VectorKey:
-    """
-    Spatial vector address matching universal_wrapper.cps format.
-    Normalized to fixed integer precision (0.0001 resolution).
-    """
-    sec_id: int
-    start_x: int
-    start_y: int
-    start_z: int
-    end_x: int
-    end_y: int
-    end_z: int
-
-    @classmethod
-    def from_floats(cls, sec_id: int, start: Vector3D, end: Vector3D) -> "VectorKey":
-        return cls(
-            sec_id=sec_id,
-            start_x=round(start.x * 10000),
-            start_y=round(start.y * 10000),
-            start_z=round(start.z * 10000),
-            end_x=round(end.x * 10000),
-            end_y=round(end.y * 10000),
-            end_z=round(end.z * 10000),
-        )
-
-    def to_wrapper_str(self) -> str:
-        return f"{self.sec_id}:{self.start_x},{self.start_y},{self.start_z}->{self.end_x},{self.end_y},{self.end_z}"
-
-
 try:
     import numpy as np
 except (ImportError, OSError):
@@ -151,6 +121,33 @@ class AxisymmetricChuckObstacle:
     outer_radius: float
     clamping_radius: float
 
+    @classmethod
+    def from_stock(
+        cls,
+        stock: AxisymmetricStock2D,
+        clamp_len_mm: float = 0.0,
+        back_ext_mm: float = 50.0,
+        jaw_height_mm: float = 30.0,
+        z_min: Optional[float] = None,
+        z_max: Optional[float] = None,
+        outer_radius: Optional[float] = None,
+    ) -> "AxisymmetricChuckObstacle":
+        """Build a lathe chuck obstacle anchored to an AxisymmetricStock2D back face."""
+        resolved_z_min = float(z_min) if z_min is not None else float(stock.z_min) - float(back_ext_mm)
+        resolved_z_max = float(z_max) if z_max is not None else float(stock.z_min) + float(clamp_len_mm)
+        resolved_clamp_r = float(stock.outer_radius)
+        resolved_outer_r = (
+            float(outer_radius)
+            if outer_radius is not None
+            else resolved_clamp_r + float(jaw_height_mm)
+        )
+        return cls(
+            z_min=resolved_z_min,
+            z_max=resolved_z_max,
+            outer_radius=resolved_outer_r,
+            clamping_radius=resolved_clamp_r,
+        )
+
 
 WorkpieceGeometry = Union[AxisymmetricStock2D, BoxStock3D, SolidMeshStock3D]
 
@@ -213,7 +210,6 @@ class MotionSegment:
     feedrate_mmpm: float          # Standardized metric feedrate (mm/min)
     spindle_rpm: float
     duration_sec: float           # Explicit duration (handles G4 dwells where distance = 0)
-    vector_key: VectorKey         # Deterministic spatial key for universal_wrapper
     is_arc: bool = False
     arc_center: Optional[Vector3D] = None
     arc_plane: str = "XY"         # 'XY' (G17), 'ZX' (G18), 'YZ' (G19)
@@ -223,7 +219,6 @@ class MotionSegment:
 @dataclass
 class CollisionRecord:
     segment_id: int
-    vector_key: str
     kind: CollisionKind
     timestamp_sec: float
     contact_point: Vector3D
@@ -238,7 +233,6 @@ class CollisionRecord:
 class MoveEvaluation:
     """Evaluation output for an atomic step."""
     segment_id: int
-    vector_key: str
     is_air_move: bool             # True if move removed 0 stock and cleared obstacles by >= margin
     material_removed_mm3: float   # Volume removed during this move
     instantaneous_mrr: float      # mm^3/min

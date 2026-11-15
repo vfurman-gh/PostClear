@@ -729,12 +729,15 @@ def extract_solid_workpiece_from_fusion_setup(
                         clamp_len_mm = float(v_sub) * 10.0  # cm to mm
                         z_min_mm = float(vertices_mm[:, 2].min())
                         r_max_mm = float(np.hypot(vertices_mm[:, 0], vertices_mm[:, 1]).max())
+                        temp_stock = AxisymmetricStock2D(
+                            z_min=z_min_mm,
+                            z_max=float(vertices_mm[:, 2].max()),
+                            outer_radius=r_max_mm,
+                        )
                         fixtures.append(
-                            AxisymmetricChuckObstacle(
-                                z_min=z_min_mm - 50.0,
-                                z_max=z_min_mm + clamp_len_mm,
-                                outer_radius=r_max_mm + 30.0,
-                                clamping_radius=r_max_mm,
+                            AxisymmetricChuckObstacle.from_stock(
+                                temp_stock,
+                                clamp_len_mm=clamp_len_mm,
                             )
                         )
             except Exception:

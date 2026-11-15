@@ -66,13 +66,9 @@ if (!basePostPath) {
     basePostPath = getEnvironmentVariable("BASE_POST");
   } catch (e) {}
 }
-var vendorExtension = "nc";
 if (basePostPath && FileSystem.isFile(basePostPath)) {
   try {
     include(basePostPath);
-    if (typeof extension === "string" && extension && extension !== "json") {
-      vendorExtension = extension;
-    }
   } catch (e) {}
 }
 
@@ -187,10 +183,8 @@ var dumpData = {
   highFeedrate: 0,
   programName: "",
   programComment: "",
-  vendorExtension: vendorExtension,
   postProperties: _cfgProps,
-  rapidMode: _getRapidMode(),
-  machine: {},
+  rapidMode: null,
   workpiece: null,
   stockPath: "",
   stockExport: {
@@ -321,23 +315,6 @@ function serializeBox(b) {
   };
 }
 
-onMachine = function() {
-  if (typeof machineConfiguration !== "undefined" && machineConfiguration) {
-    dumpData.machine = {
-      vendor: machineConfiguration.getVendor ? machineConfiguration.getVendor() : "",
-      model: machineConfiguration.getModel ? machineConfiguration.getModel() : "",
-      description: machineConfiguration.getDescription ? machineConfiguration.getDescription() : "",
-      multiAxis: machineConfiguration.isMultiAxisConfiguration ? machineConfiguration.isMultiAxisConfiguration() : false,
-      hasHomeX: machineConfiguration.hasHomePositionX ? machineConfiguration.hasHomePositionX() : false,
-      homeX: machineConfiguration.getHomePositionX ? machineConfiguration.getHomePositionX() : 0,
-      hasHomeY: machineConfiguration.hasHomePositionY ? machineConfiguration.hasHomePositionY() : false,
-      homeY: machineConfiguration.getHomePositionY ? machineConfiguration.getHomePositionY() : 0,
-      hasHomeZ: machineConfiguration.hasHomePositionZ ? machineConfiguration.hasHomePositionZ() : false,
-      homeZ: machineConfiguration.getHomePositionZ ? machineConfiguration.getHomePositionZ() : 0
-    };
-  }
-};
-
 onOpen = function() {
   opened = true;
   dumpData.unit = unit;
@@ -391,6 +368,8 @@ onOpen = function() {
     var sMode = (dumpData.stockMode || "").toLowerCase();
     var isUnsupported = sMode.indexOf("previous") !== -1 ||
                         sMode.indexOf("preceding") !== -1 ||
+                        sMode.indexOf("prev") !== -1 ||
+                        sMode.indexOf("rest") !== -1 ||
                         sMode.indexOf("solid") !== -1 ||
                         sMode.indexOf("body") !== -1;
     if (!isUnsupported) {
@@ -399,7 +378,6 @@ onOpen = function() {
       dumpData.workpiece = null;
     }
   } catch (e) {}
-  _captureStockFile();
 };
 
 onComment = function(c) {
@@ -634,45 +612,41 @@ onManualNC = function(command, value) {
 };
 
 onRapid = function(x, y, z) {
+  if (capturingExpanded) {
+    capturingExpanded.push({type: "onRapid", x: x, y: y, z: z, movement: movement});
+    return;
+  }
   var start = getCurrentPosition();
-  var obj = {
+  curSec.events.push({
     type: "onRapid", x: x, y: y, z: z,
     sx: start.x, sy: start.y, sz: start.z,
     movement: movement, rc: radiusCompensation, rpm: spindleSpeed
-  };
-  if (capturingExpanded) {
-    capturingExpanded.push(obj);
-    return;
-  }
-  curSec.events.push(obj);
+  });
 };
 
 onLinear = function(x, y, z, feed) {
+  if (capturingExpanded) {
+    capturingExpanded.push({type: "onLinear", x: x, y: y, z: z, feed: feed, movement: movement});
+    return;
+  }
   var start = getCurrentPosition();
-  var obj = {
+  curSec.events.push({
     type: "onLinear", x: x, y: y, z: z, feed: feed,
     sx: start.x, sy: start.y, sz: start.z,
     movement: movement, rc: radiusCompensation, rpm: spindleSpeed,
     sync: (typeof isSpeedFeedSynchronizationActive === "function") ? isSpeedFeedSynchronizationActive() : false
-  };
-  if (capturingExpanded) {
-    capturingExpanded.push(obj);
-    return;
-  }
-  curSec.events.push(obj);
+  });
 };
 
 onRapid5D = function(x, y, z, a, b, c) {
   if (curSec) {
     curSec.has5DMoves = true;
-    curSec.events.push({type: "onRapid5D", x: x, y: y, z: z, a: a, b: b, c: c});
   }
 };
 
 onLinear5D = function(x, y, z, a, b, c, feed) {
   if (curSec) {
     curSec.has5DMoves = true;
-    curSec.events.push({type: "onLinear5D", x: x, y: y, z: z, a: a, b: b, c: c, feed: feed});
   }
 };
 
@@ -754,10 +728,12 @@ onCyclePoint = function(x, y, z) {
     try {
       repositionToCycleClearance(cycle, x, y, z);
     } catch (e) {}
-    capturingExpanded = afterReposMoves;
-    try {
-      expandCyclePoint(x, y, z);
-    } catch (e) {}
+    if (reposMoves.length > 0) {
+      capturingExpanded = afterReposMoves;
+      try {
+        expandCyclePoint(x, y, z);
+      } catch (e) {}
+    }
     capturingExpanded = null;
 
     setCurrentPosition(start);
@@ -774,9 +750,11 @@ onCyclePoint = function(x, y, z) {
     sx: start.x, sy: start.y, sz: start.z,
     first: first, last: last,
     reposMoves: reposMoves,
-    afterReposMoves: afterReposMoves,
     expandedMoves: expMoves
   };
+  if (reposMoves.length > 0) {
+    pt.afterReposMoves = afterReposMoves;
+  }
   if (activeCycleObj) {
     activeCycleObj.points.push({x: x, y: y, z: z});
   }
@@ -834,14 +812,6 @@ onClose = function() {
     try {
       targetCnc = getEnvironmentVariable("TARGET_INTERMEDIATE_CNC");
     } catch (e) {}
-  }
-  if (!targetCnc) {
-    try {
-      var outPath = getOutputPath();
-      if (outPath) {
-        targetCnc = outPath + ".intermediate.cnc";
-      }
-    } catch (ignored) {}
   }
   if (targetCnc) {
     try {

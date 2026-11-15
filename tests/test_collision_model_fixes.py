@@ -19,7 +19,6 @@ from geometry.models import (
     SolidMeshStock3D,
     ToolAssembly,
     Vector3D,
-    VectorKey,
     WorkpieceDefinition,
 )
 from geometry.solid_mesh import rasterize_triangles_to_grid
@@ -75,15 +74,6 @@ def _make_segment(
     arc_center: Vector3D = None,
     arc_plane: str = "XY",
 ) -> MotionSegment:
-    vk = VectorKey(
-        sec_id=sec_id,
-        start_x=int(round(start.x * 1000)),
-        start_y=int(round(start.y * 1000)),
-        start_z=int(round(start.z * 1000)),
-        end_x=int(round(end.x * 1000)),
-        end_y=int(round(end.y * 1000)),
-        end_z=int(round(end.z * 1000)),
-    )
     return MotionSegment(
         segment_id=seg_id,
         op_id=op_id,
@@ -94,7 +84,6 @@ def _make_segment(
         feedrate_mmpm=feedrate,
         spindle_rpm=12000.0,
         duration_sec=duration_sec,
-        vector_key=vk,
         is_arc=is_arc,
         arc_center=arc_center,
         arc_plane=arc_plane,

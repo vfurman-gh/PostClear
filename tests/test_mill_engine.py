@@ -14,7 +14,6 @@ from geometry.models import (
     MotionSegment,
     ToolAssembly,
     Vector3D,
-    VectorKey,
     WorkpieceDefinition,
 )
 from geometry.mill_engine import MillClearanceVerifier
@@ -44,7 +43,6 @@ class TestMillClearanceVerifier(unittest.TestCase):
         z_clearance_mm: float = 5.0,
         feed_mmpm: float = 1000.0,
     ) -> MotionSegment:
-        vkey = VectorKey.from_floats(sec_id=sec_id, start=start, end=end)
         return MotionSegment(
             segment_id=seg_id,
             sec_id=sec_id,
@@ -55,7 +53,6 @@ class TestMillClearanceVerifier(unittest.TestCase):
             feedrate_mmpm=feed_mmpm,
             spindle_rpm=5000.0,
             duration_sec=0.1,
-            vector_key=vkey,
             metadata={
                 "sec_idx": sec_id,
                 "event_idx": seg_id,

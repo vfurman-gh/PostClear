@@ -24,7 +24,6 @@ from geometry import (
     MotionSegment,
     MotionKind,
     Vector3D,
-    VectorKey,
     CollisionKind,
 )
 
@@ -75,7 +74,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=4.5,
-            vector_key=VectorKey.from_floats(0, Vector3D(15.0, 0.0, 0.0), Vector3D(15.0, 0.0, -15.0)),
         )
 
         eval_res = verifier.step(cut_move)
@@ -119,7 +117,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=3.0,
-            vector_key=VectorKey.from_floats(0, Vector3D(15.0, 0.0, 0.0), Vector3D(15.0, 0.0, -10.0)),
         )
         res1 = verifier.step(pass1)
         self.assertEqual(len(res1.collisions), 0)
@@ -136,7 +133,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=3.0,
-            vector_key=VectorKey.from_floats(0, Vector3D(15.0, 0.0, -10.0), Vector3D(15.0, 0.0, -20.0)),
         )
         res2 = verifier.step(pass2)
         self.assertEqual(len(res2.collisions), 0, "False positive flagged while navigating previously cut channel")
@@ -180,7 +176,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=4.5,
-            vector_key=VectorKey.from_floats(0, Vector3D(10.0, 0.0, 0.0), Vector3D(10.0, 0.0, -15.0)),
         )
 
         eval_res = verifier.step(cut_move)
@@ -224,7 +219,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=5000.0,
             spindle_rpm=1000.0,
             duration_sec=0.18,
-            vector_key=VectorKey.from_floats(0, Vector3D(10.0, 0.0, 5.0), Vector3D(10.0, 0.0, -10.0)),
         )
 
         eval_res = verifier.step(rapid_crash)
@@ -270,7 +264,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=3.0,
-            vector_key=VectorKey.from_floats(0, Vector3D(20.0, 0.0, -35.0), Vector3D(20.0, 0.0, -45.0)),
         )
 
         eval_res = verifier.step(chuck_hit_move)
@@ -308,7 +301,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=4.5,
-            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
             metadata={"rc": 1},
         )
         res_rc = verifier.step(air_move_rc)
@@ -328,7 +320,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=4.5,
-            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
             metadata={"rc": 0},
         )
         res_no_rc = verifier.step(air_move_no_rc)
@@ -348,7 +339,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=4.5,
-            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
             metadata={"rc": 0, "rc_transition": True},
         )
         res_trans = verifier.step(air_move_trans)
@@ -389,7 +379,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=4.5,
-            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
             metadata={"sync": True},
         )
         res = verifier.step(sync_air_move)
@@ -430,7 +419,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=4.5,
-            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -15.0)),
             metadata={"in_cycle": True, "sec_idx": 0, "event_idx": 1},
         )
         res = verifier.step(cycle_air_move)
@@ -484,7 +472,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=1.5,
-            vector_key=VectorKey.from_floats(0, Vector3D(25.0, 0.0, -39.90), Vector3D(30.0, 0.0, -39.90)),
         )
         eval_near = verifier.step(move_near_chuck)
         self.assertEqual(len(eval_near.collisions), 0, "No collision expected")
@@ -502,7 +489,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=1.5,
-            vector_key=VectorKey.from_floats(0, Vector3D(25.0, 0.0, -39.50), Vector3D(30.0, 0.0, -39.50)),
         )
         eval_far = verifier.step(move_far_chuck)
         self.assertEqual(len(eval_far.collisions), 0, "No collision expected")
@@ -542,7 +528,6 @@ class TestLatheEngineCollisions(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=3.0,
-            vector_key=VectorKey.from_floats(0, Vector3D(15.0, 0.0, 0.0), Vector3D(15.0, 0.0, -15.0)),
         )
         verifier.step(cut_move)
         report = verifier.generate_report()

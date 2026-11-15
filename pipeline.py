@@ -18,7 +18,6 @@ Orchestrates the G-code-dialect-independent flow:
 6. Report & Visualization Generation: Compiles markdown reports and high-res verification plots.
 """
 
-import glob
 import json
 import math
 import os
@@ -27,12 +26,11 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from geometry.models import (
-    MotionKind,
-    MotionSegment,
-    SolidMeshStock3D,
+    CollisionRecord,
+    MRRSample,
     ToolAssembly,
     WorkpieceDefinition,
     VerificationReport,
@@ -40,6 +38,7 @@ from geometry.models import (
 from geometry.engine_interface import IVerificationEngine
 from context_parser import (
     DEFAULT_MIN_PROMOTE_LEN_MM,
+    classify_stock_mode,
     merge_context_dumps,
     parse_context_dump,
     apply_promotions_to_context,
@@ -291,24 +290,6 @@ def find_autodesk_system_posts_dir() -> str:
     )
 
 
-def find_autodesk_apt_cps() -> Optional[str]:
-    """Locate Autodesk's standard apt.cps configuration (deprecated, use find_autodesk_system_posts_dir)."""
-    env_apt = os.environ.get("AUTODESK_APT_CPS")
-    if env_apt and os.path.isfile(env_apt):
-        return env_apt
-
-    try:
-        posts_dir = find_autodesk_system_posts_dir()
-    except (FileNotFoundError, RuntimeError):
-        posts_dir = None
-
-    if posts_dir:
-        cand = os.path.join(posts_dir, "apt.cps")
-        if os.path.isfile(cand):
-            return cand
-    return None
-
-
 class PipelineOrchestrator:
     def __init__(
         self,
@@ -316,9 +297,7 @@ class PipelineOrchestrator:
         dumper_cps: Optional[str] = None,
         replayer_cps: Optional[str] = None,
         timeout: float = 120.0,
-        *args,
         min_promote_len_mm: float = DEFAULT_MIN_PROMOTE_LEN_MM,
-        **kwargs,
     ):
         min_len_val = float(min_promote_len_mm)
         if not math.isfinite(min_len_val) or min_len_val < 0.0:
@@ -326,7 +305,6 @@ class PipelineOrchestrator:
         self.post_bin = post_bin or find_autodesk_post_binary()
         if not self.post_bin or not os.path.isfile(self.post_bin):
             raise FileNotFoundError(f"Autodesk post executable not found: {self.post_bin}")
-        self.post_bin_path = self.post_bin
         self.timeout = float(timeout)
         self.min_promote_len_mm = min_len_val
 
@@ -359,17 +337,6 @@ class PipelineOrchestrator:
             err_detail = f"exit code {res.returncode}\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
             raise RuntimeError(f"Context dump extraction failed: {err_detail}")
         return output_json_path
-
-    def dump_context(
-        self,
-        intermediate_cnc_path: str,
-        base_post_path: str,
-        output_json_path: str,
-    ) -> Dict:
-        """Run Pass 1 (`universal_dumper.cps`) and return the parsed context dictionary."""
-        self.dump_intermediate_to_json(intermediate_cnc_path, base_post_path, output_json_path)
-        with open(output_json_path, "r", encoding="utf-8") as f:
-            return json.load(f)
 
     _REPLAY_DIAG_MARKER_RE = re.compile(r"(?m)^\(POSTCLEAR_REPLAY_DIAG:(\{.*\})\)\r?\n?")
 
@@ -465,7 +432,6 @@ class PipelineOrchestrator:
         is_turning: Optional[bool] = None,
         unit: Optional[int] = None,
         min_promote_len_mm: Optional[float] = None,
-        **kwargs,
     ) -> Tuple[VerificationReport, str]:
         """
         Execute the complete dump -> merge -> verify -> replay pipeline on one or more
@@ -566,7 +532,8 @@ class PipelineOrchestrator:
                 workpiece = extract_workpiece_from_context(combined_ctx, fallback_workpiece=fallback_workpiece, is_turning=is_turning)
 
             setup_label = f"'{program_name}'" if program_name else "this setup"
-            if any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
+            stock_mode_cat = classify_stock_mode(stock_mode)
+            if stock_mode_cat == "previous_setup":
                 if not explicit_workpiece and (workpiece is None or not getattr(workpiece, "is_stl_derived", False)):
                     se = combined_ctx.get("stockExport")
                     if isinstance(se, dict):
@@ -586,7 +553,7 @@ class PipelineOrchestrator:
                         "Please verify that the preceding setup has generated toolpaths "
                         f"and valid in-process stock before posting.{diag}"
                     )
-            if any(k in stock_mode for k in ("solid", "body")):
+            if stock_mode_cat == "solid":
                 if workpiece is None and fallback_workpiece is None:
                     raise ValueError(
                         f"Setup {setup_label} uses 'From Solid' stock, "
@@ -782,7 +749,7 @@ class PipelineOrchestrator:
                 report.toolpath_bounding_box = tp_box_log
 
             # Phase 1 M1: When previous-mode turning has no fixtures, warn user
-            if is_turning and any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
+            if is_turning and classify_stock_mode(stock_mode) == "previous_setup":
                 if not getattr(workpiece, "fixtures", None):
                     report.fixture_warning = (
                         "Fixture checks disabled: previous-mode turning has no fixture/chuck definitions."
@@ -800,7 +767,7 @@ class PipelineOrchestrator:
                 is_dog_leg = (hfm is not None and hfm != 0) or (use_g0 is False)
                 if is_dog_leg:
                     promote = False
-                    hfm_val = hfm if (hfm is not None and hfm != 0) else (hfm if hfm is not None else 0)
+                    hfm_val = hfm if hfm is not None else 0
                     dog_leg_msg = (
                         f"Rapid promotion disabled: post High feedrate mapping = {hfm_val} / useG0=false "
                         "(controller may dog-leg rapids)"
@@ -830,8 +797,11 @@ class PipelineOrchestrator:
                     ev for ev in report.promoted_events
                     if ev not in colliding_events
                 }
+                report.promoted_events = set(safe_promoted_events)
                 if safe_promoted_events:
                     restored_count = apply_promotions_to_context(combined_ctx, safe_promoted_events)
+            else:
+                report.promoted_events = set()
 
             # -----------------------------------------------------------------
             # Step 5: Execute Single-Pass Vendor Post Replay
@@ -1185,5 +1155,3 @@ class PipelineOrchestrator:
                         )
 
         return "\n".join(lines)
-
-    _format_summary_report = format_summary_report

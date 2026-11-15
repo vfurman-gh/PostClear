@@ -238,13 +238,11 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
         p1 = (move.start.z, move.start.x)
         p2 = (move.end.z, move.end.x)
         dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-        v_key_str = move.vector_key.to_wrapper_str()
 
         # Handle zero-displacement moves (e.g. dwells)
         if dist < 1e-6:
             return MoveEvaluation(
                 segment_id=move.segment_id,
-                vector_key=v_key_str,
                 is_air_move=False,
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
@@ -295,7 +293,6 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                 if not chuck_hit.is_empty and chuck_hit.area > 1e-4:
                     col = CollisionRecord(
                         segment_id=move.segment_id,
-                        vector_key=v_key_str,
                         kind=CollisionKind.FIXTURE_COLLISION,
                         timestamp_sec=self.current_time_sec,
                         contact_point=Vector3D(p2[1], 0.0, p2[0]),
@@ -318,7 +315,6 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                     if not rapid_hit.is_empty and rapid_hit.area > 1e-4:
                         col = CollisionRecord(
                             segment_id=move.segment_id,
-                            vector_key=v_key_str,
                             kind=CollisionKind.RAPID_INTO_STOCK,
                             timestamp_sec=self.current_time_sec,
                             contact_point=Vector3D(p2[1], 0.0, p2[0]),
@@ -336,7 +332,6 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                     if not holder_hit.is_empty and holder_hit.area > 1e-4:
                         col = CollisionRecord(
                             segment_id=move.segment_id,
-                            vector_key=v_key_str,
                             kind=CollisionKind.HOLDER_STRIKE,
                             timestamp_sec=self.current_time_sec,
                             contact_point=Vector3D(p2[1], 0.0, p2[0]),
@@ -351,7 +346,6 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
 
             return MoveEvaluation(
                 segment_id=move.segment_id,
-                vector_key=v_key_str,
                 is_air_move=False,
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
@@ -370,7 +364,6 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                 if not outside_wake.is_empty and outside_wake.area > 1e-4:
                     col = CollisionRecord(
                         segment_id=move.segment_id,
-                        vector_key=v_key_str,
                         kind=CollisionKind.HOLDER_STRIKE,
                         timestamp_sec=self.current_time_sec,
                         contact_point=Vector3D(p2[1], 0.0, p2[0]),
@@ -424,7 +417,6 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
                 self.record_event_evaluation(move, is_air_move=True, collisions=move_collisions)
                 return MoveEvaluation(
                     segment_id=move.segment_id,
-                    vector_key=v_key_str,
                     is_air_move=True,
                     material_removed_mm3=0.0,
                     instantaneous_mrr=0.0,
@@ -459,7 +451,6 @@ class Lathe2DIPWVerifier(BaseVerificationEngine):
 
         return MoveEvaluation(
             segment_id=move.segment_id,
-            vector_key=v_key_str,
             is_air_move=False,
             material_removed_mm3=vol_3d_mm3,
             instantaneous_mrr=sample.mrr_rate_mm3_per_min,

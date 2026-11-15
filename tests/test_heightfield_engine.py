@@ -33,7 +33,6 @@ from geometry.models import (
     MotionSegment,
     ToolAssembly,
     Vector3D,
-    VectorKey,
     WorkpieceDefinition,
 )
 
@@ -51,15 +50,6 @@ def _make_segment(
     arc_center: Vector3D = None,
     metadata: dict = None,
 ) -> MotionSegment:
-    vkey = VectorKey(
-        sec_id=sec_id,
-        start_x=round(start.x, 3),
-        start_y=round(start.y, 3),
-        start_z=round(start.z, 3),
-        end_x=round(end.x, 3),
-        end_y=round(end.y, 3),
-        end_z=round(end.z, 3),
-    )
     meta = dict(metadata or {})
     meta.setdefault("sec_idx", sec_id)
     meta.setdefault("event_idx", seg_id)
@@ -73,7 +63,6 @@ def _make_segment(
         feedrate_mmpm=feedrate,
         spindle_rpm=8000.0,
         duration_sec=duration_sec,
-        vector_key=vkey,
         is_arc=is_arc,
         arc_center=arc_center,
         metadata=meta,

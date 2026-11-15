@@ -41,7 +41,6 @@ from geometry.models import (
     ToolAssembly,
     ToolCompensationQuadrant,
     Vector3D,
-    VectorKey,
     VerificationReport,
     WorkpieceDefinition,
 )
@@ -88,7 +87,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=6.0,
-            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -20.0)),
             metadata={"sec_idx": 0, "event_idx": 0, "rc": 0},
         )
         res1 = verifier.step(move1)
@@ -105,7 +103,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=6.0,
-            vector_key=VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -20.0)),
             metadata={"sec_idx": 0, "event_idx": 1, "rc": 1},
         )
         res2 = verifier.step(move2)
@@ -144,7 +141,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
             feedrate_mmpm=1000.0,
             spindle_rpm=8000.0,
             duration_sec=2.4,
-            vector_key=VectorKey.from_floats(0, Vector3D(-20.0, 0.0, 15.0), Vector3D(20.0, 0.0, 15.0)),
             metadata={"sec_idx": 0, "event_idx": 10, "rc": 0},
         )
         res1 = verifier.step(move1)
@@ -161,7 +157,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
             feedrate_mmpm=1000.0,
             spindle_rpm=8000.0,
             duration_sec=2.4,
-            vector_key=VectorKey.from_floats(0, Vector3D(-20.0, 0.0, 15.0), Vector3D(20.0, 0.0, 15.0)),
             metadata={"sec_idx": 0, "event_idx": 11, "rc": 2},
         )
         res2 = verifier.step(move2)
@@ -199,7 +194,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
             collisions=[
                 CollisionRecord(
                     segment_id=2,
-                    vector_key="0:10000,0,5000->20000,0,5000",
                     kind=CollisionKind.HOLDER_STRIKE,
                     timestamp_sec=5.0,
                     contact_point=Vector3D(20.0, 0.0, 5.0),
@@ -244,8 +238,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
         stock = AxisymmetricStock2D(z_min=-50.0, z_max=0.0, outer_radius=20.0, inner_radius=0.0)
         wp = WorkpieceDefinition(stock=stock, fixtures=[])
 
-        vkey = VectorKey.from_floats(0, Vector3D(30.0, 0.0, 0.0), Vector3D(30.0, 0.0, -20.0))
-
         # Event 0 is promoted; Event 1 with identical coordinates is NOT promoted
         seg1 = MotionSegment(
             segment_id=1,
@@ -257,7 +249,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=6.0,
-            vector_key=vkey,
             metadata={"sec_idx": 0, "event_idx": 0},
         )
         seg2 = MotionSegment(
@@ -270,7 +261,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
             feedrate_mmpm=200.0,
             spindle_rpm=1000.0,
             duration_sec=6.0,
-            vector_key=vkey,
             metadata={"sec_idx": 0, "event_idx": 1},
         )
 
@@ -330,7 +320,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
             "sections": [
                 {
                     "id": 0,
-                    "batchIdx": 0,
                     "events": [
                         {"type": "onLinear", "sx": 0, "sy": 0, "sz": 5, "x": 10, "y": 0, "z": 5, "feed": 100},
                         {"type": "onLinear", "sx": 10, "sy": 0, "sz": 5, "x": 20, "y": 0, "z": 5, "feed": 100},
@@ -343,7 +332,6 @@ class TestPerEventPromotionMigration(unittest.TestCase):
             "sections": [
                 {
                     "id": 0,
-                    "batchIdx": 1,
                     "events": [
                         {"type": "onLinear", "sx": 0, "sy": 0, "sz": 5, "x": 10, "y": 0, "z": 5, "feed": 100},
                         {"type": "onLinear", "sx": 10, "sy": 0, "sz": 5, "x": 20, "y": 0, "z": 5, "feed": 100},

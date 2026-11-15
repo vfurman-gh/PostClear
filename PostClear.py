@@ -4,11 +4,9 @@
 import collections
 import contextlib
 import datetime
-import enum
 import glob
 import html
 import importlib
-import io
 import json
 import math
 import os
@@ -22,7 +20,7 @@ import tempfile
 import time
 import traceback
 import urllib.parse
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import adsk.cam
 import adsk.core
@@ -73,7 +71,6 @@ constPostProcessControlId = "IronPostProcess"
 constCAMProductId = "CAMProductType"
 constAttrGroup = constCmdDefId
 constAttrName = "settings"
-constAttrCompressedName = "CompressedName"
 constSettingsFileExt = ".settings"
 constNcProgramName = "PostClear NC Program"
 constAddonDir = os.path.dirname(os.path.abspath(__file__))
@@ -302,6 +299,26 @@ def _NormalizeFileExtension(ext: Optional[str]) -> str:
     return clean
 
 
+def _GetNcProgramExtension(prog, settings: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve and normalize an NC Program's output extension, defaulting to '.cnc'."""
+    raw_ext = ""
+    params = getattr(prog, "parameters", None) if prog is not None else None
+    if params is not None:
+        try:
+            ext_param = (
+                params.itemByName("nc_program_nc_extension")
+                if hasattr(params, "itemByName")
+                else params.get("nc_program_nc_extension")
+            )
+            if ext_param is not None:
+                raw_ext = _extract_choice_value(ext_param)
+        except Exception:
+            pass
+    if not raw_ext and isinstance(settings, dict):
+        raw_ext = str(settings.get("nc_program_nc_extension") or settings.get("extension") or "").strip()
+    return _NormalizeFileExtension(raw_ext)
+
+
 # Tool tip text
 toolTip = (
     "Post process selected NC Programs into G-code for your machine.\n\n"
@@ -424,7 +441,6 @@ class SettingsManager:
         self.default = None
         self.path = None
         self.fMustSave = False
-        self.inputs = None
 
     def GetSettings(self, docAttr):
         docSettings = None
@@ -558,27 +574,6 @@ def InitAddIn():
     except:
         if ui:
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
-
-
-def ExpandFileName(file):
-    return os.path.expanduser(file).replace("\\", "/")
-
-
-def CompressFileName(file):
-    # normalize whacks 
-    base = os.path.expanduser("~").replace("\\", "/")
-    newFile = file.replace("\\", "/").removeprefix(base)
-    if len(file) != len(newFile) and newFile[0] == "/":
-        file = "~" + newFile
-    return file
-
-
-def AssignOutputFolder(parameters, folder):
-    parameters.itemByName("nc_program_output_folder").value.value = folder
-    result = parameters.itemByName("nc_program_output_folder").value.value
-    if result != folder and folder[0:2] == "\\\\":
-        parameters.itemByName("nc_program_output_folder").value.value = "\\\\" + folder    # double up leading "\"
-    return None
 
 
 def _is_setup_cam_object(obj, cam=None):
@@ -996,7 +991,7 @@ def _CheckProgramCapability(p_setups, setup_operations_map) -> Optional[str]:
     return None
 
 
-def GetNcProgramSetupsAndOperations(cam, settings, setups=None, program=None):
+def GetNcProgramSetupsAndOperations(cam, settings, program=None):
     """
     Look in the selected NCProgram's setup and operations and derive the setups and operations to process.
     Returns:
@@ -1638,10 +1633,10 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                 ncInput = programs.createInput()
                 ncInput.displayName = constNcProgramName
                 program = programs.add(ncInput)
-                program.postConfiguration = program.postConfiguration
                 outputFolder = docSettings["output"]
-                program.attributes.add(constAttrGroup, constAttrCompressedName, outputFolder)
-                AssignOutputFolder(program.parameters, ExpandFileName(outputFolder))
+                out_param = program.parameters.itemByName("nc_program_output_folder")
+                if out_param is not None:
+                    out_param.value.value = outputFolder
                 program.parameters.itemByName("nc_program_createInBrowser").value.value = True
 
             all_progs = _extract_cam_collection(programs)
@@ -1718,16 +1713,7 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                 else:
                     setup_obj = p_setups[0] if len(p_setups) == 1 else None
                     setup_name = _safe_str(getattr(setup_obj, "name", None)) or "No setup"
-                    raw_ext = ""
-                    p_params = getattr(prog, "parameters", None)
-                    if p_params is not None:
-                        try:
-                            ext_param = p_params.itemByName("nc_program_nc_extension")
-                            if ext_param is not None:
-                                raw_ext = _extract_choice_value(ext_param)
-                        except Exception:
-                            pass
-                    file_ext = _NormalizeFileExtension(raw_ext) if raw_ext else ".nc"
+                    file_ext = _GetNcProgramExtension(prog, docSettings)
                     raw_fname = _ResolveNcProgramOutputFilename(prog, setup_obj, file_ext)
                     leaf_fname = _SanitizePathSegment(raw_fname)
                     info_str = f"{setup_name} -> {leaf_fname}{file_ext}"
@@ -1863,8 +1849,6 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
             elif input.id in self.docSettings:
                 if input.objectType == adsk.core.GroupCommandInput.classType():
                     self.docSettings[input.id] = input.isExpanded
-                elif input.objectType == adsk.core.DropDownCommandInput.classType():
-                    self.docSettings[input.id] = input.selectedItem.name
                 else:
                     self.docSettings[input.id] = input.value
 
@@ -1942,9 +1926,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             if inp:
                 if inp.objectType == adsk.core.GroupCommandInput.classType():
                     self.docSettings[key] = inp.isExpanded
-                elif inp.objectType == adsk.core.DropDownCommandInput.classType():
-                    if inp.selectedItem:
-                        self.docSettings[key] = inp.selectedItem.name
                 elif hasattr(inp, "value"):
                     self.docSettings[key] = inp.value
         _SetDebugLogEnabled(bool(self.docSettings.get("debug_log", False)))
@@ -2005,13 +1986,11 @@ def PerformPostProcess(docSettings, setups=None):
         program_snapshots = {}
         seen_targets = {}
         first_output_folder = ""
-        all_output_folders = set()
 
         for prog_idx, program in enumerate(selected_programs):
             prog_name = _safe_str(getattr(program, "name", None)) or f"NC Program {prog_idx + 1}"
             parameters = getattr(program, "parameters", None)
-            setups_override = setups if (setups is not None and len(selected_programs) == 1) else None
-            p_setups, setup_operations_map = GetNcProgramSetupsAndOperations(cam, docSettings, setups_override, program)
+            p_setups, setup_operations_map = GetNcProgramSetupsAndOperations(cam, docSettings, program=program)
 
             # Abort with error if multiple setups are detected in a single NC Program
             if len(p_setups) > 1:
@@ -2058,31 +2037,12 @@ def PerformPostProcess(docSettings, setups=None):
             try:
                 pathlib.Path(outputFolder).mkdir(parents=True, exist_ok=True)
             except Exception:
-                # See if we can map it to folder with compressed user
-                try:
-                    attr = program.attributes.itemByName(constAttrGroup, constAttrCompressedName)
-                    if attr and attr.value:
-                        compressedName = attr.value
-                        if compressedName and compressedName[0] == "~" and compressedName[1:] == outputFolder[-(len(compressedName) - 1):]:
-                            outputFolder = ExpandFileName(compressedName)
-                except Exception:
-                    pass
-                try:
-                    pathlib.Path(outputFolder).mkdir(parents=True, exist_ok=True)
-                except Exception:
-                    pass
+                pass
 
             if not first_output_folder:
                 first_output_folder = outputFolder
-            if outputFolder:
-                all_output_folders.add(outputFolder)
 
-            compressedName = CompressFileName(outputFolder)
-            try:
-                program.attributes.add(constAttrGroup, constAttrCompressedName, compressedName)
-            except Exception:
-                pass
-            docSettings["output"] = compressedName
+            docSettings["output"] = outputFolder
 
             empty_invalid = getattr(setup_operations_map, "empty_or_invalid_ops", [])
             if empty_invalid:
@@ -2107,15 +2067,7 @@ def PerformPostProcess(docSettings, setups=None):
             program_snapshots[id(program)] = (program, parameters, outputFolder, orig_prog_params)
 
             if len(p_setups) != 0 and cam.allOperations.count != 0:
-                raw_ext = ""
-                if parameters is not None:
-                    try:
-                        ext_param = parameters.itemByName("nc_program_nc_extension")
-                        if ext_param is not None:
-                            raw_ext = _extract_choice_value(ext_param)
-                    except Exception:
-                        pass
-                fileExt = _NormalizeFileExtension(raw_ext)
+                fileExt = _GetNcProgramExtension(program, docSettings)
 
                 for setup in p_setups:
                     target_ops = _lookup_setup_ops(setup, setup_operations_map)
@@ -2275,15 +2227,6 @@ def PerformPostProcess(docSettings, setups=None):
                     if status is None:
                         cntFiles += 1
                         setup_cb("Completed.", 1.0)
-                        if len(verifyResults) == prev_len:
-                            program_outcomes.append({
-                                "nc_program": prog_name,
-                                "setup": setup.name,
-                                "cnc": task["target_path"],
-                                "folder": task["outputFolder"],
-                                "status": "success",
-                                "summary": "Completed",
-                            })
                     elif "cancelled" in status.lower():
                         cntSkipped += 1
                         lstSkipped += f"\nCancelled by user on setup {setup.name}"
@@ -2314,13 +2257,9 @@ def PerformPostProcess(docSettings, setups=None):
                         progress.hide()
                     except Exception:
                         pass
-                # Restore every program's output folder and original parameters
-                for _, parameters, orig_folder, orig_prog_params in program_snapshots.values():
+                # Restore every program's original parameters
+                for _, parameters, _, orig_prog_params in program_snapshots.values():
                     if parameters is not None:
-                        try:
-                            AssignOutputFolder(parameters, orig_folder)
-                        except Exception:
-                            pass
                         for p_key, p_val in orig_prog_params.items():
                             try:
                                 p_item = parameters.itemByName(p_key)
@@ -2329,18 +2268,16 @@ def PerformPostProcess(docSettings, setups=None):
                             except Exception:
                                 pass
 
-        shared_folder = first_output_folder if len(all_output_folders) <= 1 else ""
         # done with setups, report results non-modally
         _NotifyPostProcessResult(
             ui=ui,
             cntFiles=cntFiles,
             cntSkipped=cntSkipped,
             lstSkipped=lstSkipped,
-            outputFolder=shared_folder or first_output_folder,
+            outputFolder=first_output_folder,
             verifyResults=verifyResults,
             program_outcomes=program_outcomes,
         )
-        ShowVerifyResults(ui)
 
     except Exception as exc:
         if progress:
@@ -2562,7 +2499,6 @@ def _ResolveBasePostPath(program=None, is_turning: Optional[bool] = None) -> str
         if hasattr(post_cfg, "url") and post_cfg.url:
             u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
             if u_str and u_str.startswith("file://"):
-                import urllib.parse
                 f_path = urllib.parse.unquote(u_str[len("file://"):])
                 if os.path.isfile(f_path):
                     if _IsPostCompatible(f_path, is_turning):
@@ -2720,8 +2656,6 @@ _deps_bootstrap_warned_session = False
 def _EnsureLocalModulesLoaded(force=False, allow_bootstrap=True, progress_cb=None):
     """Ensure Add-In directory and packages are on sys.path and reload local modules once per session."""
     global _modules_loaded_session, _deps_bootstrap_attempted, _deps_bootstrap_warned_session
-    import importlib
-    import sys
 
     if constAddonDir not in sys.path:
         sys.path.insert(0, constAddonDir)
@@ -2976,32 +2910,20 @@ def _WriteDumperConfig(base_post_path=None, target_cnc_path=None, post_propertie
     return cfg_path
 
 
-def _ClearDumperConfig(target_dir=None):
-    """Remove temporary sidecar config and clean environment variables for universal_dumper.cps."""
-    if target_dir and os.path.isdir(target_dir):
-        cfg_path = os.path.join(target_dir, "universal_dumper_config.json")
-        if os.path.isfile(cfg_path):
-            try:
-                os.remove(cfg_path)
-            except Exception:
-                pass
-
-    env_cfg = os.environ.get("DUMPER_CONFIG_PATH")
-    if env_cfg and os.path.isfile(env_cfg):
-        try:
-            os.remove(env_cfg)
-        except Exception:
-            pass
-
-    os.environ.pop("DUMPER_CONFIG_PATH", None)
-    os.environ.pop("BASE_POST", None)
-    os.environ.pop("TARGET_INTERMEDIATE_CNC", None)
-
-
 def _GetSetupStockMode(setup) -> str:
     """Detect the stock definition mode from a Fusion CAM Setup."""
     if not setup:
         return ""
+
+    from context_parser import classify_stock_mode
+
+    def _map_stock_mode_str(raw_str: str) -> str:
+        cat = classify_stock_mode(raw_str)
+        if cat == "previous_setup":
+            return "previous-setup"
+        if cat == "solid":
+            return "solid"
+        return str(raw_str).lower().strip()
 
     res = ""
     # 1. Primary check: setup.stockMode enum property (Autodesk Fusion typed API)
@@ -3028,13 +2950,7 @@ def _GetSetupStockMode(setup) -> str:
                 elif v == getattr(modes_enum, "RelativeTubeStock", 5):
                     res = "relative-tube"
         elif isinstance(v, str):
-            s = v.lower().strip()
-            if "previous" in s or "preceding" in s or "rest" in s:
-                res = "previous-setup"
-            elif "solid" in s or "body" in s:
-                res = "solid"
-            else:
-                res = s
+            res = _map_stock_mode_str(v)
 
     # 2. Fallback check for headless test setups or mock objects
     if not res and hasattr(setup, "parameters") and setup.parameters is not None:
@@ -3047,13 +2963,7 @@ def _GetSetupStockMode(setup) -> str:
                         if pv is not None:
                             pv_sub = getattr(pv, "value", pv)
                             if isinstance(pv_sub, (str, int)) and not hasattr(pv_sub, "_mock_return_value"):
-                                s = str(pv_sub).lower().strip()
-                                if "previous" in s or "preceding" in s or "rest" in s:
-                                    res = "previous-setup"
-                                elif "solid" in s or "body" in s:
-                                    res = "solid"
-                                else:
-                                    res = s
+                                res = _map_stock_mode_str(str(pv_sub))
                                 break
                     if res:
                         break
@@ -3067,12 +2977,14 @@ def _GetSetupStockMode(setup) -> str:
 def _ExtractWorkpieceFromSetup(setup):
     """Extract axisymmetric stock and chuck geometry directly from native Fusion 360 Setup."""
     try:
+        from context_parser import classify_stock_mode
         stock_mode = _GetSetupStockMode(setup)
-        if any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
+        mode_cat = classify_stock_mode(stock_mode)
+        if mode_cat == "previous_setup":
             _dbg_global(f"_ExtractWorkpieceFromSetup: setup uses stock mode '{stock_mode}'; relying on Pass 1 STL stock dump")
             return None
 
-        if any(k in stock_mode for k in ("solid", "body")):
+        if mode_cat == "solid":
             try:
                 from geometry.solid_mesh import extract_solid_workpiece_from_fusion_setup
                 return extract_solid_workpiece_from_fusion_setup(setup, is_turning=True)
@@ -3154,27 +3066,25 @@ def _ExtractWorkpieceFromSetup(setup):
         z_min_mm = z_max_mm - length_mm
 
 
+        from geometry.models import AxisymmetricChuckObstacle, AxisymmetricStock2D, WorkpieceDefinition
+        stock = AxisymmetricStock2D(
+            z_min=z_min_mm,
+            z_max=z_max_mm,
+            outer_radius=d_outer_mm * 0.5,
+            inner_radius=d_inner_mm * 0.5,
+        )
         fixtures = []
         clamp_len_mm = _get_float_param(["job_stockClampingLength", "stockClampingLength"], default=0.0)
         if clamp_len_mm and clamp_len_mm > 0.1:
-            from geometry.models import AxisymmetricChuckObstacle
             fixtures.append(
-                AxisymmetricChuckObstacle(
-                    z_min=z_min_mm - 50.0,
-                    z_max=z_min_mm + clamp_len_mm,
-                    outer_radius=(d_outer_mm * 0.5) + 30.0,
-                    clamping_radius=d_outer_mm * 0.5,
+                AxisymmetricChuckObstacle.from_stock(
+                    stock,
+                    clamp_len_mm=clamp_len_mm,
                 )
             )
 
-        from geometry.models import AxisymmetricStock2D, WorkpieceDefinition
         return WorkpieceDefinition(
-            stock=AxisymmetricStock2D(
-                z_min=z_min_mm,
-                z_max=z_max_mm,
-                outer_radius=d_outer_mm * 0.5,
-                inner_radius=d_inner_mm * 0.5,
-            ),
+            stock=stock,
             fixtures=fixtures,
         )
     except Exception as exc:
@@ -3631,14 +3541,14 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
     Provide non-modal feedback via Fusion statusMessage and non-modal Palette toast,
     matching Fusion native post-processing behavior without blocking modal message boxes.
     """
-    global _notification_handler
     verifyResults = verifyResults or []
     program_outcomes = program_outcomes or []
 
     # 1. Determine status type and headline
     has_errors = (cntFiles == 0 or is_fatal)
     has_collisions = any(bool(r.get("kinds")) for r in verifyResults)
-    has_warnings = (cntSkipped > 0 or has_collisions or any(bool(r.get("warning")) for r in verifyResults))
+    warning_msgs = [str(r["warning"]) for r in verifyResults if r.get("warning")]
+    has_warnings = (cntSkipped > 0 or has_collisions or bool(warning_msgs))
 
     if has_errors:
         status_type = "error"
@@ -3649,8 +3559,10 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
         title = "Post Processing Completed with Warnings"
         if cntSkipped > 0:
             msg = f"{cntFiles} file(s) written. {cntSkipped} setup(s) skipped due to errors."
-        else:
+        elif has_collisions:
             msg = f"{cntFiles} file(s) written. Collision warnings detected during verification."
+        else:
+            msg = f"{cntFiles} file(s) written. {warning_msgs[0]}"
     else:
         status_type = "success"
         title = "Post Processing Completed Successfully"
@@ -3770,7 +3682,6 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
         # Query macOS Fusion window bounds for pixel-perfect lower-right placement
         if sys.platform == "darwin":
             try:
-                import subprocess
                 cmd = 'tell application "System Events" to tell process "Autodesk Fusion" to repeat with w in windows\nif name of w contains "Autodesk Fusion" then\nreturn {position of w, size of w}\nend if\nend repeat'
                 raw = subprocess.check_output(['osascript', '-e', cmd], timeout=0.4).decode().strip()
                 parts = [int(p.strip()) for p in raw.split(',') if p.strip().lstrip('-').isdigit()]
@@ -3909,31 +3820,6 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
 
 
 
-def ShowVerifyResults(ui):
-    """
-    Log verification summaries to Application log without modal dialog interruption.
-    Diagnostic details and collision breakdowns are saved to the XXX_report.md files.
-    """
-    _dbg_global(f"ShowVerifyResults called: verifyResults count={len(verifyResults)}")
-    if not verifyResults:
-        return
-    for r in verifyResults:
-        total_cols = sum(r["kinds"].values()) if r.get("kinds") else 0
-        if r.get("error"):
-            status = "FAILED: " + r["error"]
-        elif r.get("warning") or total_cols > 0:
-            warn_str = r.get("warning") or f"{total_cols} collision(s) detected"
-            status = f"WARNING: {warn_str}"
-        else:
-            status = "OK"
-        msg = f"[PostClear] Verification for '{r['setup']}': {status} | NC: {r.get('cnc')} | Report: {r.get('report')}"
-        _dbg_global(msg)
-        try:
-            adsk.core.Application.get().log(msg)
-        except Exception:
-            pass
-
-
 def _OpenFile(path):
     """Open a file in the OS viewer. Returns None on success or an error string."""
     _dbg_global(f"_OpenFile: requested for '{path}' (exists={os.path.exists(path)})")
@@ -3966,7 +3852,7 @@ def _OpenFile(path):
         return str(exc)
 
 
-def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program, path, fileExt, target_operations=None, progress_cb=None):
+def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileExt, target_operations=None, progress_cb=None):
     """
     Unified 2-pass Context-Dump & Single-Pass Replay pipeline for Milling and Turning setups:
     Pass 1 (Context Extraction): Post each single-tool batch inside Fusion using universal_dumper.cps
@@ -4053,11 +3939,13 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
     report_path = base_no_ext + "_report.md"
     plot_path = base_no_ext + ".png"
 
+    from context_parser import classify_stock_mode
     stock_mode = _GetSetupStockMode(setup)
+    stock_mode_cat = classify_stock_mode(stock_mode)
     _dbg(f"_PostProcessUnifiedPipeline: setup '{setup.name}' stock_mode='{stock_mode}'")
 
     solid_wp = None
-    if any(k in stock_mode for k in ("solid", "body")):
+    if stock_mode_cat == "solid":
         try:
             from geometry.solid_mesh import extract_solid_workpiece_from_fusion_setup
             solid_wp = extract_solid_workpiece_from_fusion_setup(setup, is_turning=is_turning)
@@ -4178,7 +4066,7 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
             dumper_unit = 0  # IN in CPS post engine
 
         stock_unit = _GetDocumentStockUnit(getattr(app, "activeDocument", None) if app else None)
-        is_prev_stock = any(k in stock_mode for k in ("previous", "preceding", "prev", "rest"))
+        is_prev_stock = (stock_mode_cat == "previous_setup")
 
         n_batches = max(1, len(batches))
         for b_idx, (t_num, op_list) in enumerate(batches):
@@ -4303,10 +4191,6 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
         from pipeline import PipelineOrchestrator
         from geometry import CollisionKind
 
-        base_no_ext = os.path.splitext(path)[0]
-        report_path = base_no_ext + "_report.md"
-        plot_path = base_no_ext + ".png"
-
         if solid_wp is not None:
             fallback_wp = solid_wp
         else:
@@ -4355,6 +4239,8 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
         extra_warnings = []
         if getattr(report, "fixture_warning", None):
             extra_warnings.append(report.fixture_warning)
+        if getattr(report, "dog_leg_warning", None):
+            extra_warnings.append(report.dog_leg_warning)
         for fw in (getattr(report, "frame_warnings", None) or []):
             extra_warnings.append(fw)
         tilted_ops = getattr(report, "tilted_ops", None) or []
@@ -4376,15 +4262,7 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
 
         _notify_p("Setup completed.", 1.0)
 
-        if do_promote and getattr(report, "promoted_events", None):
-            colliding_events = {
-                (c.sec_idx, c.event_idx)
-                for c in report.collisions
-                if c.sec_idx is not None and c.event_idx is not None
-            }
-            promoted_total = len([ev for ev in report.promoted_events if ev not in colliding_events])
-        else:
-            promoted_total = 0
+        promoted_total = len(report.promoted_events) if report and report.promoted_events else 0
 
         summary_md = ""
         if os.path.isfile(report_path):
@@ -4431,7 +4309,6 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
         )
         return f"PostProcess pipeline error: {err_msg}"
     finally:
-        _ClearDumperConfig(target_dir=tmp_dir)
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
@@ -4441,7 +4318,6 @@ def _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program,
 
 def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_operations, progress_cb=None):
     ui = None
-    retVal = "Fusion reported an exception"
 
     try:
         _SetDebugLogEnabled(bool(docSettings.get("debug_log", False)) if isinstance(docSettings, dict) else False)
@@ -4468,15 +4344,7 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
                 return op_cap_err
 
         # Verify file name is valid by creating it now
-        raw_ext = ""
-        if parameters is not None:
-            try:
-                ext_param = parameters.itemByName("nc_program_nc_extension") if hasattr(parameters, "itemByName") else parameters.get("nc_program_nc_extension")
-                if ext_param is not None:
-                    raw_ext = _extract_choice_value(ext_param)
-            except Exception:
-                pass
-        fileExt = _NormalizeFileExtension(raw_ext)
+        fileExt = _GetNcProgramExtension(program, docSettings)
         path = os.path.join(setupFolder, fname + fileExt)
         try:
             pathlib.Path(setupFolder).mkdir(parents=True, exist_ok=True)
@@ -4491,8 +4359,9 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
             return "Unable to create output file '" + path + "'. Make sure the setup name is valid as a file name."
 
         # For setups using 'From preceding setup' stock, warn if preceding setup stock is likely missing
+        from context_parser import classify_stock_mode
         stock_mode = _GetSetupStockMode(setup)
-        if any(k in stock_mode for k in ("previous", "preceding", "prev", "rest")):
+        if classify_stock_mode(stock_mode) == "previous_setup":
             prior_missing = False
             try:
                 if cam and hasattr(cam, "setups"):
@@ -4581,7 +4450,7 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings, program, target_ope
         _dbg(f"PostProcessSetup called: fname={fname}, setup={setup.name}, opType={setup.operationType}, target_ops_cnt={len(target_operations)}")
 
         # Unified 2-pass dump & single-pass replay pipeline for all setups
-        return _PostProcessUnifiedPipeline(fname, setup, setupFolder, docSettings, program, path, fileExt, target_operations=target_operations, progress_cb=progress_cb)
+        return _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileExt, target_operations=target_operations, progress_cb=progress_cb)
 
     except Exception as exc:
         _dbg_global(f"PostProcessSetup exception: {traceback.format_exc()}")

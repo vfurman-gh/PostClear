@@ -381,7 +381,6 @@ class TestSolidMeshStock(unittest.TestCase):
         # Linear cutting move at Z=5 (cutting 5 mm into the 10 mm top stock)
         start_pt = Vector3D(10.0, 20.0, 5.0)
         end_pt = Vector3D(50.0, 20.0, 5.0)
-        from geometry.models import VectorKey
         seg = MotionSegment(
             segment_id=1,
             op_id="op1",
@@ -392,7 +391,6 @@ class TestSolidMeshStock(unittest.TestCase):
             feedrate_mmpm=1000.0,
             spindle_rpm=5000.0,
             duration_sec=2.4,
-            vector_key=VectorKey.from_floats(1, start_pt, end_pt),
         )
         eval_res = verifier.step(seg)
         self.assertFalse(eval_res.is_air_move)
@@ -551,7 +549,6 @@ class TestSolidMeshStock(unittest.TestCase):
                 res = PostClear._PostProcessUnifiedPipeline(
                     fname="Op1SolidMilling",
                     setup=mock_setup,
-                    setupFolder=tmp_dir,
                     docSettings={},
                     program=mock_prog,
                     path=os.path.join(tmp_dir, "solid_milling.nc"),
@@ -757,7 +754,6 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
             res = PostClear._PostProcessUnifiedPipeline(
                 fname="Op2PrecedingSetup",
                 setup=mock_setup,
-                setupFolder=self.tmp_dir,
                 docSettings={},
                 program=mock_prog,
                 path=os.path.join(self.tmp_dir, "prev_stock.nc"),
@@ -999,7 +995,9 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
             with open(cfg_file, "w", encoding="utf-8") as f:
                 json.dump({"stockMode": "previous"}, f)
             out1 = os.path.join(self.tmp_dir, "dump_prev.json")
-            ctx1 = orch.dump_context(cnc, cps, out1)
+            orch.dump_intermediate_to_json(cnc, cps, out1)
+            with open(out1, "r", encoding="utf-8") as f:
+                ctx1 = json.load(f)
             self.assertIn("stockExport", ctx1)
             self.assertTrue(ctx1["stockExport"]["enabled"])
 
@@ -1007,7 +1005,9 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
             with open(cfg_file, "w", encoding="utf-8") as f:
                 json.dump({"stockMode": "fixedbox"}, f)
             out2 = os.path.join(self.tmp_dir, "dump_box.json")
-            ctx2 = orch.dump_context(cnc, cps, out2)
+            orch.dump_intermediate_to_json(cnc, cps, out2)
+            with open(out2, "r", encoding="utf-8") as f:
+                ctx2 = json.load(f)
             self.assertIn("stockExport", ctx2)
             self.assertFalse(ctx2["stockExport"]["enabled"])
 
@@ -1016,7 +1016,9 @@ class TestPreviousSetupStockSupport(unittest.TestCase):
             with open(cfg_file, "w", encoding="utf-8") as f:
                 json.dump({"stockMode": "previous", "stockPath": self.bin_stl}, f)
             out3 = os.path.join(self.tmp_dir, "dump_dead_branch.json")
-            ctx3 = orch.dump_context(cnc, cps, out3)
+            orch.dump_intermediate_to_json(cnc, cps, out3)
+            with open(out3, "r", encoding="utf-8") as f:
+                ctx3 = json.load(f)
             self.assertEqual(ctx3.get("stockPath", ""), "")
         finally:
             if old_env is None:

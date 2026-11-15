@@ -192,7 +192,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         setup = DummySetup(name="Collision Setup", is_turning=True)
         col = CollisionRecord(
             segment_id=1,
-            vector_key="v1",
             kind=CollisionKind.RAPID_INTO_STOCK,
             timestamp_sec=0.1,
             contact_point=Vector3D(0.0, 0.0, -5.0),
@@ -214,41 +213,8 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         self.assertEqual(rec["warning"], "1 collision(s) detected!")
         self.assertEqual(rec["kinds"].get("RAPID_INTO_STOCK"), 1)
 
-    def test_show_verify_results_does_not_popup_modal_dialog(self):
-        """Verify ShowVerifyResults operates silently without modal dialog popups."""
-        from PostClear import _RecordVerifyResult, ShowVerifyResults, verifyResults
-        from geometry.models import CollisionRecord, CollisionKind, Vector3D
-
-        setup = DummySetup(name="Warning Setup", is_turning=False)
-        col = CollisionRecord(
-            segment_id=5,
-            vector_key="v5",
-            kind=CollisionKind.HOLDER_STRIKE,
-            timestamp_sec=0.5,
-            contact_point=Vector3D(10.0, 20.0, -10.0),
-            penetration_volume_mm3=20.0,
-            description="Holder strikes stock wall",
-        )
-        _RecordVerifyResult(
-            setup=setup,
-            cncPath="/tmp/warn.nc",
-            reportText="# Warning Report",
-            collisions=[col],
-            warning="1 collision(s) detected",
-            error=None,
-        )
-
-        popup_called = []
-        class MockUI:
-            def messageBox(self, *args, **kwargs):
-                popup_called.append(args)
-                return 0
-
-        ShowVerifyResults(MockUI())
-        self.assertEqual(len(popup_called), 0, "ShowVerifyResults must never pop up modal message boxes in the user's face")
-
     def test_format_summary_report_specifies_operation_collisions(self):
-        """Verify _format_summary_report outputs markdown table and breakdown by operation."""
+        """Verify format_summary_report outputs markdown table and breakdown by operation."""
         from pipeline import PipelineOrchestrator
         from geometry.models import CollisionRecord, CollisionKind, Vector3D, VerificationReport
 
@@ -259,7 +225,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
 
         col1 = CollisionRecord(
             segment_id=42,
-            vector_key="v42",
             kind=CollisionKind.RAPID_INTO_STOCK,
             timestamp_sec=12.5,
             contact_point=Vector3D(10.0, -15.0, -2.0),
@@ -269,7 +234,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         )
         col2 = CollisionRecord(
             segment_id=88,
-            vector_key="v88",
             kind=CollisionKind.RAPID_INTO_STOCK,
             timestamp_sec=25.0,
             contact_point=Vector3D(12.0, -14.0, -3.0),
@@ -279,7 +243,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         )
         col3 = CollisionRecord(
             segment_id=150,
-            vector_key="v150",
             kind=CollisionKind.HOLDER_STRIKE,
             timestamp_sec=60.0,
             contact_point=Vector3D(20.0, 5.0, 15.0),
@@ -298,7 +261,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             operation_names=["3D Adaptive Roughing1", "2D Contour3", "2D Contour1"],
         )
 
-        md = orchestrator._format_summary_report(
+        md = orchestrator.format_summary_report(
             report=report,
             final_gcode="",
             base_post_path="/path/to/tormach.cps",
@@ -330,7 +293,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         self.assertIn("Move 150", md)
 
     def test_format_summary_report_includes_top_3_mrr_spikes(self):
-        """Verify _format_summary_report includes MRR spikes section with top 3 spikes per operation."""
+        """Verify format_summary_report includes MRR spikes section with top 3 spikes per operation."""
         from pipeline import PipelineOrchestrator
         from geometry.models import MRRSample, VerificationReport
 
@@ -349,7 +312,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             mrr_spikes=[],
             operation_names=["Roughing"],
         )
-        zero_md = orchestrator._format_summary_report(zero_report, "", "post.cps")
+        zero_md = orchestrator.format_summary_report(zero_report, "", "post.cps")
         self.assertIn("## Material Removal Rate (MRR) Spikes", zero_md)
         self.assertIn("✅ **Zero MRR spikes detected.**", zero_md)
 
@@ -368,7 +331,7 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             mrr_spikes=[s1, s2, s3, s4],
             operation_names=["Roughing", "Finishing"],
         )
-        md = orchestrator._format_summary_report(spike_report, "", "post.cps")
+        md = orchestrator.format_summary_report(spike_report, "", "post.cps")
 
         self.assertIn("## Material Removal Rate (MRR) Spikes", md)
         self.assertIn("⚠️ **4 MRR spike(s) flagged (top 3 per operation shown).**", md)
@@ -1198,7 +1161,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 res = PostClear._PostProcessUnifiedPipeline(
                     fname="test_out",
                     setup=mock_setup,
-                    setupFolder=tmp_dir,
                     docSettings=doc_settings,
                     program=mock_program,
                     path=out_file,
@@ -1276,16 +1238,12 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             ],
         }
 
-        from geometry.models import VectorKey
-        key_collided = VectorKey.from_floats(0, Vector3D(0.0, 0.0, 0.0), Vector3D(-10.0, 0.0, 0.0)).to_wrapper_str()
-
         report = VerificationReport(
             total_machining_time_sec=10.0,
             total_volume_removed_mm3=50.0,
             collisions=[
                 CollisionRecord(
                     segment_id=1,
-                    vector_key=key_collided,
                     kind=CollisionKind.HOLDER_STRIKE,
                     timestamp_sec=5.0,
                     contact_point=Vector3D(0, 0, 0),
@@ -1347,7 +1305,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             status = PostClear._PostProcessUnifiedPipeline(
                 fname="test_cancel",
                 setup=mock_setup,
-                setupFolder="/tmp",
                 docSettings=dict(PostClear.defaultSettings),
                 program=mock_prog,
                 path="/tmp/test_cancel.nc",
@@ -1553,20 +1510,27 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             PostClear._SetDebugLogEnabled(saved_dbg_enabled)
 
         # Test _WriteDumperConfig writes to per-run mkdtemp and sets DUMPER_CONFIG_PATH without touching /tmp or $TMPDIR
-        with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
-            cfg_path = PostClear._WriteDumperConfig(base_post_path=tmp_cps.name)
-            self.assertTrue(os.path.isfile(cfg_path))
-            self.assertEqual(os.environ.get("DUMPER_CONFIG_PATH"), cfg_path)
-            # Verify NOT written to $TMPDIR or /tmp
-            self.assertFalse(os.path.isfile(os.path.join(tempfile.gettempdir(), "universal_dumper_config.json")))
-            self.assertFalse(os.path.isfile("/tmp/universal_dumper_config.json"))
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            self.assertEqual(cfg.get("basePost"), os.path.abspath(tmp_cps.name))
-
-            PostClear._ClearDumperConfig()
-            self.assertFalse(os.path.isfile(cfg_path))
-            self.assertNotIn("DUMPER_CONFIG_PATH", os.environ)
+        saved_dumper_cfg_env = os.environ.get("DUMPER_CONFIG_PATH")
+        cfg_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".cps") as tmp_cps:
+                cfg_path = PostClear._WriteDumperConfig(base_post_path=tmp_cps.name)
+                self.assertTrue(os.path.isfile(cfg_path))
+                self.assertEqual(os.environ.get("DUMPER_CONFIG_PATH"), cfg_path)
+                # Verify NOT written to $TMPDIR or /tmp
+                self.assertFalse(os.path.isfile(os.path.join(tempfile.gettempdir(), "universal_dumper_config.json")))
+                self.assertFalse(os.path.isfile("/tmp/universal_dumper_config.json"))
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                self.assertEqual(cfg.get("basePost"), os.path.abspath(tmp_cps.name))
+        finally:
+            if saved_dumper_cfg_env is None:
+                os.environ.pop("DUMPER_CONFIG_PATH", None)
+            else:
+                os.environ["DUMPER_CONFIG_PATH"] = saved_dumper_cfg_env
+            if cfg_path and os.path.isdir(os.path.dirname(cfg_path)):
+                import shutil
+                shutil.rmtree(os.path.dirname(cfg_path), ignore_errors=True)
 
     def test_w8_sanitize_path_segment(self):
         """Verify _SanitizePathSegment strips invalid Windows/POSIX filesystem characters and handles reserved names."""
@@ -1631,40 +1595,37 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
 
 
     def test_a5_isolated_dumper_config_and_pipeline_unification(self):
-        """Verify _WriteDumperConfig isolates config to target_dir and _ClearDumperConfig cleans env vars."""
+        """Verify _WriteDumperConfig isolates config to target_dir and sets DUMPER_CONFIG_PATH."""
         import json
         import PostClear
-        with tempfile.TemporaryDirectory() as target_dir:
-            base_post = os.path.join(target_dir, "fake.cps")
-            with open(base_post, "w") as f:
-                f.write("// post")
-            cnc_path = os.path.join(target_dir, "fake.cnc")
-            PostClear._WriteDumperConfig(
-                base_post_path=base_post,
-                target_cnc_path=cnc_path,
-                post_properties={"prop1": "val1"},
-                target_dir=target_dir,
-            )
+        saved_dumper_cfg_env = os.environ.get("DUMPER_CONFIG_PATH")
+        try:
+            with tempfile.TemporaryDirectory() as target_dir:
+                base_post = os.path.join(target_dir, "fake.cps")
+                with open(base_post, "w") as f:
+                    f.write("// post")
+                cnc_path = os.path.join(target_dir, "fake.cnc")
+                PostClear._WriteDumperConfig(
+                    base_post_path=base_post,
+                    target_cnc_path=cnc_path,
+                    post_properties={"prop1": "val1"},
+                    target_dir=target_dir,
+                )
 
-            cfg_file = os.path.join(target_dir, "universal_dumper_config.json")
-            self.assertTrue(os.path.isfile(cfg_file))
-            self.assertEqual(os.environ.get("DUMPER_CONFIG_PATH"), cfg_file)
+                cfg_file = os.path.join(target_dir, "universal_dumper_config.json")
+                self.assertTrue(os.path.isfile(cfg_file))
+                self.assertEqual(os.environ.get("DUMPER_CONFIG_PATH"), cfg_file)
 
-            with open(cfg_file, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            self.assertEqual(cfg["basePost"], os.path.abspath(base_post))
-            self.assertEqual(cfg["targetIntermediateCnc"], os.path.abspath(cnc_path))
-            self.assertEqual(cfg["postProperties"], {"prop1": "val1"})
-
-            # Test cleanup
-            os.environ["BASE_POST"] = os.path.abspath(base_post)
-            os.environ["TARGET_INTERMEDIATE_CNC"] = os.path.abspath(cnc_path)
-            PostClear._ClearDumperConfig(target_dir=target_dir)
-
-            self.assertFalse(os.path.isfile(cfg_file))
-            self.assertNotIn("DUMPER_CONFIG_PATH", os.environ)
-            self.assertNotIn("BASE_POST", os.environ)
-            self.assertNotIn("TARGET_INTERMEDIATE_CNC", os.environ)
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                self.assertEqual(cfg["basePost"], os.path.abspath(base_post))
+                self.assertEqual(cfg["targetIntermediateCnc"], os.path.abspath(cnc_path))
+                self.assertEqual(cfg["postProperties"], {"prop1": "val1"})
+        finally:
+            if saved_dumper_cfg_env is None:
+                os.environ.pop("DUMPER_CONFIG_PATH", None)
+            else:
+                os.environ["DUMPER_CONFIG_PATH"] = saved_dumper_cfg_env
 
 
     def test_b5_batch_json_matching_no_prefix_collision(self):
@@ -1853,20 +1814,16 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
         self.assertAlmostEqual(segs_default[0].end.x, 25.4)
 
     def test_system_posts_discovery_and_fallback(self):
-        """Verify find_autodesk_system_posts_dir and MillClearanceVerifier fallback."""
-        from pipeline import find_autodesk_system_posts_dir, find_autodesk_apt_cps, PipelineOrchestrator
+        """Verify find_autodesk_system_posts_dir resolves AUTODESK_SYSTEM_POSTS_DIR override."""
+        from pipeline import find_autodesk_system_posts_dir
         import unittest.mock
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             posts_dir = os.path.join(tmp_dir, "Posts")
             os.makedirs(posts_dir)
-            apt_file = os.path.join(posts_dir, "apt.cps")
-            with open(apt_file, "w") as f:
-                f.write('description = "Autodesk APT Post";\n')
 
             with unittest.mock.patch.dict(os.environ, {"AUTODESK_SYSTEM_POSTS_DIR": posts_dir}):
                 self.assertEqual(find_autodesk_system_posts_dir(), posts_dir)
-                self.assertEqual(find_autodesk_apt_cps(), apt_file)
 
     def test_no_stock_detected_raises_error_to_user(self):
         """Verify that missing stock raises an explicit error and reports failure to the user."""
@@ -1933,7 +1890,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 res = PostClear._PostProcessUnifiedPipeline(
                     fname="SetupWithoutStock",
                     setup=mock_setup,
-                    setupFolder=tmp_dir,
                     docSettings={},
                     program=mock_prog,
                     path=out_file,
@@ -2031,7 +1987,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 res = PostClear._PostProcessUnifiedPipeline(
                     fname="Op2RestMachining",
                     setup=mock_setup_prev,
-                    setupFolder=tmp_dir,
                     docSettings={},
                     program=mock_prog,
                     path=os.path.join(tmp_dir, "op2.nc"),
@@ -2056,7 +2011,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 res = PostClear._PostProcessUnifiedPipeline(
                     fname="OpSolid",
                     setup=mock_setup_solid,
-                    setupFolder=tmp_dir,
                     docSettings={},
                     program=mock_prog,
                     path=os.path.join(tmp_dir, "solid.nc"),
@@ -2234,7 +2188,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 res = PostClear._PostProcessUnifiedPipeline(
                     fname="Spinner setup",
                     setup=mock_setup,
-                    setupFolder=tmp_dir,
                     docSettings=doc_settings,
                     program=mock_prog,
                     path=out_file,
@@ -2357,7 +2310,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 res = PostClear._PostProcessUnifiedPipeline(
                     fname="InchSetup",
                     setup=mock_setup,
-                    setupFolder=tmp_dir,
                     docSettings=doc_settings,
                     program=mock_prog,
                     path=out_file,
@@ -2469,7 +2421,6 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 res = PostClear._PostProcessUnifiedPipeline(
                     fname="DocSetup",
                     setup=mock_setup,
-                    setupFolder=tmp_dir,
                     docSettings=doc_settings,
                     program=mock_prog,
                     path=out_file,
@@ -4178,7 +4129,6 @@ class TestPostClearCapabilityPreChecks(unittest.TestCase):
                 pipe_err = PostClear._PostProcessUnifiedPipeline(
                     fname="rotary_out",
                     setup=rot_setup,
-                    setupFolder=tmp_dir,
                     docSettings=dict(PostClear.defaultSettings),
                     program=prog,
                     path=out_nc,

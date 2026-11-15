@@ -151,7 +151,6 @@ class MillClearanceVerifier(IVerificationEngine):
         Only pure `Z+` linear moves outside canned cycles that reach `>= clearance_z`
         are marked as `is_air_move = True` for `G0` promotion.
         """
-        vkey_str = segment.vector_key.to_wrapper_str()
         meta = segment.metadata or {}
         sec_idx = meta.get("sec_idx", segment.sec_id)
         event_idx = meta.get("event_idx", segment.segment_id)
@@ -172,7 +171,6 @@ class MillClearanceVerifier(IVerificationEngine):
                 self._sec_clearance_mm[segment.sec_id] = top_z
             return MoveEvaluation(
                 segment_id=segment.segment_id,
-                vector_key=vkey_str,
                 is_air_move=True,
                 material_removed_mm3=0.0,
                 instantaneous_mrr=0.0,
@@ -196,7 +194,6 @@ class MillClearanceVerifier(IVerificationEngine):
 
         return MoveEvaluation(
             segment_id=segment.segment_id,
-            vector_key=vkey_str,
             is_air_move=is_air_move,
             material_removed_mm3=0.0,
             instantaneous_mrr=0.0,
