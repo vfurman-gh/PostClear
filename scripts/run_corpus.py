@@ -19,7 +19,6 @@ import concurrent.futures
 import copy
 import dataclasses
 import difflib
-import glob
 import hashlib
 import json
 import math
@@ -60,8 +59,9 @@ from geometry.models import (
 from geometry.solid_mesh import extract_workpiece_from_stl, load_stl_mesh
 from pipeline import (
     PipelineOrchestrator,
-    find_autodesk_post_binary,
-    find_autodesk_system_posts_dir,
+    get_post_search_dirs as _pipeline_get_post_search_dirs,
+    resolve_post_file as _pipeline_resolve_post_file,
+    scan_cps_capabilities,
 )
 
 # ---------------------------------------------------------------------------
@@ -134,79 +134,19 @@ HOBBYIST_POSTS_TOP_10: Tuple[Dict[str, Optional[str]], ...] = (
 
 def get_post_search_dirs() -> List[str]:
     """Return existing user, cache, and Autodesk system directories containing `.cps` posts."""
-    dirs: List[str] = []
-
-    def _add(path: Optional[str]) -> None:
-        if path and os.path.isdir(path):
-            ap = os.path.abspath(path)
-            if ap not in dirs:
-                dirs.append(ap)
-
-    _add(os.path.expanduser("~/Library/Application Support/Autodesk/Fusion 360 CAM/Posts"))
-    _add(os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/cache/posts"))
-    _add(os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/Posts"))
-    for cd in glob.glob(os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/*/W.login/*/CAMPosts")):
-        _add(cd)
-
-    appdata = os.environ.get("APPDATA", "")
-    if appdata:
-        _add(os.path.join(appdata, "Autodesk", "Fusion 360 CAM", "Posts"))
-        _add(os.path.join(appdata, "Autodesk", "Autodesk Fusion 360", "CAM", "Posts"))
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    if localappdata:
-        _add(os.path.join(localappdata, "Autodesk", "Autodesk Fusion 360", "CAM", "cache", "posts"))
-        for cd in glob.glob(os.path.join(localappdata, "Autodesk", "Autodesk Fusion 360", "*", "W.login", "*", "CAMPosts")):
-            _add(cd)
-
-    try:
-        _add(find_autodesk_system_posts_dir())
-    except FileNotFoundError:
-        pass
-
-    try:
-        post_bin = find_autodesk_post_binary()
-        cam_dir = os.path.dirname(post_bin)
-        _add(os.path.join(cam_dir, "Data", "Posts"))
-        _add(os.path.join(cam_dir, "Posts"))
-    except FileNotFoundError:
-        pass
-
-    return dirs
+    return _pipeline_get_post_search_dirs()
 
 
 def infer_post_capabilities(cps_path: str) -> Dict[str, bool]:
     """Inspect a `.cps` file's `capabilities = ...` declaration."""
-    caps = {"milling": False, "turning": False}
-    try:
-        with open(cps_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                m = re.search(r"\bcapabilities\s*=\s*([^;]+);", line)
-                if m:
-                    expr = m.group(1)
-                    caps["turning"] = "CAPABILITY_TURNING" in expr
-                    caps["milling"] = ("CAPABILITY_MILLING" in expr) or ("CAPABILITY_ROUTER" in expr)
-                    return caps
-    except OSError:
-        pass
-    return caps
+    return scan_cps_capabilities(cps_path) or {"milling": False, "turning": False}
 
 
 def resolve_post_file(post_name_or_path: str, search_dirs: Optional[Sequence[str]] = None) -> Optional[str]:
     """Resolve a `.cps` filename or absolute path from user/system post directories."""
-    if not post_name_or_path:
-        return None
-    if os.path.isfile(post_name_or_path):
-        return os.path.abspath(post_name_or_path)
-
-    bname = os.path.basename(post_name_or_path)
-    names = [bname] if bname.lower().endswith(".cps") else [bname, bname + ".cps"]
-    sdirs = list(search_dirs) if search_dirs is not None else get_post_search_dirs()
-    for d in sdirs:
-        for nm in names:
-            cand = os.path.join(d, nm)
-            if os.path.isfile(cand):
-                return os.path.abspath(cand)
-    return None
+    if search_dirs is None:
+        search_dirs = get_post_search_dirs()
+    return _pipeline_resolve_post_file(post_name_or_path, search_dirs=search_dirs)
 
 
 def resolve_hobbyist_posts(

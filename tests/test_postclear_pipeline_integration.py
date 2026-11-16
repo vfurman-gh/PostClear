@@ -3448,14 +3448,17 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 PostClear.settingsMgr = saved_settings_mgr
 
     def test_dynamic_loader_module_name_routes_dbg_global(self):
-        """Verify _SetDebugLogEnabled registers the active module as sys.modules['PostClear'] when loaded under a dynamic name."""
+        """Verify dynamic-name loading routes debug logging via dep_bootstrap without polluting sys.modules['PostClear']."""
         import importlib.util
+        import dep_bootstrap
         import context_parser
         import pipeline
         from geometry import solid_mesh
 
         repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         saved_mod = sys.modules.get("PostClear")
+        saved_log_path = dep_bootstrap.LOG_PATH
+        saved_enabled = dep_bootstrap.is_debug_log_enabled()
         dyn_name = "_fusion_runner_PostClear_entry"
         try:
             sys.modules.pop("PostClear", None)
@@ -3465,8 +3468,8 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             sys.modules[dyn_name] = dyn_mod
             spec.loader.exec_module(dyn_mod)
 
-            # Even before _SetDebugLogEnabled, module load registers fallback alias
-            self.assertIs(sys.modules.get("PostClear"), dyn_mod)
+            # No synthetic sys.modules["PostClear"] registration is needed anymore
+            self.assertNotIn("PostClear", sys.modules)
 
             with tempfile.TemporaryDirectory() as tmp_dir:
                 temp_log = os.path.join(tmp_dir, "postclear_debug.log")
@@ -3494,6 +3497,8 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 self.assertIn("PipelineOrchestrator.run: workpiece stock=", text)
         finally:
             sys.modules.pop(dyn_name, None)
+            dep_bootstrap.LOG_PATH = saved_log_path
+            dep_bootstrap.set_debug_log_enabled(saved_enabled)
             if saved_mod is not None:
                 sys.modules["PostClear"] = saved_mod
 

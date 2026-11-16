@@ -19,6 +19,8 @@ import math
 import os
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+from dep_bootstrap import dbg_log
+
 from geometry.models import (
     MotionKind,
     MotionSegment,
@@ -744,6 +746,86 @@ def filter_promoted_events_by_length(
     }
 
 
+def infer_stl_is_inch(
+    raw_verts: Any,
+    context_data: Dict[str, Any],
+    strict: bool = True,
+) -> bool:
+    """
+    Infer whether unscaled STL mesh vertices (`raw_verts`) are in inches vs millimeters
+    from `stockUnit` / `unit` cross-checked against `workpieceHint`.
+
+    When `strict=True`, raises `ValueError` if `workpieceHint` extents diverge by > 5%
+    across all candidate scales `(1.0, 25.4, 1.0 / 25.4)`. When `strict=False`, falls back
+    to the baseline `stockUnit` / `unit` inference instead of raising.
+    """
+    import numpy as np
+
+    context_data = _as_context_dict(context_data)
+    stock_unit_str = context_data.get("stockUnit")
+    if stock_unit_str:
+        is_inch = str(stock_unit_str).lower() in ("in", "inch", "inches")
+    else:
+        is_inch = (context_data.get("unit", 0) == 0)
+
+    if raw_verts is None or len(raw_verts) == 0:
+        return is_inch
+
+    wh_mm = extract_workpiece_hint_bbox_mm(context_data)
+    if wh_mm is None:
+        return is_inch
+
+    stl_min = raw_verts.min(axis=0)
+    stl_max = raw_verts.max(axis=0)
+    stl_extents = stl_max - stl_min
+
+    dump_scale = 25.4 if int(context_data.get("unit", 0) or 0) == 0 else 1.0
+    hint_extents = np.array([
+        (wh_mm[1] - wh_mm[0]) / dump_scale,
+        (wh_mm[3] - wh_mm[2]) / dump_scale,
+        (wh_mm[5] - wh_mm[4]) / dump_scale,
+    ], dtype=np.float64)
+
+    candidate_scales = [1.0, 25.4, 1.0 / 25.4]
+    active_dims = (hint_extents > 1e-4) & (stl_extents > 1e-4)
+    if not np.any(active_dims):
+        return is_inch
+
+    best_scale = None
+    min_err = float("inf")
+    for s in candidate_scales:
+        scaled_stl = stl_extents[active_dims] * s
+        target_hint = hint_extents[active_dims]
+        rel_errors = np.abs(scaled_stl - target_hint) / np.maximum(target_hint, 1e-6)
+        # In-process stock from a preceding setup may have 1-2 axes machined smaller
+        # than workpieceHint while keeping at least one axis unmachined and never
+        # exceeding workpieceHint by > 5%.
+        if np.all(scaled_stl <= target_hint * 1.05):
+            scale_err = float(np.min(rel_errors))
+        else:
+            scale_err = float(np.max(rel_errors))
+        if scale_err < min_err:
+            min_err = scale_err
+            best_scale = s
+
+    if min_err > 0.05:
+        if strict:
+            raise ValueError(
+                f"STL bounding box extents {stl_extents.tolist()} do not match workpieceHint "
+                f"{hint_extents.tolist()} within 5% for any candidate scale {candidate_scales} "
+                f"(best match scale {best_scale} error: {min_err*100:.1f}%)."
+            )
+        return is_inch
+
+    if abs(best_scale - 25.4) < 1e-3:
+        return True
+    if abs(best_scale - (1.0 / 25.4)) < 1e-3:
+        return False
+    if abs(best_scale - 1.0) < 1e-3:
+        return (context_data.get("unit", 0) == 0)
+    return is_inch
+
+
 def extract_workpiece_from_context(
     context_data: Dict[str, Any],
     fallback_workpiece: Any = None,
@@ -764,20 +846,13 @@ def extract_workpiece_from_context(
         WorkpieceDefinition,
     )
 
-    def _dbg_ctx(msg: str) -> None:
-        try:
-            from PostClear import _dbg_global
-            _dbg_global(msg)
-        except Exception:
-            pass
-
     stock_mode = str(
         context_data.get("stockMode")
         or context_data.get("globalParams", {}).get("job:stockMode")
         or context_data.get("globalParams", {}).get("stockMode")
         or ""
     ).lower()
-    _dbg_ctx(f"extract_workpiece_from_context: stock_mode='{stock_mode}', fallback={fallback_workpiece}")
+    dbg_log(f"extract_workpiece_from_context: stock_mode='{stock_mode}', fallback={fallback_workpiece}")
 
     mode_cat = classify_stock_mode(stock_mode)
     is_previous_mode = (mode_cat == "previous_setup")
@@ -791,18 +866,14 @@ def extract_workpiece_from_context(
                     f"Exported stock STL mesh file not found: '{stl_path}'."
                 )
             try:
-                import numpy as np
+                import numpy as np  # noqa: F401
             except (ImportError, OSError) as exc:
                 raise RuntimeError(
                     "Loading in-process STL stock requires 'numpy', which is not installed "
                     "(offline first-time setup failed). Connect to the internet and re-run Post Clear."
                 ) from exc
             try:
-                from geometry.solid_mesh import (
-                    load_stl_mesh,
-                    revolve_mesh_to_lathe_stock,
-                    SolidMeshStock3D,
-                )
+                from geometry.solid_mesh import load_stl_mesh, workpiece_from_stl_mesh
 
                 try:
                     raw_verts, raw_indices = load_stl_mesh(stl_path, is_inch=False)
@@ -811,86 +882,22 @@ def extract_workpiece_from_context(
                         f"Failed to load stock from STL mesh '{stl_path}': {stl_err}"
                     ) from stl_err
 
-                stl_min = raw_verts.min(axis=0)
-                stl_max = raw_verts.max(axis=0)
-                stl_extents = stl_max - stl_min
-
-                # Base stock unit determination (Phase 1 H2)
-                stock_unit_str = context_data.get("stockUnit")
-                if stock_unit_str:
-                    is_inch = str(stock_unit_str).lower() in ("in", "inch", "inches")
-                else:
-                    is_inch = (context_data.get("unit", 0) == 0)
-
-                # Cross-check against workpieceHint if captured
-                wh_mm = extract_workpiece_hint_bbox_mm(context_data)
-                if wh_mm is not None:
-                    dump_scale = 25.4 if int(context_data.get("unit", 0) or 0) == 0 else 1.0
-                    hint_extents = np.array([
-                        (wh_mm[1] - wh_mm[0]) / dump_scale,
-                        (wh_mm[3] - wh_mm[2]) / dump_scale,
-                        (wh_mm[5] - wh_mm[4]) / dump_scale,
-                    ], dtype=np.float64)
-
-                    candidate_scales = [1.0, 25.4, 1.0 / 25.4]
-                    active_dims = (hint_extents > 1e-4) & (stl_extents > 1e-4)
-                    if np.any(active_dims):
-                        best_scale = None
-                        min_err = float("inf")
-                        for s in candidate_scales:
-                            scaled_stl = stl_extents[active_dims] * s
-                            target_hint = hint_extents[active_dims]
-                            rel_errors = np.abs(scaled_stl - target_hint) / np.maximum(target_hint, 1e-6)
-                            # In-process stock from a preceding setup may have 1-2 axes machined smaller
-                            # than workpieceHint while keeping at least one axis unmachined and never
-                            # exceeding workpieceHint by > 5%.
-                            if np.all(scaled_stl <= target_hint * 1.05):
-                                scale_err = float(np.min(rel_errors))
-                            else:
-                                scale_err = float(np.max(rel_errors))
-                            if scale_err < min_err:
-                                min_err = scale_err
-                                best_scale = s
-
-                        if min_err > 0.05:
-                            raise ValueError(
-                                f"STL bounding box extents {stl_extents.tolist()} do not match workpieceHint "
-                                f"{hint_extents.tolist()} within 5% for any candidate scale {candidate_scales} "
-                                f"(best match scale {best_scale} error: {min_err*100:.1f}%)."
-                            )
-
-                        if abs(best_scale - 25.4) < 1e-3:
-                            is_inch = True
-                        elif abs(best_scale - (1.0 / 25.4)) < 1e-3:
-                            is_inch = False
-                        elif abs(best_scale - 1.0) < 1e-3:
-                            is_inch = (context_data.get("unit", 0) == 0)
+                is_inch = infer_stl_is_inch(raw_verts, context_data, strict=True)
 
                 turning_mode = is_turning
                 if turning_mode is None:
                     turning_mode = is_turning_context(context_data)
                 fb_fixtures = getattr(fallback_workpiece, "fixtures", None) if fallback_workpiece else None
-                _dbg_ctx(f"extract_workpiece_from_context: loading stock from exported STL '{stl_path}' (turning={turning_mode}, inch={is_inch})")
+                dbg_log(f"extract_workpiece_from_context: loading stock from exported STL '{stl_path}' (turning={turning_mode}, inch={is_inch})")
 
                 vertices_mm = raw_verts * 25.4 if is_inch else raw_verts
-                if turning_mode:
-                    wp = revolve_mesh_to_lathe_stock(
-                        vertices_mm,
-                        raw_indices,
-                        max_radial_offset_mm=None,
-                        fixtures=fb_fixtures,
-                    )
-                    if not wp.fixtures and isinstance(wp.stock, AxisymmetricStock2D):
-                        wp.fixtures = [AxisymmetricChuckObstacle.from_stock(wp.stock)]
-                else:
-                    stock = SolidMeshStock3D.from_mesh(vertices_mm, raw_indices)
-                    _dbg_ctx(
-                        f"extract_workpiece_from_context: created SolidMeshStock3D from '{stl_path}' "
-                        f"X=[{stock.x_min:.2f}, {stock.x_max:.2f}], Y=[{stock.y_min:.2f}, {stock.y_max:.2f}], Z=[{stock.z_min:.2f}, {stock.z_max:.2f}]"
-                    )
-                    wp = WorkpieceDefinition(stock=stock, fixtures=fb_fixtures or [])
-                wp.is_stl_derived = True
-                return wp
+                return workpiece_from_stl_mesh(
+                    vertices_mm,
+                    raw_indices,
+                    is_turning=turning_mode,
+                    fixtures=fb_fixtures,
+                    stl_label=stl_path,
+                )
             except (ValueError, FileNotFoundError, RuntimeError):
                 raise
             except Exception as stl_err:
@@ -898,7 +905,7 @@ def extract_workpiece_from_context(
                     f"Failed to load stock from STL mesh '{stl_path}': {stl_err}"
                 ) from stl_err
         else:
-            _dbg_ctx(
+            dbg_log(
                 f"extract_workpiece_from_context: ignoring stockPath '{stl_path}' "
                 f"because stockMode is '{stock_mode}' (not previous/preceding)"
             )
@@ -1190,7 +1197,8 @@ _NON_MACHINING_TOOL_TYPES = frozenset({29, 30, 36, 37})
 _PROBE_TOOL_TYPE = 27
 
 
-def _is_truthy_flag(val: Any) -> bool:
+def is_truthy_flag(val: Any) -> bool:
+    """Return True when a Fusion/JSON flag represents a truthy boolean, numeric, or string value."""
     if val is True:
         return True
     if val is False or val is None:
@@ -1200,6 +1208,9 @@ def _is_truthy_flag(val: Any) -> bool:
     if isinstance(val, str):
         return val.strip().lower() in ("true", "1", "yes")
     return False
+
+
+_is_truthy_flag = is_truthy_flag
 
 
 def check_section_dict_capability(
@@ -1231,8 +1242,8 @@ def check_section_dict_capability(
     if (
         s_type not in (0, 1)
         or t_type in _NON_MACHINING_TOOL_TYPES
-        or _is_truthy_flag(params.get("operation:isJetStrategy"))
-        or _is_truthy_flag(params.get("operation:isAdditiveStrategy"))
+        or is_truthy_flag(params.get("operation:isJetStrategy"))
+        or is_truthy_flag(params.get("operation:isAdditiveStrategy"))
     ):
         return (
             f"Unsupported operation '{op_name}' in setup '{setup_name}': "
@@ -1242,8 +1253,8 @@ def check_section_dict_capability(
 
     if check_probing and (
         t_type == _PROBE_TOOL_TYPE
-        or _is_truthy_flag(params.get("operation:isProbingStrategy"))
-        or _is_truthy_flag(params.get("operation:isInspectionStrategy"))
+        or is_truthy_flag(params.get("operation:isProbingStrategy"))
+        or is_truthy_flag(params.get("operation:isInspectionStrategy"))
     ):
         return (
             f"Unsupported operation '{op_name}' in setup '{setup_name}': "
@@ -1254,7 +1265,7 @@ def check_section_dict_capability(
     if (
         sec.get("isMultiAxis")
         or sec.get("has5DMoves")
-        or _is_truthy_flag(params.get("operation:wrap_cylinder"))
+        or is_truthy_flag(params.get("operation:wrap_cylinder"))
         or (isinstance(ma_type, str) and ma_type.strip().lower() not in ("", "three_axis", "3_axis", "none"))
     ):
         return (
@@ -1275,10 +1286,10 @@ def check_section_dict_capability(
             )
 
     if is_turning and s_type != 1:
-        is_mill = _is_truthy_flag(params.get("operation:isMillingStrategy")) or _is_truthy_flag(
+        is_mill = is_truthy_flag(params.get("operation:isMillingStrategy")) or is_truthy_flag(
             params.get("operation:isHoleMillingStrategy")
         )
-        if is_mill or not _is_truthy_flag(params.get("operation:isDrillingStrategy")):
+        if is_mill or not is_truthy_flag(params.get("operation:isDrillingStrategy")):
             return (
                 f"Unsupported mill-turn live-tool operation '{op_name}' in turning setup '{setup_name}': "
                 f"milling operations inside a Turning setup require C/Y-axis live tooling and are not supported."

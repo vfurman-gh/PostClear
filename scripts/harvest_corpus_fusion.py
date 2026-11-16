@@ -75,47 +75,13 @@ def write_binary_stl(stl_path: str, vertices_mm: Any, indices: Any, header_text:
 
 def detect_stl_is_inch(stl_path: str, dump_data: Dict[str, Any]) -> bool:
     """Infer whether an exported `PreviousSetupStock` STL uses inch or millimeter coordinates."""
-    import numpy as np
+    from context_parser import extract_workpiece_hint_bbox_mm, infer_stl_is_inch
     from geometry.solid_mesh import load_stl_mesh
 
-    stock_unit_str = dump_data.get("stockUnit")
-    if stock_unit_str:
-        is_inch = str(stock_unit_str).lower() in ("in", "inch", "inches")
-    else:
-        is_inch = (dump_data.get("unit", 0) == 0)
-
-    hint = dump_data.get("workpieceHint")
-    if not (isinstance(hint, dict) and "lower" in hint and "upper" in hint):
-        return is_inch
-
+    if extract_workpiece_hint_bbox_mm(dump_data) is None:
+        return infer_stl_is_inch(None, dump_data, strict=False)
     raw_verts, _ = load_stl_mesh(stl_path, is_inch=False)
-    stl_extents = raw_verts.max(axis=0) - raw_verts.min(axis=0)
-    hl, hu = hint["lower"], hint["upper"]
-    hint_extents = np.array([
-        abs(float(hu.get("x", 0.0)) - float(hl.get("x", 0.0))),
-        abs(float(hu.get("y", 0.0)) - float(hl.get("y", 0.0))),
-        abs(float(hu.get("z", 0.0)) - float(hl.get("z", 0.0))),
-    ], dtype=np.float64)
-    active = (hint_extents > 1e-4) & (stl_extents > 1e-4)
-    if not np.any(active):
-        return is_inch
-
-    best_scale = 1.0
-    min_err = float("inf")
-    for s in (1.0, 25.4, 1.0 / 25.4):
-        scaled = stl_extents[active] * s
-        target = hint_extents[active]
-        rel = np.abs(scaled - target) / np.maximum(target, 1e-6)
-        err = float(np.min(rel)) if np.all(scaled <= target * 1.05) else float(np.max(rel))
-        if err < min_err:
-            min_err = err
-            best_scale = s
-
-    if abs(best_scale - 25.4) < 1e-3:
-        return True
-    if abs(best_scale - (1.0 / 25.4)) < 1e-3:
-        return False
-    return bool(dump_data.get("unit", 0) == 0)
+    return infer_stl_is_inch(raw_verts, dump_data, strict=False)
 
 
 def extract_wcs_dict(setup: Any) -> Optional[Dict[str, List[float]]]:
@@ -198,7 +164,7 @@ def _find_nc_program_for_setup(cam: Any, setup: Any, is_turning: bool, PostClear
         prog_obj, base_path = chosen
         return prog_obj, base_path, PostClear._ExtractPostProperties(prog_obj)
 
-    from scripts.run_corpus import get_post_search_dirs, resolve_post_file
+    from pipeline import get_post_search_dirs, resolve_post_file
     sdirs = get_post_search_dirs()
     fallback_names = ("centroid_turning.cps", "fanuc turning.cps") if is_turning else ("grbl.cps", "shopbot.cps", "fanuc.cps")
     for nm in fallback_names:
@@ -354,30 +320,6 @@ def _build_setup_manifest(
     }
 
 
-def _get_op_tool_number(op: Any) -> int:
-    try:
-        tool = getattr(op, "tool", None)
-        params = getattr(tool, "parameters", None) if tool else None
-        p = params.itemByName("tool_number") if params else None
-        val = getattr(getattr(p, "value", None), "value", None)
-        if val is not None:
-            return int(val)
-    except Exception:
-        pass
-    return 0
-
-
-def _is_supported_setup_type(setup: Any, adsk_cam: Any = None) -> bool:
-    """Return True only for Milling and Turning setups (skip Jet, Additive, etc.)."""
-    op_type = getattr(setup, "operationType", None)
-    if op_type is None:
-        return True
-    op_enum = getattr(adsk_cam, "OperationTypes", None) if adsk_cam is not None else None
-    mill_val = getattr(op_enum, "MillingOperation", 0) if op_enum is not None else 0
-    turn_val = getattr(op_enum, "TurningOperation", 1) if op_enum is not None else 1
-    return op_type in (mill_val, turn_val)
-
-
 def _get_param_raw_value(params: Any, name: str) -> Any:
     if params is None or not hasattr(params, "itemByName"):
         return None
@@ -393,6 +335,8 @@ def _get_param_raw_value(params: Any, name: str) -> Any:
 
 def _is_supported_cutting_op(op: Any) -> bool:
     """Return False for non-cutting (probing, inspection, jet, or additive) operations."""
+    from context_parser import is_truthy_flag
+
     if getattr(op, "isProbing", False) is True:
         return False
     op_params = getattr(op, "parameters", None)
@@ -406,7 +350,7 @@ def _is_supported_cutting_op(op: Any) -> bool:
         "operation:isAdditiveStrategy",
         "isAdditiveStrategy",
     ):
-        if _get_param_raw_value(op_params, flag_name) in (True, 1, "1", "true", "True"):
+        if is_truthy_flag(_get_param_raw_value(op_params, flag_name)):
             return False
     tool = getattr(op, "tool", None)
     tool_params = getattr(tool, "parameters", None) if tool is not None else None
@@ -422,22 +366,7 @@ def _partition_tool_batches(setup: Any, PostClear: Any) -> List[Tuple[int, List[
         and getattr(op, "isToolpathValid", True)
         and _is_supported_cutting_op(op)
     ]
-    batches: List[Tuple[int, List[Any]]] = []
-    i = 0
-    while i < len(active_ops):
-        op = active_ops[i]
-        cur_tool = _get_op_tool_number(op)
-        op_list = [op]
-        i += 1
-        while i < len(active_ops):
-            next_op = active_ops[i]
-            t_num = _get_op_tool_number(next_op)
-            if t_num != cur_tool:
-                break
-            op_list.append(next_op)
-            i += 1
-        batches.append((cur_tool, op_list))
-    return batches
+    return PostClear.partition_operations_by_tool(active_ops, default_tool_number=0, coerce_int=True)
 
 
 def _read_post_failure_hint(b_tmp: str) -> str:
@@ -481,8 +410,11 @@ def _setup_has_unsupported_capability(setup: Any, PostClear: Any, adsk_cam: Any 
     Return an error reason if `setup` uses an unsupported setup type or any unsuppressed
     operation uses 3+2 Tool Orientation, 4-axis rotary wrap, simultaneous 5-axis, or mill-turn.
     """
-    if not _is_supported_setup_type(setup, adsk_cam):
-        return "unsupported setup type"
+    check_setup_fn = getattr(PostClear, "_CheckSetupCapability", None)
+    if callable(check_setup_fn):
+        setup_err = check_setup_fn(setup)
+        if setup_err:
+            return setup_err
     op_enum = getattr(adsk_cam, "OperationTypes", None) if adsk_cam is not None else None
     turn_val = getattr(op_enum, "TurningOperation", 1) if op_enum is not None else 1
     op_type = getattr(setup, "operationType", None)
@@ -520,9 +452,6 @@ def harvest_setup(
     import adsk.core
 
     setup_name = getattr(setup, "name", f"Setup_{setup_idx}")
-    if not _is_supported_setup_type(setup, adsk.cam):
-        return {"status": "skipped_capability", "setup_name": setup_name}
-
     PostClear = _get_postclear_module()
     if _setup_has_unsupported_capability(setup, PostClear, adsk.cam) is not None:
         return {"status": "skipped_capability", "setup_name": setup_name}

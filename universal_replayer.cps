@@ -529,295 +529,312 @@ function onClose() {
   getNumberOfCyclePoints = function() { return curCyclePoints.length; };
   getCyclePoint = function(i) { return _fpVec(curCyclePoints[i]); };
 
-  __getCurEv = function() { return curEv; };
-  __fp = _fp;
-  __setLocalPos = function(v) { curLocalPos = new Vector(v.x, v.y, v.z); };
-
   unit = data.unit;
   if (data.highFeedrate) {
     highFeedrate = data.highFeedrate;
   }
 
-  var buildVendor = new Function(
+  var __inSection = false;
+  var __didRepos = false;
+  var __manualNCQueue = [];
+  var __sb = null;
+
+  function _dispatchManualNCExpanded(expanded) {
+    if (!Array.isArray(expanded) || !__sb) return;
+    for (var mi = 0; mi < expanded.length; ++mi) {
+      var mev = expanded[mi];
+      if (mev.type === "onComment") __sb.onComment(mev.c);
+      else if (mev.type === "onPassThrough") __sb.onPassThrough(mev.text);
+      else if (mev.type === "onParameter") __sb.onParameter(mev.name, mev.value);
+      else if (mev.type === "onCommand") __sb.onCommand(mev.cmd);
+      else if (mev.type === "onDwell") __sb.onDwell(mev.sec);
+    }
+  }
+
+  var __host = {
+    bind: function(sb) { __sb = sb; },
+    setInSection: function(v) { __inSection = !!v; },
+    resetDidRepos: function() { __didRepos = false; },
+    enqueueManualNC: function(rec) {
+      __manualNCQueue.push({
+        command: rec.command,
+        value: rec.value,
+        expanded: Array.isArray(rec.expanded) ? rec.expanded : null,
+        used: false
+      });
+    },
+    getCurrentSectionId: function(curSec) {
+      return (__inSection && curSec) ? curSec.getId() : -1;
+    },
+    getPreviousSection: function(curSec) {
+      if (!curSec || curSec.getId() <= 0) return curSec;
+      return getSection(curSec.getId() - 1);
+    },
+    getNextSection: function(curSec) {
+      if (!curSec || (curSec.getId() + 1) >= getNumberOfSections()) return curSec;
+      return getSection(curSec.getId() + 1);
+    },
+    isNewWorkPlane: function(sec, curSec, mc) {
+      var section = (sec && typeof sec === "object") ? sec : curSec;
+      if (!section) return false;
+      var firstSection = section.getId() === 0;
+      var newWorkPlane = firstSection;
+      if (!firstSection) {
+        var previousSection = getSection(section.getId() - 1);
+        if (previousSection) {
+          var isOptimized = section.isOptimizedForMachine() && previousSection.isOptimizedForMachine();
+          newWorkPlane = newWorkPlane || !isSameDirection(previousSection.getGlobalFinalToolAxis(), section.getGlobalInitialToolAxis());
+          newWorkPlane = newWorkPlane || (isOptimized && Vector.diff(previousSection.getFinalToolAxisABC(), section.getInitialToolAxisABC()).length > 1e-4);
+          newWorkPlane = newWorkPlane || (mc && !mc.isMultiAxisConfiguration() && section.isMultiAxis());
+          newWorkPlane = newWorkPlane || (previousSection.isMultiAxis() !== section.isMultiAxis());
+        }
+      }
+      return newWorkPlane;
+    },
+    isNewWorkOffset: function(sec, curSec) {
+      var section = (sec && typeof sec === "object") ? sec : curSec;
+      if (!section) return false;
+      var firstSection = section.getId() === 0;
+      var newWorkOffset = firstSection;
+      if (!firstSection) {
+        var previousSection = getSection(section.getId() - 1);
+        if (previousSection) {
+          newWorkOffset = newWorkOffset || (previousSection.workOffset !== section.workOffset);
+        }
+      }
+      return newWorkOffset;
+    },
+    isToolChangeNeeded: function(args, curSec) {
+      var start = (args.length > 0 && typeof args[0] === "object") ? 1 : 0;
+      var section = (args.length > 0 && typeof args[0] === "object") ? args[0] : curSec;
+      if (!section) return false;
+      var firstSection = section.getId() === 0;
+      var currentTool = section.getTool();
+      if (firstSection || section.getForceToolChange()) return true;
+      var previousSection = getSection(section.getId() - 1);
+      if (!previousSection) return true;
+      var previousTool = previousSection.getTool();
+      if (!previousTool) return true;
+      if (args.length === start) {
+        return currentTool.number !== previousTool.number;
+      }
+      for (var i = start; i < args.length; ++i) {
+        var prop = args[i];
+        if (previousTool[prop] !== currentTool[prop]) return true;
+      }
+      return false;
+    },
+    getNextTool: function(args, curSec) {
+      var start = (args.length > 0 && typeof args[0] === "object") ? 1 : 0;
+      var section = (args.length > 0 && typeof args[0] === "object") ? args[0] : curSec;
+      if (!section) return undefined;
+      var currentSectionId = section.getId();
+      var numSections = getNumberOfSections();
+      var returnFirstTool = (args.length > start && typeof args[start] === "boolean") ? args[start] : false;
+      for (var i = currentSectionId + 1; i < numSections; ++i) {
+        var nextSec = getSection(i);
+        if (nextSec && nextSec.getTool().number !== section.getTool().number) {
+          return nextSec.getTool();
+        }
+      }
+      return returnFirstTool ? getSection(0).getTool() : undefined;
+    },
+    isSpindleSpeedDifferent: function(sec, curSec) {
+      var section = (sec && typeof sec === "object") ? sec : curSec;
+      if (!section || section.getId() === 0) return true;
+      var previousSection = getSection(section.getId() - 1);
+      if (!previousSection) return true;
+      if (previousSection.getTool().clockwise !== section.getTool().clockwise) return true;
+      if (section.getTool().getSpindleMode() === SPINDLE_CONSTANT_SURFACE_SPEED) {
+        return (previousSection.getTool().getSpindleMode() !== SPINDLE_CONSTANT_SURFACE_SPEED) ||
+          Math.round(previousSection.getTool().surfaceSpeed - section.getTool().surfaceSpeed) !== 0;
+      }
+      return (previousSection.getTool().getSpindleMode() !== SPINDLE_CONSTANT_SPINDLE_SPEED) ||
+        Math.round(previousSection.getTool().spindleRPM - section.getTool().spindleRPM) !== 0;
+    },
+    isProbeOperation: function(sec, curSec) {
+      var section = (sec && typeof sec === "object") ? sec : curSec;
+      if (!section) return false;
+      var strat = section.getParameter("operation-strategy", "");
+      return strat === "probe" || strat === "probe_geometry";
+    },
+    isDrillingCycle: function(sec, curSec) {
+      var section = (sec && typeof sec === "object") ? sec : curSec;
+      if (!section) return false;
+      return section.strategy === "drill";
+    },
+    hasParameter: function(name, curSec) {
+      return (curSec && curSec.hasParameter(name)) || hasGlobalParameter(name);
+    },
+    getParameter: function(name, def, curSec) {
+      return (curSec && curSec.hasParameter(name)) ? curSec.getParameter(name, def) : getGlobalParameter(name, def);
+    },
+    getProperty: function(props, name, def) {
+      if (props && Object.prototype.hasOwnProperty.call(props, name)) {
+        var p = props[name];
+        if (p !== null && typeof p === "object") {
+          if ("current" in p && p.current !== undefined) return p.current;
+          if ("value" in p) return p.value;
+        }
+        return p;
+      }
+      return def;
+    },
+    setProperty: function(props, name, val) {
+      if (props && Object.prototype.hasOwnProperty.call(props, name)) {
+        if (props[name] !== null && typeof props[name] === "object") {
+          props[name].value = val;
+          props[name].current = val;
+        } else {
+          props[name] = val;
+        }
+      }
+    },
+    applyPostProp: function(name, val) {
+      if (__sb && typeof __sb.setProp === "function") {
+        try { __sb.setProp(name, val); } catch (e) {}
+      }
+    },
+    getRapidMode: function() {
+      var rawHfm = __sb ? __sb.getHfm() : undefined;
+      var hfm = (rawHfm !== undefined) ? rawHfm : null;
+      var ug = null;
+      if (__sb && typeof __sb.getProp === "function") {
+        try {
+          var p = __sb.getProp("useG0");
+          if (typeof p === "boolean") ug = p;
+        } catch (e) {}
+      }
+      var props = __sb ? __sb.getProps() : undefined;
+      if (ug === null && props && typeof props.useG0 !== "undefined") {
+        try {
+          var val = (typeof props.useG0 === "object" && props.useG0 !== null) ? props.useG0.value : props.useG0;
+          if (typeof val === "boolean") ug = val;
+        } catch (e) {}
+      }
+      return { highFeedMapping: hfm, useG0: ug };
+    },
+    replaySubMoves: function(moves, defaultType) {
+      if (!moves) return;
+      for (var m = 0; m < moves.length; ++m) {
+        var mv = moves[m];
+        if (mv.movement !== undefined && __sb) __sb.setMovement(mv.movement);
+        var mType = mv.type || defaultType;
+        if (mType === "onRapid") {
+          var pr = _fp(mv.x, mv.y, mv.z);
+          if (__sb) __sb.onRapid(pr.x, pr.y, pr.z);
+          curLocalPos = new Vector(mv.x, mv.y, mv.z);
+        } else if (mType === "onLinear") {
+          var pl = _fp(mv.x, mv.y, mv.z);
+          if (__sb) __sb.onLinear(pl.x, pl.y, pl.z, mv.feed);
+          curLocalPos = new Vector(mv.x, mv.y, mv.z);
+        } else if (mType === "onDwell") {
+          if (__sb) __sb.onDwell(mv.sec);
+        }
+      }
+    },
+    linearize: function(tol) {
+      if (curEv && curEv.linearizedMoves && curEv.linearizedMoves.length > 0) {
+        this.replaySubMoves(curEv.linearizedMoves, "onLinear");
+      } else if (curEv) {
+        this.replaySubMoves([{type: "onLinear", x: curEv.x, y: curEv.y, z: curEv.z, feed: curEv.feed}], "onLinear");
+      }
+    },
+    expandCyclePoint: function() {
+      if (__sb) __sb.setCycleExpanded(true);
+      var list = curEv ? ((__didRepos && curEv.afterReposMoves) ? curEv.afterReposMoves : curEv.expandedMoves) : null;
+      this.replaySubMoves(list);
+    },
+    repositionToCycleClearance: function() {
+      __didRepos = true;
+      this.replaySubMoves(curEv ? curEv.reposMoves : null);
+    },
+    expandManualNC: function(command, value) {
+      var matched = null;
+      for (var qi = 0; qi < __manualNCQueue.length; ++qi) {
+        var q = __manualNCQueue[qi];
+        if (!q.used && q.command === command && q.value === value) {
+          q.used = true;
+          matched = q;
+          break;
+        }
+      }
+      if (matched && Array.isArray(matched.expanded)) {
+        _dispatchManualNCExpanded(matched.expanded);
+        return;
+      }
+      if (!__sb) return;
+      if (typeof COMMAND_COMMENT !== "undefined" && command === COMMAND_COMMENT) {
+        __sb.onComment(value);
+      } else if (typeof COMMAND_PASS_THROUGH !== "undefined" && command === COMMAND_PASS_THROUGH) {
+        __sb.onPassThrough(value);
+      } else if (typeof COMMAND_DWELL !== "undefined" && command === COMMAND_DWELL) {
+        __sb.onDwell(value);
+      } else if (typeof COMMAND_DISPLAY_MESSAGE !== "undefined" && command === COMMAND_DISPLAY_MESSAGE) {
+        __sb.onParameter("display", value);
+      } else {
+        __sb.onCommand(command);
+      }
+    }
+  };
+
+  var buildVendor = new Function("__host",
     "var currentSection, tool, movement, radiusCompensation, spindleSpeed, cycle, cycleType, cycleExpanded, programName, programComment;\n" +
     "var onOpen, onComment, onPassThrough, onParameter, onSection, onSpindleSpeed, onOrientateSpindle, onMovement, onFeedMode, onRadiusCompensation, onDwell, onCommand, onManualNC, onRapid, onLinear, onCircular, onCycle, onCyclePoint, onCycleEnd, onSectionEnd, onClose;\n" +
-    "var __didRepos = false;\n" +
-    "var __inSection = false;\n" +
-    "var __manualNCQueue = [];\n" +
-    "function getCurrentSectionId() { return (__inSection && currentSection) ? currentSection.getId() : -1; }\n" +
+    "__host.bind({\n" +
+    "  getProps: function() { return (typeof properties !== 'undefined') ? properties : undefined; }, getHfm: function() { return (typeof highFeedMapping !== 'undefined') ? highFeedMapping : undefined; },\n" +
+    "  setMovement: function(m) { movement = m; }, setCycleExpanded: function(v) { cycleExpanded = !!v; },\n" +
+    "  getProp: function(n, d) { return (typeof getProperty === 'function') ? getProperty(n, d) : d; }, setProp: function(n, v) { if (typeof setProperty === 'function') setProperty(n, v); },\n" +
+    "  onRapid: function(x, y, z) { if (typeof onRapid === 'function') onRapid(x, y, z); }, onLinear: function(x, y, z, f) { if (typeof onLinear === 'function') onLinear(x, y, z, f); },\n" +
+    "  onDwell: function(s) { if (typeof onDwell === 'function') onDwell(s); }, onComment: function(c) { if (typeof onComment === 'function') onComment(c); },\n" +
+    "  onPassThrough: function(t) { if (typeof onPassThrough === 'function') onPassThrough(t); }, onParameter: function(n, v) { if (typeof onParameter === 'function') onParameter(n, v); }, onCommand: function(c) { if (typeof onCommand === 'function') onCommand(c); }\n" +
+    "});\n" +
+    "function getCurrentSectionId() { return __host.getCurrentSectionId(currentSection); }\n" +
     "function isFirstSection() { return currentSection.getId() === 0; }\n" +
     "function isLastSection() { return currentSection.getId() === (getNumberOfSections() - 1); }\n" +
     "function hasPreviousSection() { return currentSection.getId() > 0; }\n" +
     "function hasNextSection() { return (currentSection.getId() + 1) < getNumberOfSections(); }\n" +
-    "function getPreviousSection() {\n" +
-    "  if (!currentSection || currentSection.getId() <= 0) return currentSection;\n" +
-    "  return getSection(currentSection.getId() - 1);\n" +
-    "}\n" +
-    "function getNextSection() {\n" +
-    "  if (!currentSection || (currentSection.getId() + 1) >= getNumberOfSections()) return currentSection;\n" +
-    "  return getSection(currentSection.getId() + 1);\n" +
-    "}\n" +
-    "function isNewWorkPlane(sec) {\n" +
-    "  var section = (sec && typeof sec === 'object') ? sec : currentSection;\n" +
-    "  if (!section) return false;\n" +
-    "  var firstSection = section.getId() === 0;\n" +
-    "  var newWorkPlane = firstSection;\n" +
-    "  if (!firstSection) {\n" +
-    "    var previousSection = getSection(section.getId() - 1);\n" +
-    "    if (previousSection) {\n" +
-    "      var isOptimized = section.isOptimizedForMachine() && previousSection.isOptimizedForMachine();\n" +
-    "      newWorkPlane = newWorkPlane || !isSameDirection(previousSection.getGlobalFinalToolAxis(), section.getGlobalInitialToolAxis());\n" +
-    "      newWorkPlane = newWorkPlane || (isOptimized && Vector.diff(previousSection.getFinalToolAxisABC(), section.getInitialToolAxisABC()).length > 1e-4);\n" +
-    "      newWorkPlane = newWorkPlane || (typeof machineConfiguration !== 'undefined' && machineConfiguration && !machineConfiguration.isMultiAxisConfiguration() && section.isMultiAxis());\n" +
-    "      newWorkPlane = newWorkPlane || (previousSection.isMultiAxis() !== section.isMultiAxis());\n" +
-    "    }\n" +
-    "  }\n" +
-    "  return newWorkPlane;\n" +
-    "}\n" +
-    "function isNewWorkOffset(sec) {\n" +
-    "  var section = (sec && typeof sec === 'object') ? sec : currentSection;\n" +
-    "  if (!section) return false;\n" +
-    "  var firstSection = section.getId() === 0;\n" +
-    "  var newWorkOffset = firstSection;\n" +
-    "  if (!firstSection) {\n" +
-    "    var previousSection = getSection(section.getId() - 1);\n" +
-    "    if (previousSection) {\n" +
-    "      newWorkOffset = newWorkOffset || (previousSection.workOffset !== section.workOffset);\n" +
-    "    }\n" +
-    "  }\n" +
-    "  return newWorkOffset;\n" +
-    "}\n" +
-    "function isToolChangeNeeded() {\n" +
-    "  var start = (arguments.length > 0 && typeof arguments[0] === 'object') ? 1 : 0;\n" +
-    "  var section = (arguments.length > 0 && typeof arguments[0] === 'object') ? arguments[0] : currentSection;\n" +
-    "  if (!section) return false;\n" +
-    "  var firstSection = section.getId() === 0;\n" +
-    "  var currentTool = section.getTool();\n" +
-    "  if (firstSection || section.getForceToolChange()) return true;\n" +
-    "  var previousSection = getSection(section.getId() - 1);\n" +
-    "  if (!previousSection) return true;\n" +
-    "  var previousTool = previousSection.getTool();\n" +
-    "  if (!previousTool) return true;\n" +
-    "  if (arguments.length === start) {\n" +
-    "    return currentTool.number !== previousTool.number;\n" +
-    "  } else {\n" +
-    "    for (var i = start; i < arguments.length; ++i) {\n" +
-    "      var prop = arguments[i];\n" +
-    "      if (previousTool[prop] !== currentTool[prop]) return true;\n" +
-    "    }\n" +
-    "  }\n" +
-    "  return false;\n" +
-    "}\n" +
-    "function getNextTool() {\n" +
-    "  var start = (arguments.length > 0 && typeof arguments[0] === 'object') ? 1 : 0;\n" +
-    "  var section = (arguments.length > 0 && typeof arguments[0] === 'object') ? arguments[0] : currentSection;\n" +
-    "  if (!section) return undefined;\n" +
-    "  var currentSectionId = section.getId();\n" +
-    "  var numSections = getNumberOfSections();\n" +
-    "  var returnFirstTool = (arguments.length > start && typeof arguments[start] === 'boolean') ? arguments[start] : false;\n" +
-    "  for (var i = currentSectionId + 1; i < numSections; ++i) {\n" +
-    "    var nextSec = getSection(i);\n" +
-    "    if (nextSec && nextSec.getTool().number !== section.getTool().number) {\n" +
-    "      return nextSec.getTool();\n" +
-    "    }\n" +
-    "  }\n" +
-    "  return returnFirstTool ? getSection(0).getTool() : undefined;\n" +
-    "}\n" +
-    "function isSpindleSpeedDifferent(sec) {\n" +
-    "  var section = (sec && typeof sec === 'object') ? sec : currentSection;\n" +
-    "  if (!section || section.getId() === 0) return true;\n" +
-    "  var previousSection = getSection(section.getId() - 1);\n" +
-    "  if (!previousSection) return true;\n" +
-    "  if (previousSection.getTool().clockwise !== section.getTool().clockwise) return true;\n" +
-    "  if (section.getTool().getSpindleMode() === SPINDLE_CONSTANT_SURFACE_SPEED) {\n" +
-    "    return (previousSection.getTool().getSpindleMode() !== SPINDLE_CONSTANT_SURFACE_SPEED) ||\n" +
-    "      Math.round(previousSection.getTool().surfaceSpeed - section.getTool().surfaceSpeed) !== 0;\n" +
-    "  } else {\n" +
-    "    return (previousSection.getTool().getSpindleMode() !== SPINDLE_CONSTANT_SPINDLE_SPEED) ||\n" +
-    "      Math.round(previousSection.getTool().spindleRPM - section.getTool().spindleRPM) !== 0;\n" +
-    "  }\n" +
-    "}\n" +
-    "function isProbeOperation(sec) {\n" +
-    "  var section = (sec && typeof sec === 'object') ? sec : currentSection;\n" +
-    "  if (!section) return false;\n" +
-    "  var strat = section.getParameter('operation-strategy', '');\n" +
-    "  return strat === 'probe' || strat === 'probe_geometry';\n" +
-    "}\n" +
-    "function isDrillingCycle(sec) {\n" +
-    "  var section = (sec && typeof sec === 'object') ? sec : currentSection;\n" +
-    "  if (!section) return false;\n" +
-    "  return section.strategy === 'drill';\n" +
-    "}\n" +
-    "function hasParameter(name) { return (currentSection && currentSection.hasParameter(name)) || hasGlobalParameter(name); }\n" +
-    "function getParameter(name, def) { return (currentSection && currentSection.hasParameter(name)) ? currentSection.getParameter(name, def) : getGlobalParameter(name, def); }\n" +
-    "function getProperty(name, def) {\n" +
-    "  if (typeof properties !== 'undefined' && properties && Object.prototype.hasOwnProperty.call(properties, name)) {\n" +
-    "    var p = properties[name];\n" +
-    "    if (p !== null && typeof p === 'object') {\n" +
-    "      if ('current' in p && p.current !== undefined) return p.current;\n" +
-    "      if ('value' in p) return p.value;\n" +
-    "    }\n" +
-    "    return p;\n" +
-    "  }\n" +
-    "  return def;\n" +
-    "}\n" +
-    "function setProperty(name, val) {\n" +
-    "  if (typeof properties !== 'undefined' && properties && Object.prototype.hasOwnProperty.call(properties, name)) {\n" +
-    "    if (properties[name] !== null && typeof properties[name] === 'object') {\n" +
-    "      properties[name].value = val;\n" +
-    "      properties[name].current = val;\n" +
-    "    } else {\n" +
-    "      properties[name] = val;\n" +
-    "    }\n" +
-    "  }\n" +
-    "}\n" +
-    "function __applyPostProp(name, val) {\n" +
-    "  if (typeof setProperty === 'function') {\n" +
-    "    try { setProperty(name, val); } catch (e) {}\n" +
-    "  }\n" +
-    "}\n" +
+    "function getPreviousSection() { return __host.getPreviousSection(currentSection); }\n" +
+    "function getNextSection() { return __host.getNextSection(currentSection); }\n" +
+    "function isNewWorkPlane(sec) { return __host.isNewWorkPlane(sec, currentSection, typeof machineConfiguration !== 'undefined' ? machineConfiguration : undefined); }\n" +
+    "function isNewWorkOffset(sec) { return __host.isNewWorkOffset(sec, currentSection); }\n" +
+    "function isToolChangeNeeded() { return __host.isToolChangeNeeded(arguments, currentSection); }\n" +
+    "function getNextTool() { return __host.getNextTool(arguments, currentSection); }\n" +
+    "function isSpindleSpeedDifferent(sec) { return __host.isSpindleSpeedDifferent(sec, currentSection); }\n" +
+    "function isProbeOperation(sec) { return __host.isProbeOperation(sec, currentSection); }\n" +
+    "function isDrillingCycle(sec) { return __host.isDrillingCycle(sec, currentSection); }\n" +
+    "function hasParameter(name) { return __host.hasParameter(name, currentSection); }\n" +
+    "function getParameter(name, def) { return __host.getParameter(name, def, currentSection); }\n" +
+    "function getProperty(name, def) { return __host.getProperty(typeof properties !== 'undefined' ? properties : undefined, name, def); }\n" +
+    "function setProperty(name, val) { __host.setProperty(typeof properties !== 'undefined' ? properties : undefined, name, val); }\n" +
+    "function linearize(tol) { __host.linearize(tol); }\n" +
+    "function expandCyclePoint(x, y, z) { __host.expandCyclePoint(x, y, z); }\n" +
+    "function repositionToCycleClearance(cycle, x, y, z) { __host.repositionToCycleClearance(cycle, x, y, z); }\n" +
+    "function expandManualNC(command, value) { __host.expandManualNC(command, value); }\n" +
     vendorCode + "\n" +
-    "if (typeof gMotionModal !== 'undefined') this.gMotionModal = gMotionModal;\n" +
-    "if (typeof gPlaneModal !== 'undefined') this.gPlaneModal = gPlaneModal;\n" +
-    "if (typeof gAbsIncModal !== 'undefined') this.gAbsIncModal = gAbsIncModal;\n" +
-    "if (typeof gFeedModeModal !== 'undefined') this.gFeedModeModal = gFeedModeModal;\n" +
-    "if (typeof feedOutput !== 'undefined') this.feedOutput = feedOutput;\n" +
-    "if (typeof fourthAxisClamp !== 'undefined') this.fourthAxisClamp = fourthAxisClamp;\n" +
-    "if (typeof fifthAxisClamp !== 'undefined') this.fifthAxisClamp = fifthAxisClamp;\n" +
-    "if (typeof sixthAxisClamp !== 'undefined') this.sixthAxisClamp = sixthAxisClamp;\n" +
-    "function __replaySubMoves(moves, defaultType) {\n" +
-    "  if (!moves) return;\n" +
-    "  for (var m = 0; m < moves.length; ++m) {\n" +
-    "    var mv = moves[m];\n" +
-    "    if (mv.movement !== undefined) movement = mv.movement;\n" +
-    "    var mType = mv.type || defaultType;\n" +
-    "    if (mType === 'onRapid') {\n" +
-    "      var pr = __fp(mv.x, mv.y, mv.z);\n" +
-    "      if (typeof onRapid === 'function') onRapid(pr.x, pr.y, pr.z);\n" +
-    "      __setLocalPos(mv);\n" +
-    "    } else if (mType === 'onLinear') {\n" +
-    "      var pl = __fp(mv.x, mv.y, mv.z);\n" +
-    "      if (typeof onLinear === 'function') onLinear(pl.x, pl.y, pl.z, mv.feed);\n" +
-    "      __setLocalPos(mv);\n" +
-    "    } else if (mType === 'onDwell') {\n" +
-    "      if (typeof onDwell === 'function') onDwell(mv.sec);\n" +
-    "    }\n" +
-    "  }\n" +
-    "}\n" +
-    "function linearize(tol) {\n" +
-    "  var cEv = __getCurEv();\n" +
-    "  if (cEv && cEv.linearizedMoves && cEv.linearizedMoves.length > 0) {\n" +
-    "    __replaySubMoves(cEv.linearizedMoves, 'onLinear');\n" +
-    "  } else if (cEv) {\n" +
-    "    __replaySubMoves([{type: 'onLinear', x: cEv.x, y: cEv.y, z: cEv.z, feed: cEv.feed}], 'onLinear');\n" +
-    "  }\n" +
-    "}\n" +
-    "function expandCyclePoint(x, y, z) {\n" +
-    "  cycleExpanded = true;\n" +
-    "  var cEv = __getCurEv();\n" +
-    "  var list = cEv ? ((__didRepos && cEv.afterReposMoves) ? cEv.afterReposMoves : cEv.expandedMoves) : null;\n" +
-    "  __replaySubMoves(list);\n" +
-    "}\n" +
-    "function repositionToCycleClearance(cycle, x, y, z) {\n" +
-    "  __didRepos = true;\n" +
-    "  var cEv = __getCurEv();\n" +
-    "  __replaySubMoves(cEv ? cEv.reposMoves : null);\n" +
-    "}\n" +
-    "function expandManualNC(command, value) {\n" +
-    "  var matched = null;\n" +
-    "  for (var qi = 0; qi < __manualNCQueue.length; ++qi) {\n" +
-    "    var q = __manualNCQueue[qi];\n" +
-    "    if (!q.used && q.command === command && q.value === value) {\n" +
-    "      q.used = true;\n" +
-    "      matched = q;\n" +
-    "      break;\n" +
-    "    }\n" +
-    "  }\n" +
-    "  if (matched && Array.isArray(matched.expanded)) {\n" +
-    "    for (var mi = 0; mi < matched.expanded.length; ++mi) {\n" +
-    "      var mev = matched.expanded[mi];\n" +
-    "      if (mev.type === 'onComment') { if (typeof onComment === 'function') onComment(mev.c); }\n" +
-    "      else if (mev.type === 'onPassThrough') { if (typeof onPassThrough === 'function') onPassThrough(mev.text); }\n" +
-    "      else if (mev.type === 'onParameter') { if (typeof onParameter === 'function') onParameter(mev.name, mev.value); }\n" +
-    "      else if (mev.type === 'onCommand') { if (typeof onCommand === 'function') onCommand(mev.cmd); }\n" +
-    "      else if (mev.type === 'onDwell') { if (typeof onDwell === 'function') onDwell(mev.sec); }\n" +
-    "    }\n" +
-    "    return;\n" +
-    "  }\n" +
-    "  if (typeof COMMAND_COMMENT !== 'undefined' && command === COMMAND_COMMENT) {\n" +
-    "    if (typeof onComment === 'function') onComment(value);\n" +
-    "  } else if (typeof COMMAND_PASS_THROUGH !== 'undefined' && command === COMMAND_PASS_THROUGH) {\n" +
-    "    if (typeof onPassThrough === 'function') onPassThrough(value);\n" +
-    "  } else if (typeof COMMAND_DWELL !== 'undefined' && command === COMMAND_DWELL) {\n" +
-    "    if (typeof onDwell === 'function') onDwell(value);\n" +
-    "  } else if (typeof COMMAND_DISPLAY_MESSAGE !== 'undefined' && command === COMMAND_DISPLAY_MESSAGE) {\n" +
-    "    if (typeof onParameter === 'function') onParameter('display', value);\n" +
-    "  } else {\n" +
-    "    if (typeof onCommand === 'function') onCommand(command);\n" +
-    "  }\n" +
-    "}\n" +
+    "if (typeof gMotionModal !== 'undefined') this.gMotionModal = gMotionModal; if (typeof gPlaneModal !== 'undefined') this.gPlaneModal = gPlaneModal;\n" +
+    "if (typeof gAbsIncModal !== 'undefined') this.gAbsIncModal = gAbsIncModal; if (typeof gFeedModeModal !== 'undefined') this.gFeedModeModal = gFeedModeModal;\n" +
+    "if (typeof feedOutput !== 'undefined') this.feedOutput = feedOutput; if (typeof fourthAxisClamp !== 'undefined') this.fourthAxisClamp = fourthAxisClamp;\n" +
+    "if (typeof fifthAxisClamp !== 'undefined') this.fifthAxisClamp = fifthAxisClamp; if (typeof sixthAxisClamp !== 'undefined') this.sixthAxisClamp = sixthAxisClamp;\n" +
     "return {\n" +
-    "  setGlobals: function(pn, pc) { programName = pn; programComment = pc; },\n" +
-    "  setInSection: function(v) { __inSection = !!v; },\n" +
-    "  enqueueManualNC: function(rec) {\n" +
-    "    __manualNCQueue.push({command: rec.command, value: rec.value, expanded: Array.isArray(rec.expanded) ? rec.expanded : null, used: false});\n" +
-    "  },\n" +
-    "  getProperty: getProperty,\n" +
+    "  setGlobals: function(pn, pc) { programName = pn; programComment = pc; }, setInSection: __host.setInSection, enqueueManualNC: __host.enqueueManualNC,\n" +
+    "  getProperty: getProperty, setProperty: setProperty, applyPostProp: __host.applyPostProp, getRapidMode: __host.getRapidMode,\n" +
     "  setState: function(st) {\n" +
-    "    if ('currentSection' in st) currentSection = st.currentSection;\n" +
-    "    if ('tool' in st) tool = st.tool;\n" +
-    "    if ('movement' in st) movement = st.movement;\n" +
-    "    if ('radiusCompensation' in st) radiusCompensation = st.radiusCompensation;\n" +
-    "    if ('spindleSpeed' in st) spindleSpeed = st.spindleSpeed;\n" +
-    "    if ('cycle' in st) cycle = st.cycle;\n" +
-    "    if ('cycleType' in st) cycleType = st.cycleType;\n" +
-    "    if ('cycleExpanded' in st) cycleExpanded = st.cycleExpanded;\n" +
+    "    if ('currentSection' in st) currentSection = st.currentSection; if ('tool' in st) tool = st.tool; if ('movement' in st) movement = st.movement; if ('radiusCompensation' in st) radiusCompensation = st.radiusCompensation;\n" +
+    "    if ('spindleSpeed' in st) spindleSpeed = st.spindleSpeed; if ('cycle' in st) cycle = st.cycle; if ('cycleType' in st) cycleType = st.cycleType; if ('cycleExpanded' in st) cycleExpanded = st.cycleExpanded;\n" +
     "  },\n" +
-    "  setProperty: setProperty,\n" +
-    "  applyPostProp: __applyPostProp,\n" +
-    "  getRapidMode: function() {\n" +
-    "    var hfm = (typeof highFeedMapping !== 'undefined') ? highFeedMapping : null;\n" +
-    "    var ug = null;\n" +
-    "    if (typeof getProperty === 'function') {\n" +
-    "      try {\n" +
-    "        var p = getProperty('useG0');\n" +
-    "        if (typeof p === 'boolean') ug = p;\n" +
-    "      } catch (e) {}\n" +
-    "    }\n" +
-    "    if (ug === null && typeof properties !== 'undefined' && properties && typeof properties.useG0 !== 'undefined') {\n" +
-    "      try {\n" +
-    "        var val = (typeof properties.useG0 === 'object' && properties.useG0 !== null) ? properties.useG0.value : properties.useG0;\n" +
-    "        if (typeof val === 'boolean') ug = val;\n" +
-    "      } catch (e) {}\n" +
-    "    }\n" +
-    "    return { highFeedMapping: hfm, useG0: ug };\n" +
-    "  },\n" +
-    "  writeComment: (typeof writeComment === 'function') ? writeComment : null,\n" +
-    "  onOpen: (typeof onOpen === 'function') ? onOpen : null,\n" +
-    "  onComment: (typeof onComment === 'function') ? onComment : null,\n" +
-    "  onPassThrough: (typeof onPassThrough === 'function') ? onPassThrough : null,\n" +
-    "  onParameter: (typeof onParameter === 'function') ? onParameter : null,\n" +
-    "  onSection: (typeof onSection === 'function') ? onSection : null,\n" +
-    "  onSpindleSpeed: (typeof onSpindleSpeed === 'function') ? onSpindleSpeed : null,\n" +
-    "  onOrientateSpindle: (typeof onOrientateSpindle === 'function') ? onOrientateSpindle : null,\n" +
-    "  onMovement: (typeof onMovement === 'function') ? onMovement : null,\n" +
-    "  onFeedMode: (typeof onFeedMode === 'function') ? onFeedMode : null,\n" +
-    "  onRadiusCompensation: (typeof onRadiusCompensation === 'function') ? onRadiusCompensation : null,\n" +
-    "  onDwell: (typeof onDwell === 'function') ? onDwell : null,\n" +
-    "  onCommand: (typeof onCommand === 'function') ? onCommand : null,\n" +
-    "  onManualNC: (typeof onManualNC === 'function') ? onManualNC : null,\n" +
-    "  onRapid: (typeof onRapid === 'function') ? onRapid : null,\n" +
-    "  onLinear: (typeof onLinear === 'function') ? onLinear : null,\n" +
-    "  onCircular: (typeof onCircular === 'function') ? onCircular : null,\n" +
-    "  onCycle: (typeof onCycle === 'function') ? onCycle : null,\n" +
-    "  onCyclePoint: (typeof onCyclePoint === 'function') ? function(x,y,z){ __didRepos = false; onCyclePoint(x,y,z); } : function(x,y,z){ __didRepos = false; expandCyclePoint(x,y,z); },\n" +
-    "  onCycleEnd: (typeof onCycleEnd === 'function') ? onCycleEnd : null,\n" +
-    "  onSectionEnd: (typeof onSectionEnd === 'function') ? onSectionEnd : null,\n" +
-    "  onClose: (typeof onClose === 'function') ? onClose : null\n" +
+    "  writeComment: (typeof writeComment === 'function') ? writeComment : null, onOpen: (typeof onOpen === 'function') ? onOpen : null, onComment: (typeof onComment === 'function') ? onComment : null,\n" +
+    "  onPassThrough: (typeof onPassThrough === 'function') ? onPassThrough : null, onParameter: (typeof onParameter === 'function') ? onParameter : null, onSection: (typeof onSection === 'function') ? onSection : null,\n" +
+    "  onSpindleSpeed: (typeof onSpindleSpeed === 'function') ? onSpindleSpeed : null, onOrientateSpindle: (typeof onOrientateSpindle === 'function') ? onOrientateSpindle : null,\n" +
+    "  onMovement: (typeof onMovement === 'function') ? onMovement : null, onFeedMode: (typeof onFeedMode === 'function') ? onFeedMode : null, onRadiusCompensation: (typeof onRadiusCompensation === 'function') ? onRadiusCompensation : null,\n" +
+    "  onDwell: (typeof onDwell === 'function') ? onDwell : null, onCommand: (typeof onCommand === 'function') ? onCommand : null, onManualNC: (typeof onManualNC === 'function') ? onManualNC : null,\n" +
+    "  onRapid: (typeof onRapid === 'function') ? onRapid : null, onLinear: (typeof onLinear === 'function') ? onLinear : null, onCircular: (typeof onCircular === 'function') ? onCircular : null,\n" +
+    "  onCycle: (typeof onCycle === 'function') ? onCycle : null, onCyclePoint: function(x, y, z) { __host.resetDidRepos(); if (typeof onCyclePoint === 'function') onCyclePoint(x, y, z); else expandCyclePoint(x, y, z); },\n" +
+    "  onCycleEnd: (typeof onCycleEnd === 'function') ? onCycleEnd : null, onSectionEnd: (typeof onSectionEnd === 'function') ? onSectionEnd : null, onClose: (typeof onClose === 'function') ? onClose : null\n" +
     "};"
   );
 
-  var vendor = buildVendor();
+  var vendor = buildVendor(__host);
   _vendorGetProperty = function(name, def) {
     return (vendor && typeof vendor.getProperty === "function") ? vendor.getProperty(name, def) : def;
   };
@@ -829,14 +846,7 @@ function onClose() {
       vendor.enqueueManualNC(rec);
       vendor.onManualNC(rec.command, rec.value);
     } else if (rec.expanded) {
-      for (var mi = 0; mi < rec.expanded.length; ++mi) {
-        var mev = rec.expanded[mi];
-        if (mev.type === "onComment" && vendor.onComment) vendor.onComment(mev.c);
-        else if (mev.type === "onPassThrough" && vendor.onPassThrough) vendor.onPassThrough(mev.text);
-        else if (mev.type === "onParameter" && vendor.onParameter) vendor.onParameter(mev.name, mev.value);
-        else if (mev.type === "onCommand" && vendor.onCommand) vendor.onCommand(mev.cmd);
-        else if (mev.type === "onDwell" && vendor.onDwell) vendor.onDwell(mev.sec);
-      }
+      _dispatchManualNCExpanded(rec.expanded);
     }
   }
 

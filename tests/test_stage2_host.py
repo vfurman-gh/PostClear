@@ -378,6 +378,46 @@ class TestStage2SetupAndPipelineChecks(unittest.TestCase):
             self.assertEqual(PostClear.verifyResults[-1]["nc_program"], "NC Program 1")
 
 
+class _MockTableCommandInput:
+    """Faithful mock of Fusion's adsk.core.TableCommandInput visible-row invariant."""
+
+    def __init__(self, inp_id, name):
+        self.id = inp_id
+        self.name = name
+        self._min_visible_rows = 2
+        self._max_visible_rows = 4
+        self.hasGrid = True
+        self.rowCount = 0
+        self._rows = {}
+
+    @property
+    def minimumVisibleRows(self):
+        return self._min_visible_rows
+
+    @minimumVisibleRows.setter
+    def minimumVisibleRows(self, val):
+        if val < 0 or self._max_visible_rows < val:
+            raise RuntimeError("3 : invalid value")
+        self._min_visible_rows = val
+
+    @property
+    def maximumVisibleRows(self):
+        return self._max_visible_rows
+
+    @maximumVisibleRows.setter
+    def maximumVisibleRows(self, val):
+        if self._min_visible_rows > val:
+            raise RuntimeError("3 : invalid value")
+        self._max_visible_rows = val
+
+    def addCommandInput(self, child, r, c):
+        self._rows[(r, c)] = child
+        self.rowCount = max(self.rowCount, r + 1)
+
+    def getInputAtPosition(self, r, c):
+        return self._rows.get((r, c))
+
+
 class TestStage2DeduplicationHelpers(unittest.TestCase):
     def test_resolve_base_post_path_uses_tier_helper_directly(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -467,19 +507,7 @@ class TestStage2DeduplicationHelpers(unittest.TestCase):
             return obj
 
         def _make_table(inp_id, name, cols, col_ratios):
-            tbl = types.SimpleNamespace(
-                id=inp_id,
-                name=name,
-                minimumVisibleRows=0,
-                maximumVisibleRows=0,
-                hasGrid=True,
-                rowCount=0,
-                addCommandInput=lambda child, r, c: (
-                    table_rows.__setitem__((r, c), child),
-                    setattr(tbl, "rowCount", max(tbl.rowCount, r + 1)),
-                ),
-                getInputAtPosition=lambda r, c: table_rows.get((r, c)),
-            )
+            tbl = _MockTableCommandInput(inp_id, name)
             input_store[inp_id] = tbl
             return tbl
 
@@ -598,6 +626,292 @@ class TestStage2DeduplicationHelpers(unittest.TestCase):
                 delattr(PostClear.adsk.core, "Point2D")
             else:
                 PostClear.adsk.core.Point2D = saved_point2d
+
+    def test_oillid_dialog_table_visibility_header_count_warn_and_abort_no_save(self):
+        """Reproduce 9-setup/10-NCProgram OilLid dialog, live header counter, ⚠ prefix, and abort SaveSettings behavior."""
+        input_store = {}
+        table_rows = {}
+
+        def _make_bool(inp_id, name, is_cb, res="", val=False):
+            obj = types.SimpleNamespace(id=inp_id, name=name, value=val, isEnabled=True, tooltip="", resourceFolder="")
+            input_store[inp_id] = obj
+            return obj
+
+        def _make_str(inp_id, name, val):
+            obj = types.SimpleNamespace(id=inp_id, name=name, value=val, isReadOnly=False)
+            input_store[inp_id] = obj
+            return obj
+
+        def _make_text(inp_id, name, text, rows, read_only):
+            obj = types.SimpleNamespace(id=inp_id, name=name, text=text, isFullWidth=False, isVisible=False)
+            input_store[inp_id] = obj
+            return obj
+
+        def _make_group(inp_id, name):
+            grp_children = types.SimpleNamespace(
+                addBoolValueInput=lambda iid, n, cb, res, v: _make_bool(iid, n, cb, res, v),
+                itemById=lambda iid: input_store.get(iid),
+            )
+            obj = types.SimpleNamespace(id=inp_id, name=name, isExpanded=True, children=grp_children)
+            input_store[inp_id] = obj
+            return obj
+
+        def _make_table(inp_id, name, cols, col_ratios):
+            tbl = _MockTableCommandInput(inp_id, name)
+            input_store[inp_id] = tbl
+            return tbl
+
+        mock_inputs = types.SimpleNamespace(
+            addTableCommandInput=_make_table,
+            addBoolValueInput=_make_bool,
+            addStringValueInput=_make_str,
+            addTextBoxCommandInput=_make_text,
+            addGroupCommandInput=_make_group,
+            itemById=lambda iid: input_store.get(iid),
+        )
+        added_changed_handlers = []
+        mock_cmd = types.SimpleNamespace(
+            commandInputs=mock_inputs,
+            execute=types.SimpleNamespace(add=lambda h: None),
+            inputChanged=types.SimpleNamespace(add=lambda h: added_changed_handlers.append(h)),
+            validateInputs=types.SimpleNamespace(add=lambda h: None),
+        )
+
+        def _mk_op(name, op_id, has_tp=True, is_suppressed=False):
+            return types.SimpleNamespace(
+                name=name,
+                operationId=op_id,
+                entityToken=f"op-{op_id}",
+                objectType="adsk::cam::Operation",
+                hasToolpath=has_tp,
+                isToolpathValid=has_tp,
+                isSuppressed=is_suppressed,
+                isSelected=False,
+                parent=None,
+                tool=types.SimpleNamespace(parameters=types.SimpleNamespace(itemByName=lambda _k: None)),
+            )
+
+        def _mk_setup(name, tok, ops, is_suppressed=False):
+            s = types.SimpleNamespace(
+                name=name,
+                entityToken=tok,
+                objectType="adsk::cam::Setup",
+                operationType=0,
+                isSuppressed=is_suppressed,
+                isSelected=False,
+                allOperations=list(ops),
+            )
+            for op in ops:
+                op.parent = s
+                op.parentSetup = s
+            return s
+
+        flip_op = _mk_op("Face1", 101, has_tp=False)
+        setup_flip = _mk_setup("OilLidFlip", "set-flip", [flip_op])
+        rs1_op = _mk_op("Face1", 201, has_tp=True)
+        setup_rs1 = _mk_setup("RoundStock1", "set-rs1", [rs1_op])
+        other_setups = [
+            _mk_setup(f"Setup{i}", f"set-{i}", [_mk_op(f"Op{i}", 300 + i, has_tp=True)])
+            for i in range(2, 9)
+        ]
+        all_setups = [setup_flip, setup_rs1] + other_setups  # 9 setups
+
+        def _mk_prog(name, setups_list, is_selected=False):
+            return types.SimpleNamespace(
+                name=name,
+                entityToken=f"prog-{name}",
+                objectType="adsk::cam::NCProgram",
+                isSelected=is_selected,
+                setups=list(setups_list),
+                operations=[],
+                postConfiguration=types.SimpleNamespace(extension=".nc"),
+                parameters=types.SimpleNamespace(itemByName=lambda _k: None),
+            )
+
+        prog_rs1 = _mk_prog("RoundStock1", [setup_rs1], is_selected=True)
+        prog_empty = _mk_prog("EmptyProg", [], is_selected=False)
+        prog_nc10 = _mk_prog("NCProgram10", [setup_flip], is_selected=False)
+        other_progs = [_mk_prog(f"Prog{i}", [other_setups[i - 2]]) for i in range(2, 9)]  # 7 programs
+        all_progs = [prog_rs1] + other_progs + [prog_empty, prog_nc10]  # 10 NCPrograms
+
+        cam = types.SimpleNamespace(
+            setups=all_setups,
+            ncPrograms=all_progs,
+            allOperations=types.SimpleNamespace(count=sum(len(s.allOperations) for s in all_setups)),
+        )
+        # Stale saved settings included NCProgram10 from an earlier session
+        doc_settings = dict(PostClear.defaultSettings)
+        doc_settings["ncPrograms"] = ["RoundStock1", "NCProgram10"]
+
+        mock_ui = MagicMock()
+        mock_ui.activeSelections = []
+        mock_ui.createProgressDialog.return_value.wasCancelled = False
+        mock_doc = types.SimpleNamespace(
+            products=types.SimpleNamespace(itemByProductType=lambda _id: cam),
+            attributes=MagicMock(),
+        )
+        mock_app = types.SimpleNamespace(userInterface=mock_ui, activeDocument=mock_doc)
+
+        saved_handlers = list(PostClear.handlers)
+        saved_settings_mgr = PostClear.settingsMgr
+        saved_pending = PostClear._pending_context_selection
+        try:
+            PostClear._pending_context_selection = None
+            mock_mgr = MagicMock()
+            mock_mgr.GetSettings.return_value = doc_settings
+            PostClear.settingsMgr = mock_mgr
+
+            # Verify _MockTableCommandInput enforces Fusion's setter ordering invariant
+            probe_tbl = _MockTableCommandInput("probe", "Probe")
+            with self.assertRaises(RuntimeError) as cm_min:
+                probe_tbl.minimumVisibleRows = 8
+            self.assertIn("3 : invalid value", str(cm_min.exception))
+            with self.assertRaises(RuntimeError) as cm_max:
+                probe_tbl.maximumVisibleRows = 1
+            self.assertIn("3 : invalid value", str(cm_max.exception))
+
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(PostClear.adsk.core, "CommandCreatedEventArgs", MagicMock(cast=lambda a: MagicMock(command=mock_cmd)), create=True), \
+                 patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam):
+                PostClear.CommandEventHandler().notify(MagicMock())
+
+            # 1. Table shows up to 16 rows, only RoundStock1 is checked, header count is "1 of 10 selected",
+            #    and NCProgram10 (index 9) has "⚠ " prefix
+            tbl = input_store["ncProgramsTable"]
+            self.assertEqual(tbl.maximumVisibleRows, 16)
+            self.assertEqual(tbl.minimumVisibleRows, 8)
+            self.assertTrue(input_store["ncprog_chk_0"].value)
+            self.assertFalse(input_store["ncprog_chk_9"].value)
+            self.assertEqual(input_store["ncprog_hdr_info"].value, "1 of 10 selected")
+            self.assertFalse(input_store["ncprog_info_0"].value.startswith("⚠"))
+            self.assertTrue(input_store["ncprog_info_9"].value.startswith("⚠ "))
+
+            # Also verify 1-program dialog against strict _MockTableCommandInput
+            one_prog_store = {}
+            one_mock_inputs = types.SimpleNamespace(
+                addTableCommandInput=lambda iid, n, c, cr: one_prog_store.setdefault(iid, _MockTableCommandInput(iid, n)),
+                addBoolValueInput=lambda iid, n, cb, res="", v=False: one_prog_store.setdefault(
+                    iid, types.SimpleNamespace(id=iid, name=n, value=v, isEnabled=True, tooltip="", resourceFolder="")
+                ),
+                addStringValueInput=lambda iid, n, v: one_prog_store.setdefault(
+                    iid, types.SimpleNamespace(id=iid, name=n, value=v, isReadOnly=False)
+                ),
+                addTextBoxCommandInput=lambda iid, n, txt, r, ro: one_prog_store.setdefault(
+                    iid, types.SimpleNamespace(id=iid, name=n, text=txt, isFullWidth=False, isVisible=False)
+                ),
+                addGroupCommandInput=lambda iid, n: one_prog_store.setdefault(
+                    iid,
+                    types.SimpleNamespace(
+                        id=iid,
+                        name=n,
+                        isExpanded=True,
+                        children=types.SimpleNamespace(
+                            addBoolValueInput=lambda ciid, cn, ccb, cres="", cv=False: one_prog_store.setdefault(
+                                ciid, types.SimpleNamespace(id=ciid, name=cn, value=cv, isEnabled=True, tooltip="", resourceFolder="")
+                            ),
+                            itemById=lambda ciid: one_prog_store.get(ciid),
+                        ),
+                    ),
+                ),
+                itemById=lambda iid: one_prog_store.get(iid),
+            )
+            one_cmd = types.SimpleNamespace(
+                commandInputs=one_mock_inputs,
+                execute=types.SimpleNamespace(add=lambda h: None),
+                inputChanged=types.SimpleNamespace(add=lambda h: None),
+                validateInputs=types.SimpleNamespace(add=lambda h: None),
+            )
+            one_cam = types.SimpleNamespace(setups=[setup_rs1], ncPrograms=[prog_rs1])
+            one_doc = types.SimpleNamespace(
+                products=types.SimpleNamespace(itemByProductType=lambda _id: one_cam),
+                attributes=MagicMock(),
+            )
+            one_app = types.SimpleNamespace(userInterface=mock_ui, activeDocument=one_doc)
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=one_app), \
+                 patch.object(PostClear.adsk.core, "CommandCreatedEventArgs", MagicMock(cast=lambda a: MagicMock(command=one_cmd)), create=True), \
+                 patch.object(PostClear.adsk.cam.CAM, "cast", return_value=one_cam):
+                PostClear.CommandEventHandler().notify(MagicMock())
+            self.assertEqual(one_prog_store["ncProgramsTable"].maximumVisibleRows, 16)
+            self.assertEqual(one_prog_store["ncProgramsTable"].minimumVisibleRows, 2)
+            self.assertEqual(one_prog_store["ncprog_hdr_info"].value, "1 of 1 selected")
+
+            # 2. Live CommandInputChangedHandler updates ncprog_hdr_info on Select All & row checkbox toggles
+            changed_handler = added_changed_handlers[0]
+            input_store["ncprog_select_all"].value = True
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(
+                     PostClear.adsk.core,
+                     "InputChangedEventArgs",
+                     MagicMock(cast=lambda a: types.SimpleNamespace(input=input_store["ncprog_select_all"], inputs=mock_inputs)),
+                     create=True,
+                 ):
+                changed_handler.notify(MagicMock())
+            self.assertEqual(input_store["ncprog_hdr_info"].value, "10 of 10 selected")
+
+            input_store["ncprog_chk_0"].value = False
+            with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                 patch.object(
+                     PostClear.adsk.core,
+                     "InputChangedEventArgs",
+                     MagicMock(cast=lambda a: types.SimpleNamespace(input=input_store["ncprog_chk_0"], inputs=mock_inputs)),
+                     create=True,
+                 ):
+                changed_handler.notify(MagicMock())
+            self.assertEqual(input_store["ncprog_hdr_info"].value, "9 of 10 selected")
+
+            # 3. PerformPostProcess on ['RoundStock1'] emits zero OilLidFlip warnings and saves settings
+            with tempfile.TemporaryDirectory() as out_dir:
+                for p in all_progs:
+                    p.parameters = types.SimpleNamespace(
+                        itemByName=lambda k: types.SimpleNamespace(
+                            value=types.SimpleNamespace(value=out_dir)
+                        ) if k == "nc_program_output_folder" else None
+                    )
+                with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                     patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                     patch("PostClear._EnsureLocalModulesLoaded", return_value=(True, "")), \
+                     patch("PostClear._NotifyPostProcessResult"), \
+                     patch("PostClear.PostProcessSetup", return_value=None) as mock_pp:
+                    mock_ui.messageBox.reset_mock()
+                    mock_mgr.SaveSettings.reset_mock()
+                    PostClear.PerformPostProcess({"ncPrograms": ["RoundStock1"], "restore_rapid": False, "debug_log": False})
+                    mock_ui.messageBox.assert_not_called()
+                    mock_mgr.SaveSettings.assert_called_once()
+                    self.assertEqual(mock_pp.call_count, 1)
+                    self.assertEqual(mock_pp.call_args[0][1].name, "RoundStock1")
+
+                # 4. PerformPostProcess on ['RoundStock1', 'NCProgram10'] prompts for OilLidFlip empty op;
+                #    aborting on DialogNo does NOT call SaveSettings
+                mock_ui.messageBox.reset_mock()
+                mock_ui.messageBox.return_value = PostClear.adsk.core.DialogResults.DialogNo
+                mock_mgr.SaveSettings.reset_mock()
+                with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                     patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                     patch("PostClear._EnsureLocalModulesLoaded", return_value=(True, "")), \
+                     patch("PostClear.PostProcessSetup") as mock_pp_abort:
+                    PostClear.PerformPostProcess({"ncPrograms": ["RoundStock1", "NCProgram10"], "restore_rapid": False, "debug_log": False})
+                    mock_ui.messageBox.assert_called_once()
+                    self.assertIn("OilLidFlip", mock_ui.messageBox.call_args[0][0])
+                    mock_mgr.SaveSettings.assert_not_called()
+                    mock_pp_abort.assert_not_called()
+
+                # 5. When OilLidFlip is suppressed, ['RoundStock1', 'NCProgram10'] triggers ZERO pre-validation prompts
+                setup_flip.isSuppressed = True
+                mock_ui.messageBox.reset_mock()
+                mock_mgr.SaveSettings.reset_mock()
+                with patch.object(PostClear.adsk.core.Application, "get", return_value=mock_app), \
+                     patch.object(PostClear.adsk.cam.CAM, "cast", return_value=cam), \
+                     patch("PostClear._EnsureLocalModulesLoaded", return_value=(True, "")), \
+                     patch("PostClear._NotifyPostProcessResult"), \
+                     patch("PostClear.PostProcessSetup", return_value=None) as mock_pp_sup:
+                    PostClear.PerformPostProcess({"ncPrograms": ["RoundStock1", "NCProgram10"], "restore_rapid": False, "debug_log": False})
+                    mock_ui.messageBox.assert_not_called()
+                    mock_mgr.SaveSettings.assert_called_once()
+                    self.assertEqual(mock_pp_sup.call_count, 1)
+        finally:
+            PostClear.handlers[:] = saved_handlers
+            PostClear.settingsMgr = saved_settings_mgr
+            PostClear._pending_context_selection = saved_pending
 
 
 if __name__ == "__main__":

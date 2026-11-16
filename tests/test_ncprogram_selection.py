@@ -426,6 +426,157 @@ class TestNCProgramSelection(unittest.TestCase):
         self.assertIn(("OilLidSetup", "Op2_Empty", "Empty toolpath"), flagged_ops)
         self.assertIn(("OilLidSetup", "Op3_Invalid", "Invalid toolpath"), flagged_ops)
 
+    def test_same_cam_entity_and_resolve_setup_collision_guards(self):
+        """Adversarial checks: distinct objectType/entityToken/operationId never false-match by .name."""
+        from PostClear import _resolve_setup_for_object, _same_cam_entity
+
+        op_flip = MockOperation("Face1", 101, tool_number=1)
+        op_round = MockOperation("Face1", 201, tool_number=1)
+        flip_setup = MockSetup("OilLidFlip", [op_flip])
+        round_setup = MockSetup("RoundStock1", [op_round])
+        cam = MockCAM([flip_setup, round_setup])
+
+        # Same name "Face1" but distinct operationId -> False; resolves to RoundStock1 (not first setup OilLidFlip)
+        self.assertFalse(_same_cam_entity(op_flip, op_round))
+        self.assertIs(_resolve_setup_for_object(op_round, cam), round_setup)
+
+        # objectType mismatch -> False even with identical .name
+        setup_rs = types.SimpleNamespace(name="RoundStock1", objectType="adsk::cam::Setup")
+        prog_rs = types.SimpleNamespace(name="RoundStock1", objectType="adsk::cam::NCProgram")
+        self.assertFalse(_same_cam_entity(setup_rs, prog_rs))
+
+        # Distinct entityTokens with same .name -> False
+        t1 = types.SimpleNamespace(name="Face1", entityToken="tok-1")
+        t2 = types.SimpleNamespace(name="Face1", entityToken="tok-2")
+        self.assertFalse(_same_cam_entity(t1, t2))
+
+        # parentSetup resolves directly even without parent or cam.setups scan
+        orphan_op = types.SimpleNamespace(
+            name="Face1",
+            operationId=999,
+            objectType="adsk::cam::Operation",
+            parent=None,
+            parentSetup=round_setup,
+        )
+        self.assertIs(_resolve_setup_for_object(orphan_op, cam), round_setup)
+
+        # Guarded name fallback requires matching parentSetup when neither token nor operationId is present
+        name_only_a = types.SimpleNamespace(name="Contour1", parentSetup=flip_setup)
+        name_only_b = types.SimpleNamespace(name="Contour1", parentSetup=round_setup)
+        name_only_b2 = types.SimpleNamespace(name="Contour1", parentSetup=round_setup)
+        self.assertFalse(_same_cam_entity(name_only_a, name_only_b))
+        self.assertTrue(_same_cam_entity(name_only_b, name_only_b2))
+
+    def test_suppressed_setup_and_suppressed_folder_exclusion(self):
+        """Suppressed Setup or suppressed CAMFolder must never emit empty_or_invalid_ops for child ops."""
+        from PostClear import GetNcProgramSetupsAndOperations
+
+        # 1. Suppressed setup with unsuppressed ungenerated child op
+        bad_op = MockOperation("UngeneratedOp", 301, is_suppressed=False, has_toolpath=False)
+        suppressed_setup = MockSetup("OilLidFlip", [bad_op], is_suppressed=True)
+        cam = MockCAM([suppressed_setup])
+
+        target_setups, op_map = GetNcProgramSetupsAndOperations(
+            cam, program=MockNCProgram(name="FlipProg", operations=[suppressed_setup])
+        )
+        self.assertEqual(target_setups, [suppressed_setup])
+        self.assertEqual(op_map[suppressed_setup], [])
+        self.assertEqual(getattr(op_map, "empty_or_invalid_ops", []), [])
+
+        # 2. Active setup containing suppressed CAMFolder with unsuppressed empty child op
+        good_op = MockOperation("GoodOp", 302, is_suppressed=False, has_toolpath=True)
+        folder_empty_op = MockOperation("FolderEmptyOp", 303, is_suppressed=False, has_toolpath=False)
+        suppressed_folder = MockFolder("SuppressedFolder", [folder_empty_op], parent=None)
+        suppressed_folder.isSuppressed = True
+        active_setup = MockSetup("ActiveSetup", [good_op, folder_empty_op], is_suppressed=False)
+        suppressed_folder.parent = active_setup
+        cam2 = MockCAM([active_setup])
+
+        # Whole-setup NCProgram skips ops under suppressed folder
+        _, whole_map = GetNcProgramSetupsAndOperations(
+            cam2, program=MockNCProgram(name="WholeProg", operations=[active_setup])
+        )
+        self.assertEqual(whole_map[active_setup], [good_op])
+        self.assertEqual(getattr(whole_map, "empty_or_invalid_ops", []), [])
+
+        # Folder-targeted NCProgram skips suppressed folder ops cleanly too
+        _, folder_map = GetNcProgramSetupsAndOperations(
+            cam2, program=MockNCProgram(name="FolderProg", operations=[suppressed_folder])
+        )
+        self.assertEqual(folder_map[active_setup], [])
+        self.assertEqual(getattr(folder_map, "empty_or_invalid_ops", []), [])
+
+    def test_oillid_9setup_10prog_preselection_ignores_stale_and_empty_ncprograms(self):
+        """Reproduce OilLid (9 setups, 10 NCPrograms): selecting RoundStock1 entity never matches NCProgram10 or empty NCProgram."""
+        from PostClear import _ResolveNcProgramNamesFromEntities, _ResolvePreselectedNcProgramNames
+
+        # Setup 0: OilLidFlip (has empty toolpath + same op name "Face1" as RoundStock1)
+        flip_op = MockOperation("Face1", 101, has_toolpath=False)
+        oil_lid_flip = MockSetup("OilLidFlip", [flip_op])
+
+        # Setups 1..3: RoundStock1..3, plus 5 other setups -> 9 total setups
+        rs1_op_a = MockOperation("Face1", 201, has_toolpath=True)
+        rs1_op_b = MockOperation("Profile1", 202, has_toolpath=True)
+        rs1_folder = MockFolder("RoughFolder", [rs1_op_a])
+        round_stock1 = MockSetup("RoundStock1", [rs1_op_a, rs1_op_b])
+        rs1_folder.parent = round_stock1
+        round_stock2 = MockSetup("RoundStock2", [MockOperation("RS2_Op", 203)])
+        round_stock3 = MockSetup("RoundStock3", [MockOperation("RS3_Op", 204)])
+        extra_setups = [MockSetup(f"ExtraSetup{i}", [MockOperation(f"ExOp{i}", 300 + i)]) for i in range(4, 9)]
+        all_setups = [oil_lid_flip, round_stock1, round_stock2, round_stock3] + extra_setups
+        self.assertEqual(len(all_setups), 9)
+
+        # 10 NCPrograms: RoundStock1 (op_a & op_b), RoundStock1_OpBOnly (only op_b), RoundStock2, RoundStock3,
+        # 4 extra programs, EmptyProg (unconfigured operations=[]), and NCProgram10 (OilLidFlip)
+        prog_rs1 = MockNCProgram("RoundStock1", [round_stock1])
+        prog_rs1_b_only = MockNCProgram("RoundStock1_OpB", [rs1_op_b])
+        prog_rs2 = MockNCProgram("RoundStock2", [round_stock2])
+        prog_rs3 = MockNCProgram("RoundStock3", [round_stock3])
+        extra_progs = [MockNCProgram(f"Prog{i}", [extra_setups[i - 4]]) for i in range(4, 8)]
+        prog_empty = MockNCProgram("EmptyProg", [])
+        prog_nc10 = MockNCProgram("NCProgram10", [oil_lid_flip])
+        all_progs = [
+            prog_rs1,
+            prog_rs1_b_only,
+            prog_rs2,
+            prog_rs3,
+        ] + extra_progs + [prog_empty, prog_nc10]
+        self.assertEqual(len(all_progs), 10)
+
+        cam = MockCAM(all_setups, nc_programs=all_progs)
+
+        # 1. Selecting Setup RoundStock1 matches RoundStock1 & RoundStock1_OpB, never NCProgram10 or EmptyProg
+        names_setup = _ResolveNcProgramNamesFromEntities(cam, [round_stock1])
+        self.assertEqual(names_setup, ["RoundStock1", "RoundStock1_OpB"])
+
+        # 2. Selecting rs1_op_a inside RoundStock1 matches ONLY RoundStock1 (not RoundStock1_OpB, NCProgram10, EmptyProg)
+        names_op_a = _ResolveNcProgramNamesFromEntities(cam, [rs1_op_a])
+        self.assertEqual(names_op_a, ["RoundStock1"])
+
+        # 3. Selecting rs1_folder matches ONLY RoundStock1
+        names_folder = _ResolveNcProgramNamesFromEntities(cam, [rs1_folder])
+        self.assertEqual(names_folder, ["RoundStock1"])
+
+        # 4. Browser .isSelected fallback when ui.activeSelections is empty
+        empty_ui = types.SimpleNamespace(activeSelections=[])
+        rs1_op_a.isSelected = True
+        try:
+            self.assertEqual(_ResolvePreselectedNcProgramNames(cam, empty_ui), ["RoundStock1"])
+        finally:
+            rs1_op_a.isSelected = False
+
+        round_stock1.isSelected = True
+        try:
+            self.assertEqual(_ResolvePreselectedNcProgramNames(cam, empty_ui), ["RoundStock1", "RoundStock1_OpB"])
+        finally:
+            round_stock1.isSelected = False
+
+        prog_rs1.isSelected = True
+        try:
+            self.assertEqual(_ResolvePreselectedNcProgramNames(cam, empty_ui), ["RoundStock1"])
+        finally:
+            prog_rs1.isSelected = False
+
 
 if __name__ == "__main__":
     unittest.main()

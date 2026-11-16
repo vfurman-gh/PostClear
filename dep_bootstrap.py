@@ -13,7 +13,56 @@ import os
 import platform
 import subprocess
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+import tempfile
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+LOG_PATH: str = globals().get("LOG_PATH") or os.path.join(
+    tempfile.gettempdir(), "postclear_debug.log"
+)
+MAX_LOG_SIZE_BYTES: int = 5 * 1024 * 1024  # 5 MB capped debug log
+_debug_log_enabled: bool = bool(globals().get("_debug_log_enabled", False))
+
+
+def set_debug_log_enabled(enabled: bool) -> None:
+    """Enable or disable diagnostic file logging to LOG_PATH."""
+    global _debug_log_enabled
+    _debug_log_enabled = bool(enabled)
+
+
+def is_debug_log_enabled() -> bool:
+    """Return whether diagnostic file logging is currently enabled."""
+    return bool(_debug_log_enabled)
+
+
+def rotate_log_if_needed(
+    log_path: Optional[str] = None,
+    max_bytes: int = MAX_LOG_SIZE_BYTES,
+) -> None:
+    """Rotate log_path to `<log_path>.1` if size meets or exceeds max_bytes."""
+    target = log_path if log_path else LOG_PATH
+    try:
+        if os.path.isfile(target) and os.path.getsize(target) >= max_bytes:
+            rot_path = target + ".1"
+            if os.path.isfile(rot_path):
+                os.remove(rot_path)
+            os.replace(target, rot_path)
+    except Exception:
+        pass
+
+
+def dbg_log(msg: Any, log_path: Optional[str] = None) -> None:
+    """Append a timestamped line to the debug log when logging is enabled."""
+    if not _debug_log_enabled:
+        return
+    target = log_path if log_path else LOG_PATH
+    try:
+        rotate_log_if_needed(target)
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            f.flush()
+    except Exception:
+        pass
 
 
 REQUIRED_RUNTIME_PACKAGES: Tuple[str, ...] = ("numpy", "shapely", "matplotlib")

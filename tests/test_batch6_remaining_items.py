@@ -595,7 +595,7 @@ class TestBatch6RemainingItems(unittest.TestCase):
             with patch("pipeline.merge_context_dumps", return_value=ctx), \
                  patch("pipeline.parse_context_dump", return_value=[]), \
                  patch("pipeline.extract_tools_from_context", return_value={}), \
-                 patch("PostClear._dbg_global") as mock_dbg:
+                 patch("pipeline.dbg_log") as mock_dbg:
                 try:
                     orchestrator.run(
                         context_dump_paths=[dump_p],

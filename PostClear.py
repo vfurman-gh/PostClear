@@ -4,7 +4,6 @@
 import collections
 import contextlib
 import datetime
-import glob
 import html
 import importlib
 import json
@@ -19,8 +18,7 @@ import sys
 import tempfile
 import time
 import traceback
-import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import adsk.cam
 import adsk.core
@@ -75,56 +73,42 @@ constDumperScript = os.path.join(constAddonDir, "universal_dumper.cps")
 constReplayerScript = os.path.join(constAddonDir, "universal_replayer.cps")
 constPackagesDir = os.path.join(constAddonDir, "packages")
 
-_LOG_PATH = os.path.join(tempfile.gettempdir(), "postclear_debug.log")
-_MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB capped debug log
-_debug_log_enabled = False
+if constAddonDir not in sys.path:
+    sys.path.insert(0, constAddonDir)
+import dep_bootstrap
+
+_LOG_PATH = dep_bootstrap.LOG_PATH
+_last_synced_log_path = _LOG_PATH
+_MAX_LOG_SIZE_BYTES = dep_bootstrap.MAX_LOG_SIZE_BYTES
+_debug_log_enabled = dep_bootstrap.is_debug_log_enabled()
+
+
+def _sync_log_path() -> str:
+    """Propagate PostClear._LOG_PATH mutations to dep_bootstrap.LOG_PATH without clobbering dep_bootstrap overrides."""
+    global _last_synced_log_path
+    if _LOG_PATH != _last_synced_log_path:
+        dep_bootstrap.LOG_PATH = _LOG_PATH
+        _last_synced_log_path = _LOG_PATH
+    return dep_bootstrap.LOG_PATH
 
 
 def _SetDebugLogEnabled(enabled: bool) -> None:
     """Enable or disable diagnostic file logging to _LOG_PATH."""
     global _debug_log_enabled
     _debug_log_enabled = bool(enabled)
-    # Ensure sibling modules (`from PostClear import _dbg_global`) resolve to this
-    # live add-in module instance even when Fusion loads the entry script under a
-    # dynamic loader module name rather than "PostClear".
-    cur_mod = sys.modules.get(__name__)
-    if cur_mod is not None:
-        existing = sys.modules.get("PostClear")
-        if existing is not None and existing is not cur_mod:
-            try:
-                existing._debug_log_enabled = _debug_log_enabled
-            except Exception:
-                pass
-        sys.modules["PostClear"] = cur_mod
+    dep_bootstrap.set_debug_log_enabled(_debug_log_enabled)
+    _sync_log_path()
 
 
-def _RotateLogIfNeeded(log_path: str = _LOG_PATH, max_bytes: int = _MAX_LOG_SIZE_BYTES) -> None:
+def _RotateLogIfNeeded(log_path: Optional[str] = None, max_bytes: int = _MAX_LOG_SIZE_BYTES) -> None:
     """Rotate log file to .1 if size exceeds max_bytes."""
-    try:
-        if os.path.isfile(log_path) and os.path.getsize(log_path) >= max_bytes:
-            rot_path = log_path + ".1"
-            if os.path.isfile(rot_path):
-                os.remove(rot_path)
-            os.replace(log_path, rot_path)
-    except Exception:
-        pass
+    target = log_path if log_path is not None else _sync_log_path()
+    dep_bootstrap.rotate_log_if_needed(target, max_bytes=max_bytes)
 
 
 def _dbg_global(msg):
-    if not _debug_log_enabled:
-        return
-    try:
-        _RotateLogIfNeeded(_LOG_PATH)
-        t = time.strftime('%H:%M:%S')
-        with open(_LOG_PATH, "a", encoding="utf8") as f:
-            f.write(f"[{t}] {msg}\n")
-            f.flush()
-    except Exception:
-        pass
-
-
-if __name__ != "PostClear" and __name__ in sys.modules:
-    sys.modules.setdefault("PostClear", sys.modules[__name__])
+    dep_bootstrap.set_debug_log_enabled(_debug_log_enabled)
+    dep_bootstrap.dbg_log(msg, log_path=_sync_log_path())
 
 
 def _ReadAddinManifestVersion() -> str:
@@ -538,8 +522,8 @@ def InitAddIn():
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
 
 
-def _same_cam_entity(a, b, check_name: bool = True) -> bool:
-    """Compare two Fusion CAM entities by identity, entityToken, operationId, or optional name fallback."""
+def _same_cam_entity(a, b, check_name: bool = True, _check_parent_setup: bool = True) -> bool:
+    """Compare two Fusion CAM entities by identity, objectType, entityToken, operationId, or guarded name fallback."""
     if a is None or b is None:
         return False
     try:
@@ -548,17 +532,27 @@ def _same_cam_entity(a, b, check_name: bool = True) -> bool:
     except Exception:
         pass
     try:
-        tok_a = getattr(a, "entityToken", None)
-        tok_b = getattr(b, "entityToken", None)
-        if isinstance(tok_a, str) and tok_a and tok_a == tok_b:
-            return True
+        type_a = getattr(a, "objectType", None)
+        type_b = getattr(b, "objectType", None)
+        if isinstance(type_a, str) and type_a and isinstance(type_b, str) and type_b and type_a != type_b:
+            return False
     except Exception:
         pass
     try:
-        op_a = getattr(a, "operationId", -1)
-        op_b = getattr(b, "operationId", -2)
-        if isinstance(op_a, int) and not isinstance(op_a, bool) and op_a != -1 and op_a == op_b:
-            return True
+        tok_a = getattr(a, "entityToken", None)
+        tok_b = getattr(b, "entityToken", None)
+        if isinstance(tok_a, str) and tok_a and isinstance(tok_b, str) and tok_b:
+            return tok_a == tok_b
+    except Exception:
+        pass
+    try:
+        op_a = getattr(a, "operationId", None)
+        op_b = getattr(b, "operationId", None)
+        if (
+            isinstance(op_a, int) and not isinstance(op_a, bool) and op_a >= 0
+            and isinstance(op_b, int) and not isinstance(op_b, bool) and op_b >= 0
+        ):
+            return op_a == op_b
     except Exception:
         pass
     if check_name:
@@ -566,6 +560,15 @@ def _same_cam_entity(a, b, check_name: bool = True) -> bool:
             name_a = getattr(a, "name", None)
             name_b = getattr(b, "name", None)
             if isinstance(name_a, str) and name_a and name_a == name_b:
+                if _check_parent_setup:
+                    ps_a = getattr(a, "parentSetup", None)
+                    ps_b = getattr(b, "parentSetup", None)
+                    if (
+                        ps_a is not None and ps_b is not None
+                        and ps_a is not a and ps_b is not b
+                        and _is_setup_cam_object(ps_a) and _is_setup_cam_object(ps_b)
+                    ):
+                        return _same_cam_entity(ps_a, ps_b, check_name=check_name, _check_parent_setup=False)
                 return True
         except Exception:
             pass
@@ -583,7 +586,8 @@ def _is_setup_cam_object(obj, cam=None):
             return False
     if hasattr(adsk.cam, "Setup") and isinstance(obj, adsk.cam.Setup):
         return True
-    if hasattr(obj, "operationType"):
+    op_type = getattr(obj, "operationType", None)
+    if op_type is not None and not type(op_type).__module__.startswith("unittest.mock"):
         return True
     if cam and hasattr(cam, "setups"):
         for s in cam.setups:
@@ -624,27 +628,36 @@ def _resolve_setup_for_object(obj, cam=None):
     """Find the owning adsk.cam.Setup for a Setup, Folder, or Operation."""
     if obj is None:
         return None
-    if _is_setup_cam_object(obj, cam):
-        if cam and hasattr(cam, "setups"):
-            for s in cam.setups:
-                if _same_cam_entity(s, obj):
-                    return s
-        return obj
 
-    # Walk up parent chain
+    def _canonical_setup(s):
+        if cam and hasattr(cam, "setups"):
+            for cam_s in _extract_cam_collection(cam.setups):
+                if _same_cam_entity(cam_s, s):
+                    return cam_s
+        return s
+
+    if _is_setup_cam_object(obj, cam):
+        return _canonical_setup(obj)
+
+    ps = getattr(obj, "parentSetup", None)
+    if ps is not None and ps is not obj and _is_setup_cam_object(ps, cam):
+        return _canonical_setup(ps)
+
+    # Walk up parent chain (bounded for mock safety)
     curr = getattr(obj, "parent", None)
-    while curr is not None:
+    for _ in range(32):
+        if curr is None:
+            break
         if _is_setup_cam_object(curr, cam):
-            if cam and hasattr(cam, "setups"):
-                for s in cam.setups:
-                    if _same_cam_entity(s, curr):
-                        return s
-            return curr
-        curr = getattr(curr, "parent", None)
+            return _canonical_setup(curr)
+        next_curr = getattr(curr, "parent", None)
+        if next_curr is curr:
+            break
+        curr = next_curr
 
     # Search in cam.setups by checking operations
     if cam and hasattr(cam, "setups"):
-        for s in cam.setups:
+        for s in _extract_cam_collection(cam.setups):
             all_ops = getattr(s, "allOperations", [])
             for op in _extract_cam_collection(all_ops):
                 if _same_cam_entity(op, obj):
@@ -876,15 +889,8 @@ def _extract_float_param_mm(params, names, default=None):
 
 def _is_scalar_truthy(val) -> bool:
     """Return True only for concrete truthy bool/numeric/string parameter flags."""
-    if val is True:
-        return True
-    if val is False or val is None:
-        return False
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return abs(float(val)) > 1e-9
-    if isinstance(val, str):
-        return val.strip().lower() in ("true", "1", "yes")
-    return False
+    from context_parser import is_truthy_flag
+    return is_truthy_flag(val)
 
 
 def _param_flag(params, *names) -> bool:
@@ -1046,7 +1052,7 @@ def _CheckProgramCapability(p_setups, setup_operations_map) -> Optional[str]:
     return None
 
 
-def GetNcProgramSetupsAndOperations(cam, program=None):
+def GetNcProgramSetupsAndOperations(cam, program=None, fallback_all_setups: bool = True):
     """
     Look in the selected NCProgram's setup and operations and derive the setups and operations to process.
     Returns:
@@ -1060,6 +1066,21 @@ def GetNcProgramSetupsAndOperations(cam, program=None):
     def add_setup_ref(s):
         if s and not any(_same_cam_entity(s, existing) for existing in nc_prog_setups):
             nc_prog_setups.append(s)
+
+    def _has_suppressed_ancestor(op_obj, root_setup) -> bool:
+        anc = getattr(op_obj, "parent", None)
+        for _ in range(16):
+            if anc is None or anc is op_obj:
+                return False
+            if getattr(anc, "isSuppressed", False) is True:
+                return True
+            if root_setup is not None and (anc is root_setup or _same_cam_entity(anc, root_setup)):
+                return False
+            next_anc = getattr(anc, "parent", None)
+            if next_anc is anc:
+                return False
+            anc = next_anc
+        return False
 
     # 1. Check if program has direct setups collection
     if program is not None and hasattr(program, "setups"):
@@ -1089,9 +1110,10 @@ def GetNcProgramSetupsAndOperations(cam, program=None):
                     resolved_s = _resolve_setup_for_object(item, cam)
                     if resolved_s:
                         add_setup_ref(resolved_s)
-                        f_ops = getattr(item, "allOperations", getattr(item, "operations", []))
-                        for f_op in _extract_cam_collection(f_ops):
-                            selected_ops_by_setup[resolved_s].append(f_op)
+                        if getattr(item, "isSuppressed", False) is not True:
+                            f_ops = getattr(item, "allOperations", getattr(item, "operations", []))
+                            for f_op in _extract_cam_collection(f_ops):
+                                selected_ops_by_setup[resolved_s].append(f_op)
                 else:
                     # Individual Operation
                     resolved_s = _resolve_setup_for_object(item, cam)
@@ -1102,7 +1124,7 @@ def GetNcProgramSetupsAndOperations(cam, program=None):
             _dbg_global(f"GetNcProgramSetupsAndOperations: error inspecting program.operations: {exc}")
 
     # Fallback if NCProgram specifies no setups/operations
-    if not nc_prog_setups:
+    if not nc_prog_setups and fallback_all_setups:
         if cam and hasattr(cam, "setups"):
             for s in cam.setups:
                 add_setup_ref(s)
@@ -1115,6 +1137,10 @@ def GetNcProgramSetupsAndOperations(cam, program=None):
     all_empty_or_invalid = []
 
     for s in target_setups:
+        if getattr(s, "isSuppressed", False) is True:
+            setup_operations_map[s] = []
+            continue
+
         all_s_ops = getattr(s, "allOperations", [])
         all_s_ops_list = _extract_cam_collection(all_s_ops)
 
@@ -1122,13 +1148,15 @@ def GetNcProgramSetupsAndOperations(cam, program=None):
         if is_whole:
             cand_ops = [
                 op for op in all_s_ops_list
-                if not getattr(op, "isSuppressed", False)
+                if getattr(op, "isSuppressed", False) is not True
+                and not _has_suppressed_ancestor(op, s)
             ]
         else:
             chosen_ops = selected_ops_by_setup.get(s, [])
             cand_ops = [
                 op for op in all_s_ops_list
-                if not getattr(op, "isSuppressed", False)
+                if getattr(op, "isSuppressed", False) is not True
+                and not _has_suppressed_ancestor(op, s)
                 and any(_same_cam_entity(op, c_op) for c_op in chosen_ops)
             ]
 
@@ -1252,6 +1280,7 @@ def _ResolveNcProgramNamesFromEntities(cam, entities) -> List[str]:
             matched_names.append(name)
 
     selected_setups = []
+    selected_op_targets = []  # List of (Setup, List[Operation]) for folder/operation selections
     for ent in entities:
         if ent is None:
             continue
@@ -1259,6 +1288,8 @@ def _ResolveNcProgramNamesFromEntities(cam, entities) -> List[str]:
         obj_type_str = obj_type if isinstance(obj_type, str) else ""
         ent_name = getattr(ent, "name", None)
         ent_name_str = ent_name if isinstance(ent_name, str) else ""
+        op_id_val = getattr(ent, "operationId", None)
+        has_valid_op_id = isinstance(op_id_val, int) and not isinstance(op_id_val, bool) and op_id_val >= 0
 
         if _is_nc_program_object(ent, cam):
             for p in all_progs:
@@ -1273,15 +1304,59 @@ def _ResolveNcProgramNamesFromEntities(cam, entities) -> List[str]:
                 _add_name(getattr(p, "name", None))
         elif _is_setup_cam_object(ent, cam):
             selected_setups.append(ent)
+        elif _is_folder_cam_object(ent) or has_valid_op_id or _is_cam_context_entity(ent, cam):
+            ent_setup = _resolve_setup_for_object(ent, cam)
+            if ent_setup is not None:
+                selected_setups.append(ent_setup)
+                if _is_folder_cam_object(ent):
+                    f_ops = _extract_cam_collection(
+                        getattr(ent, "allOperations", getattr(ent, "operations", []))
+                    )
+                    selected_op_targets.append((ent_setup, f_ops))
+                else:
+                    selected_op_targets.append((ent_setup, [ent]))
 
     if selected_setups:
+        whole_setups = [
+            s for s in selected_setups
+            if not any(_same_cam_entity(s, tgt_s) for tgt_s, _ in selected_op_targets)
+        ]
         for p in all_progs:
             try:
-                p_setups, _ = GetNcProgramSetupsAndOperations(cam, program=p)
+                p_setups, p_ops_map = GetNcProgramSetupsAndOperations(
+                    cam, program=p, fallback_all_setups=False
+                )
+            except TypeError:
+                try:
+                    p_setups, p_ops_map = GetNcProgramSetupsAndOperations(cam, program=p)
+                except Exception:
+                    p_setups, p_ops_map = [], None
             except Exception:
-                p_setups = []
-            for ps in p_setups:
-                if any(_same_cam_entity(ps, s) for s in selected_setups):
+                p_setups, p_ops_map = [], None
+
+            if any(
+                _same_cam_entity(ps, ws)
+                for ps in p_setups
+                for ws in whole_setups
+            ):
+                _add_name(getattr(p, "name", None))
+                continue
+
+            for tgt_s, tgt_ops in selected_op_targets:
+                if not any(_same_cam_entity(ps, tgt_s) for ps in p_setups):
+                    continue
+                if not tgt_ops or not isinstance(p_ops_map, dict):
+                    _add_name(getattr(p, "name", None))
+                    break
+                prog_setup_ops = list(_lookup_setup_ops(tgt_s, p_ops_map) or [])
+                for bad_s, bad_op, _reason in (getattr(p_ops_map, "empty_or_invalid_ops", None) or []):
+                    if _same_cam_entity(bad_s, tgt_s):
+                        prog_setup_ops.append(bad_op)
+                if any(
+                    _same_cam_entity(p_op, t_op)
+                    for p_op in prog_setup_ops
+                    for t_op in tgt_ops
+                ):
                     _add_name(getattr(p, "name", None))
                     break
 
@@ -1289,7 +1364,7 @@ def _ResolveNcProgramNamesFromEntities(cam, entities) -> List[str]:
 
 
 def _ResolvePreselectedNcProgramNames(cam, ui) -> List[str]:
-    """Resolve initially checked NC Program names from transient context-menu selection or ui.activeSelections."""
+    """Resolve initially checked NC Program names from transient context-menu selection, ui.activeSelections, or browser selection."""
     global _pending_context_selection
     all_progs = _extract_cam_collection(getattr(cam, "ncPrograms", None)) if cam else []
     valid_names = {getattr(p, "name", None) for p in all_progs if isinstance(getattr(p, "name", None), str)}
@@ -1312,6 +1387,28 @@ def _ResolvePreselectedNcProgramNames(cam, ui) -> List[str]:
                     return matched
         except Exception:
             pass
+
+    if cam:
+        browser_progs = [
+            getattr(p, "name", None)
+            for p in all_progs
+            if getattr(p, "isSelected", False) is True
+            and getattr(p, "name", None) in valid_names
+        ]
+        if browser_progs:
+            return browser_progs
+
+        all_setups = _extract_cam_collection(getattr(cam, "setups", None))
+        browser_entities = [s for s in all_setups if getattr(s, "isSelected", False) is True]
+        if not browser_entities:
+            for s in all_setups:
+                for op in _extract_cam_collection(getattr(s, "allOperations", [])):
+                    if getattr(op, "isSelected", False) is True:
+                        browser_entities.append(op)
+        if browser_entities:
+            matched = _ResolveNcProgramNamesFromEntities(cam, browser_entities)
+            if matched:
+                return matched
 
     return []
 
@@ -1365,6 +1462,25 @@ def _GetNcProgramRowInputs(inputs, tbl, idx: int, row_offset: int = 0):
         except Exception:
             name_inp = None
     return chk, name_inp
+
+
+def _UpdateNcProgramHeaderInfo(inputs, selected_count: int, total_count: int) -> None:
+    """Update the row-0 selection summary ('X of Y selected') in ncProgramsTable."""
+    if inputs is None:
+        return
+    hdr_info = inputs.itemById("ncprog_hdr_info")
+    if hdr_info is None:
+        tbl = inputs.itemById("ncProgramsTable")
+        if _TableHasSelectAllHeader(tbl) and hasattr(tbl, "getInputAtPosition"):
+            try:
+                hdr_info = tbl.getInputAtPosition(0, 2)
+            except Exception:
+                hdr_info = None
+    if hdr_info is not None and hasattr(hdr_info, "value"):
+        try:
+            hdr_info.value = f"{selected_count} of {total_count} selected" if total_count > 0 else ""
+        except Exception:
+            pass
 
 
 def _CollectCheckedNcProgramsFromInputs(inputs) -> Tuple[List[str], int]:
@@ -1644,8 +1760,8 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
             inputs = cmd.commandInputs
 
             tableInput = inputs.addTableCommandInput("ncProgramsTable", "NC Programs", 3, "1:5:4")
-            tableInput.minimumVisibleRows = min(4, max(2, len(all_progs) + 1))
-            tableInput.maximumVisibleRows = 9
+            tableInput.maximumVisibleRows = 16
+            tableInput.minimumVisibleRows = min(8, max(2, len(all_progs) + 1))
             tableInput.hasGrid = False
 
             # Row 0: Select All header aligned cleanly on top of column 0 checkboxes
@@ -1661,7 +1777,8 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                 sel_all_inp.isEnabled = False
             hdr_name_inp = inputs.addStringValueInput("ncprog_hdr_label", "", "Select All")
             hdr_name_inp.isReadOnly = True
-            hdr_info_inp = inputs.addStringValueInput("ncprog_hdr_info", "", "")
+            hdr_info_text = f"{len(ordered_checked)} of {len(all_prog_names)} selected" if all_prog_names else ""
+            hdr_info_inp = inputs.addStringValueInput("ncprog_hdr_info", "", hdr_info_text)
             hdr_info_inp.isReadOnly = True
             tableInput.addCommandInput(sel_all_inp, 0, 0)
             tableInput.addCommandInput(hdr_name_inp, 0, 1)
@@ -1690,6 +1807,8 @@ class CommandEventHandler(adsk.core.CommandCreatedEventHandler):
                     raw_fname = _ResolveNcProgramOutputFilename(prog, setup_obj, file_ext)
                     leaf_fname = _SanitizePathSegment(raw_fname)
                     info_str = f"{setup_name} -> {leaf_fname}{file_ext}"
+                    if getattr(p_ops_map, "empty_or_invalid_ops", None):
+                        info_str = f"⚠ {info_str}"
 
                 info_inp = inputs.addStringValueInput(f"ncprog_info_{idx}", "", info_str)
                 info_inp.isReadOnly = True
@@ -1783,6 +1902,7 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                 try:
                     target_val = bool(input.value)
                     selected = []
+                    total_rows = 0
                     if inputs is not None:
                         tbl = inputs.itemById("ncProgramsTable")
                         row_offset = 1 if _TableHasSelectAllHeader(tbl) else 0
@@ -1792,11 +1912,13 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                             chk, name_inp = _GetNcProgramRowInputs(inputs, tbl, i, row_offset=row_offset)
                             if chk is None:
                                 break
+                            total_rows += 1
                             chk.value = target_val
                             if target_val:
                                 p_name = getattr(name_inp, "value", "") if name_inp is not None else ""
                                 if isinstance(p_name, str) and p_name:
                                     selected.append(p_name)
+                    _UpdateNcProgramHeaderInfo(inputs, len(selected), total_rows)
                     self.docSettings["ncPrograms"] = selected
                 finally:
                     self._updating_select_all = False
@@ -1814,6 +1936,7 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                             sel_all = tbl.getInputAtPosition(0, 0)
                     if sel_all is not None and total > 0:
                         sel_all.value = (len(selected) == total)
+                    _UpdateNcProgramHeaderInfo(inputs, len(selected), total)
                     self.docSettings["ncPrograms"] = selected
                 finally:
                     self._updating_select_all = False
@@ -2009,7 +2132,10 @@ def PerformPostProcess(docSettings):
 
             empty_invalid = getattr(setup_operations_map, "empty_or_invalid_ops", [])
             if empty_invalid:
-                all_empty_invalid.extend(empty_invalid)
+                for bad_s, bad_op, reason in empty_invalid:
+                    if getattr(bad_s, "isSuppressed", False) is True:
+                        continue
+                    all_empty_invalid.append((bad_s, bad_op, reason))
 
             if len(p_setups) != 0 and cam.allOperations.count != 0:
                 fileExt = _GetNcProgramExtension(program)
@@ -2056,9 +2182,6 @@ def PerformPostProcess(docSettings):
                         "outputFolder": outputFolder,
                         "target_path": target_path,
                     })
-
-        # Save settings in document attributes
-        settingsMgr.SaveSettings(doc.attributes, docSettings)
 
         # Prompt once for any empty/invalid toolpaths across all selected NC Programs
         if all_empty_invalid and ui:
@@ -2109,6 +2232,9 @@ def PerformPostProcess(docSettings):
             if res != adsk.core.DialogResults.DialogYes:
                 _dbg_global("PerformPostProcess: user chose not to overwrite existing file; aborting.")
                 return  # abort!
+
+        # Save settings in document attributes only after pre-validation prompts succeed
+        settingsMgr.SaveSettings(doc.attributes, docSettings)
 
         program_outcomes = []
         if runnable_tasks:
@@ -2266,33 +2392,10 @@ def _RecordVerifyResult(setup, cncPath, reportText, reportPath=None, pngPath=Non
         pass
 
 
-_INTERNAL_HELPER_POSTS = (
-    "universal_dumper",
-    "universal_replayer",
-)
-
-
 def _IsInternalHelperPost(post_cfg) -> bool:
     """Return True if post_cfg refers to one of our internal wrapper/dumper/replayer .cps scripts."""
-    if not post_cfg:
-        return False
-    parts = []
-    for attr in ("description", "name", "postPath", "location", "extension"):
-        val = getattr(post_cfg, attr, None)
-        if val and isinstance(val, str):
-            parts.append(val.lower())
-    try:
-        if hasattr(post_cfg, "url") and post_cfg.url:
-            u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
-            parts.append(u_str.lower())
-    except Exception:
-        pass
-    joined = " | ".join(parts)
-    if any(tag in joined for tag in _INTERNAL_HELPER_POSTS):
-        return True
-    if "context dumper" in joined or getattr(post_cfg, "extension", "").lower().lstrip(".") == "json":
-        return True
-    return False
+    import pipeline
+    return pipeline.is_internal_helper_post(post_cfg)
 
 
 def _GetPostSearchDirsByTier() -> Tuple[List[str], List[str], List[str]]:
@@ -2302,104 +2405,26 @@ def _GetPostSearchDirsByTier() -> Tuple[List[str], List[str], List[str]]:
     Tier 2 (System): Autodesk installation system posts.
     Tier 3 (Add-on): Fallback add-in local directory.
     """
-    user_dirs: List[str] = []
-    system_dirs: List[str] = []
-    addon_dirs: List[str] = []
-
-    def _add(lst: List[str], path: Optional[str]):
-        if not path:
-            return
-        norm = os.path.normpath(os.path.abspath(path))
-        if os.path.isdir(norm) and norm not in lst:
-            lst.append(norm)
-
-    # --- Tier 1: User / Personal / Cloud Post Directories ---
-    _add(user_dirs, os.path.expanduser("~/Library/Application Support/Autodesk/Fusion 360 CAM/Posts"))
-    _add(user_dirs, os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/Posts"))
-    _add(user_dirs, os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/cache/posts"))
-
-    appdata = os.environ.get("APPDATA", "")
-    if appdata:
-        _add(user_dirs, os.path.join(appdata, "Autodesk", "Fusion 360 CAM", "Posts"))
-        _add(user_dirs, os.path.join(appdata, "Autodesk", "Autodesk Fusion 360", "CAM", "Posts"))
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    if localappdata:
-        _add(user_dirs, os.path.join(localappdata, "Autodesk", "Autodesk Fusion 360", "CAM", "cache", "posts"))
-
-    for pattern in (
-        os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/*/W.login/*/CAMPosts"),
-        os.path.join(localappdata, "Autodesk", "Autodesk Fusion 360", "*", "W.login", "*", "CAMPosts") if localappdata else "",
-    ):
-        if pattern:
-            for cd in glob.glob(pattern):
-                _add(user_dirs, cd)
-
-    # --- Tier 2: System Post Directories ---
-    try:
-        from pipeline import find_autodesk_system_posts_dir, find_autodesk_post_binary
-        try:
-            sys_posts_dir = find_autodesk_system_posts_dir()
-            if sys_posts_dir:
-                _add(system_dirs, sys_posts_dir)
-        except Exception:
-            pass
-        try:
-            post_b = find_autodesk_post_binary()
-            if post_b:
-                cam_dir = os.path.dirname(post_b)
-                for sub in ("Data/Posts", "Posts"):
-                    _add(system_dirs, os.path.join(cam_dir, sub))
-        except Exception:
-            pass
-    except Exception as exc:
-        _dbg_global(f"_GetPostSearchDirsByTier pipeline search exception: {exc}")
-
-    # --- Tier 3: Add-on Directory Fallback ---
-    _add(addon_dirs, constAddonDir)
-
-    return user_dirs, system_dirs, addon_dirs
+    import pipeline
+    return pipeline.get_post_search_dirs_by_tier(addon_dir=constAddonDir)
 
 
 def _GetPostSearchDirs() -> List[str]:
     """Return all directories on this machine where Autodesk Fusion and user post processors live."""
-    user_dirs, sys_dirs, addon_dirs = _GetPostSearchDirsByTier()
-    combined = []
-    for d in user_dirs + sys_dirs + addon_dirs:
-        if d not in combined:
-            combined.append(d)
-    return combined
+    import pipeline
+    return pipeline.get_post_search_dirs(addon_dir=constAddonDir, include_addon=True)
 
 
 def _GetPostCapabilities(cps_path: str) -> Optional[Dict[str, bool]]:
     """Parse capabilities declared in a .cps post processor file (scans whole file)."""
-    if not cps_path or not os.path.isfile(cps_path):
-        return None
-    try:
-        with open(cps_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                m = re.search(r"\bcapabilities\s*=\s*([^;]+);", line)
-                if m:
-                    expr = m.group(1)
-                    return {
-                        "turning": "CAPABILITY_TURNING" in expr,
-                        "milling": "CAPABILITY_MILLING" in expr or "CAPABILITY_ROUTER" in expr,
-                    }
-    except Exception:
-        pass
-    return None
+    import pipeline
+    return pipeline.scan_cps_capabilities(cps_path)
 
 
 def _IsPostCompatible(cps_path: str, is_turning: Optional[bool] = None) -> bool:
     """Check whether a post processor's declared capabilities match setup operation type."""
-    if is_turning is None:
-        return True
-    caps = _GetPostCapabilities(cps_path)
-    if not caps:
-        return True  # If capabilities not declared or readable, allow
-    if is_turning:
-        return caps["turning"]
-    else:
-        return caps["milling"]
+    import pipeline
+    return pipeline.is_post_compatible(cps_path, is_turning=is_turning)
 
 
 def _ResolveBasePostPath(program=None, is_turning: Optional[bool] = None) -> str:
@@ -2409,122 +2434,13 @@ def _ResolveBasePostPath(program=None, is_turning: Optional[bool] = None) -> str
     - For name/description matches, user/cloud post directories (Tier 1) are preferred over system posts (Tier 2).
     - If more than one compatible file matches within the same priority tier, raises ValueError naming candidates.
     """
-    if not program or not hasattr(program, "postConfiguration") or not program.postConfiguration:
-        return ""
-
-    post_cfg = program.postConfiguration
-    if _IsInternalHelperPost(post_cfg):
-        return ""
-
-    # 1. Authoritative check: Exact path or file:// URL
-    for attr in ("postPath", "location"):
-        val = getattr(post_cfg, attr, None)
-        if val and isinstance(val, str) and (os.path.isabs(val) or val.endswith(".cps")):
-            if os.path.isfile(val):
-                if _IsPostCompatible(val, is_turning):
-                    _dbg_global(f"_ResolveBasePostPath: authoritative exact path via postConfiguration.{attr} -> {val}")
-                    return os.path.abspath(val)
-
-    try:
-        if hasattr(post_cfg, "url") and post_cfg.url:
-            u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
-            if u_str and u_str.startswith("file://"):
-                f_path = urllib.parse.unquote(u_str[len("file://"):])
-                if os.path.isfile(f_path):
-                    if _IsPostCompatible(f_path, is_turning):
-                        _dbg_global(f"_ResolveBasePostPath: authoritative exact path via url file:// -> {f_path}")
-                        return os.path.abspath(f_path)
-    except Exception as u_exc:
-        _dbg_global(f"_ResolveBasePostPath url inspection exception: {u_exc}")
-
-    # Gather search candidate strings (names / descriptions)
-    candidates = []
-    for attr in ("postPath", "location", "name", "description"):
-        val = getattr(post_cfg, attr, None)
-        if val and isinstance(val, str):
-            candidates.append(val)
-    if hasattr(post_cfg, "url") and post_cfg.url:
-        u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
-        if u_str:
-            candidates.append(os.path.basename(u_str))
-
-    user_dirs, sys_dirs, addon_dirs = _GetPostSearchDirsByTier()
-    tiers = [
-        ("user/cloud", user_dirs),
-        ("system", sys_dirs),
-        ("add-on", addon_dirs),
-    ]
-
-    for tier_name, sdirs in tiers:
-        if not sdirs:
-            continue
-
-        # A. Basename search within this tier
-        for cand in candidates:
-            bname = os.path.basename(cand).split("?")[0].strip()
-            if not bname:
-                continue
-            names_to_try = [bname]
-            if not bname.lower().endswith(".cps"):
-                names_to_try.append(bname + ".cps")
-
-            matched_files = set()
-            for name_try in names_to_try:
-                for sdir in sdirs:
-                    p_try = os.path.join(sdir, name_try)
-                    if os.path.isfile(p_try) and _IsPostCompatible(p_try, is_turning):
-                        matched_files.add(os.path.abspath(p_try))
-
-            if len(matched_files) == 1:
-                res = list(matched_files)[0]
-                _dbg_global(f"_ResolveBasePostPath: matched {bname} in {tier_name} -> {res}")
-                return res
-            elif len(matched_files) > 1:
-                cand_list = ", ".join(f"'{p}'" for p in sorted(matched_files))
-                raise ValueError(
-                    f"Ambiguous post processor match for '{bname}' in {tier_name} post directories: "
-                    f"multiple compatible candidate files found ({cand_list}). Please specify an exact path."
-                )
-
-        # B. Description substring search within this tier
-        for cand in candidates:
-            cand_clean = cand.strip().lower()
-            if not cand_clean or len(cand_clean) < 3:
-                continue
-
-            matched_files = set()
-            for sdir in sdirs:
-                if not os.path.isdir(sdir):
-                    continue
-                try:
-                    for entry in os.listdir(sdir):
-                        if entry.lower().endswith(".cps"):
-                            entry_path = os.path.join(sdir, entry)
-                            if not _IsPostCompatible(entry_path, is_turning):
-                                continue
-                            try:
-                                with open(entry_path, "r", encoding="utf-8", errors="ignore") as f:
-                                    for line in f:
-                                        if "description" in line and cand_clean in line.lower():
-                                            matched_files.add(os.path.abspath(entry_path))
-                                            break
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-            if len(matched_files) == 1:
-                res = list(matched_files)[0]
-                _dbg_global(f"_ResolveBasePostPath: matched description '{cand}' in {tier_name} -> {res}")
-                return res
-            elif len(matched_files) > 1:
-                cand_list = ", ".join(f"'{p}'" for p in sorted(matched_files))
-                raise ValueError(
-                    f"Ambiguous post processor match for description '{cand}' in {tier_name} post directories: "
-                    f"multiple compatible candidate files found ({cand_list}). Please specify an exact path."
-                )
-
-    return ""
+    import pipeline
+    return pipeline.resolve_vendor_post_path(
+        program=program,
+        is_turning=is_turning,
+        addon_dir=constAddonDir,
+        search_dirs_by_tier_fn=_GetPostSearchDirsByTier,
+    )
 
 
 def _ExtractPostProperties(program=None) -> dict:
@@ -3605,6 +3521,41 @@ def _OpenFile(path):
         return str(exc)
 
 
+def partition_operations_by_tool(
+    ops: Sequence[Any],
+    default_tool_number: Any = None,
+    coerce_int: bool = False,
+) -> List[Tuple[Any, List[Any]]]:
+    """Group consecutive operations sharing the same tool number into single-tool batches."""
+    def _op_tool_num(op: Any) -> Any:
+        val = _extract_scalar_param(getattr(getattr(op, "tool", None), "parameters", None), "tool_number")
+        if val is None:
+            return default_tool_number
+        if coerce_int:
+            try:
+                return int(val)
+            except Exception:
+                return default_tool_number
+        return val
+
+    batches: List[Tuple[Any, List[Any]]] = []
+    i = 0
+    while i < len(ops):
+        op = ops[i]
+        curTool = _op_tool_num(op)
+        opList = [op]
+        i += 1
+        while i < len(ops):
+            next_op = ops[i]
+            t_num = _op_tool_num(next_op)
+            if t_num != curTool:
+                break
+            opList.append(next_op)
+            i += 1
+        batches.append((curTool, opList))
+    return batches
+
+
 def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileExt, target_operations=None, progress_cb=None, _skip_cap_check=False, nc_program_name=None):
     """
     Unified 2-pass Context-Dump & Single-Pass Replay pipeline for Milling and Turning setups:
@@ -3745,21 +3696,7 @@ def _PostProcessUnifiedPipeline(fname, setup, docSettings, program, path, fileEx
                 _dbg(f"_PostProcessUnifiedPipeline: {op_cap_err}")
                 _record_failure(op_cap_err)
                 return op_cap_err
-    batches = []
-    i = 0
-    while i < len(active_ops):
-        op = active_ops[i]
-        curTool = _extract_scalar_param(getattr(getattr(op, "tool", None), "parameters", None), "tool_number")
-        opList = [op]
-        i += 1
-        while i < len(active_ops):
-            next_op = active_ops[i]
-            t_num = _extract_scalar_param(getattr(getattr(next_op, "tool", None), "parameters", None), "tool_number")
-            if t_num != curTool:
-                break
-            opList.append(next_op)
-            i += 1
-        batches.append((curTool, opList))
+    batches = partition_operations_by_tool(active_ops)
 
     _dbg(f"_PostProcessUnifiedPipeline: partitioned into {len(batches)} batches: {[b[0] for b in batches]}")
     if not batches:

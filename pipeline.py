@@ -18,6 +18,7 @@ Orchestrates the G-code-dialect-independent flow:
 6. Report & Visualization Generation: Compiles markdown reports and high-res verification plots.
 """
 
+import glob
 import json
 import math
 import os
@@ -27,6 +28,9 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+import urllib.parse
+
+from dep_bootstrap import dbg_log
 
 from geometry.models import (
     CollisionRecord,
@@ -292,6 +296,305 @@ def find_autodesk_system_posts_dir() -> str:
     )
 
 
+INTERNAL_HELPER_POSTS = (
+    "universal_dumper",
+    "universal_replayer",
+)
+
+
+def is_internal_helper_post(post_cfg: Any) -> bool:
+    """Return True if post_cfg refers to one of our internal dumper/replayer .cps scripts."""
+    if not post_cfg:
+        return False
+    parts = []
+    for attr in ("description", "name", "postPath", "location", "extension"):
+        val = getattr(post_cfg, attr, None)
+        if val and isinstance(val, str):
+            parts.append(val.lower())
+    try:
+        if hasattr(post_cfg, "url") and post_cfg.url:
+            u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
+            parts.append(u_str.lower())
+    except Exception:
+        pass
+    joined = " | ".join(parts)
+    if any(tag in joined for tag in INTERNAL_HELPER_POSTS):
+        return True
+    if "context dumper" in joined or getattr(post_cfg, "extension", "").lower().lstrip(".") == "json":
+        return True
+    return False
+
+
+def get_post_search_dirs_by_tier(
+    addon_dir: Optional[str] = None,
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Return post search directories partitioned by priority tier:
+    Tier 1 (User / Cloud): Personal and cloud post libraries.
+    Tier 2 (System): Autodesk installation system posts.
+    Tier 3 (Add-on): Fallback add-in local directory.
+    """
+    user_dirs: List[str] = []
+    system_dirs: List[str] = []
+    addon_dirs: List[str] = []
+
+    def _add(lst: List[str], path: Optional[str]) -> None:
+        if not path:
+            return
+        norm = os.path.normpath(os.path.abspath(path))
+        if os.path.isdir(norm) and norm not in lst:
+            lst.append(norm)
+
+    # --- Tier 1: User / Personal / Cloud Post Directories ---
+    _add(user_dirs, os.path.expanduser("~/Library/Application Support/Autodesk/Fusion 360 CAM/Posts"))
+    _add(user_dirs, os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/Posts"))
+    _add(user_dirs, os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/CAM/cache/posts"))
+
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        _add(user_dirs, os.path.join(appdata, "Autodesk", "Fusion 360 CAM", "Posts"))
+        _add(user_dirs, os.path.join(appdata, "Autodesk", "Autodesk Fusion 360", "CAM", "Posts"))
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    if localappdata:
+        _add(user_dirs, os.path.join(localappdata, "Autodesk", "Autodesk Fusion 360", "CAM", "cache", "posts"))
+
+    for pattern in (
+        os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/*/W.login/*/CAMPosts"),
+        os.path.join(localappdata, "Autodesk", "Autodesk Fusion 360", "*", "W.login", "*", "CAMPosts") if localappdata else "",
+    ):
+        if pattern:
+            for cd in glob.glob(pattern):
+                _add(user_dirs, cd)
+
+    # --- Tier 2: System Post Directories ---
+    try:
+        try:
+            sys_posts_dir = find_autodesk_system_posts_dir()
+            if sys_posts_dir:
+                _add(system_dirs, sys_posts_dir)
+        except Exception:
+            pass
+        try:
+            post_b = find_autodesk_post_binary()
+            if post_b:
+                cam_dir = os.path.dirname(post_b)
+                for sub in ("Data/Posts", "Posts"):
+                    _add(system_dirs, os.path.join(cam_dir, sub))
+        except Exception:
+            pass
+    except Exception as exc:
+        dbg_log(f"get_post_search_dirs_by_tier pipeline search exception: {exc}")
+
+    # --- Tier 3: Add-on Directory Fallback ---
+    resolved_addon = addon_dir or os.path.dirname(os.path.abspath(__file__))
+    _add(addon_dirs, resolved_addon)
+
+    return user_dirs, system_dirs, addon_dirs
+
+
+def get_post_search_dirs(
+    addon_dir: Optional[str] = None,
+    include_addon: bool = False,
+) -> List[str]:
+    """Return existing Autodesk Fusion, user, and (optionally) add-on `.cps` directories."""
+    user_dirs, sys_dirs, addon_dirs = get_post_search_dirs_by_tier(addon_dir=addon_dir)
+    combined: List[str] = []
+    source = user_dirs + sys_dirs + (addon_dirs if include_addon else [])
+    for d in source:
+        if d not in combined:
+            combined.append(d)
+    return combined
+
+
+def scan_cps_capabilities(cps_path: str) -> Optional[Dict[str, bool]]:
+    """Parse capabilities declared in a `.cps` post processor file (returns None if undeclared)."""
+    if not cps_path or not os.path.isfile(cps_path):
+        return None
+    try:
+        with open(cps_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                m = re.search(r"\bcapabilities\s*=\s*([^;]+);", line)
+                if m:
+                    expr = m.group(1)
+                    return {
+                        "turning": "CAPABILITY_TURNING" in expr,
+                        "milling": "CAPABILITY_MILLING" in expr or "CAPABILITY_ROUTER" in expr,
+                    }
+    except Exception:
+        pass
+    return None
+
+
+def is_post_compatible(cps_path: str, is_turning: Optional[bool] = None) -> bool:
+    """Check whether a post processor's declared capabilities match setup operation type."""
+    if is_turning is None:
+        return True
+    caps = scan_cps_capabilities(cps_path)
+    if not caps:
+        return True  # If capabilities not declared or readable, allow
+    return bool(caps["turning"] if is_turning else caps["milling"])
+
+
+def resolve_post_file(
+    post_name_or_path: str,
+    search_dirs: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """Resolve a `.cps` filename or path across user and Autodesk system post directories."""
+    if not post_name_or_path:
+        return None
+    if os.path.isfile(post_name_or_path):
+        return os.path.abspath(post_name_or_path)
+
+    bname = os.path.basename(post_name_or_path)
+    names = [bname] if bname.lower().endswith(".cps") else [bname, bname + ".cps"]
+    sdirs = list(search_dirs) if search_dirs is not None else get_post_search_dirs()
+    for d in sdirs:
+        for nm in names:
+            cand = os.path.join(d, nm)
+            if os.path.isfile(cand):
+                return os.path.abspath(cand)
+    return None
+
+
+def resolve_vendor_post_path(
+    program: Any = None,
+    is_turning: Optional[bool] = None,
+    addon_dir: Optional[str] = None,
+    search_dirs_by_tier: Optional[Tuple[List[str], List[str], List[str]]] = None,
+    search_dirs_by_tier_fn: Optional[Any] = None,
+) -> str:
+    """
+    Resolve target machine post processor path from NCProgram without mutating user settings.
+    - Exact path or file:// URL is authoritative.
+    - For name/description matches, user/cloud post directories (Tier 1) are preferred over system posts (Tier 2).
+    - If more than one compatible file matches within the same priority tier, raises ValueError naming candidates.
+    """
+    if not program or not hasattr(program, "postConfiguration") or not program.postConfiguration:
+        return ""
+
+    post_cfg = program.postConfiguration
+    if is_internal_helper_post(post_cfg):
+        return ""
+
+    # 1. Authoritative check: Exact path or file:// URL
+    for attr in ("postPath", "location"):
+        val = getattr(post_cfg, attr, None)
+        if val and isinstance(val, str) and (os.path.isabs(val) or val.endswith(".cps")):
+            if os.path.isfile(val):
+                if is_post_compatible(val, is_turning):
+                    dbg_log(f"_ResolveBasePostPath: authoritative exact path via postConfiguration.{attr} -> {val}")
+                    return os.path.abspath(val)
+
+    try:
+        if hasattr(post_cfg, "url") and post_cfg.url:
+            u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
+            if u_str and u_str.startswith("file://"):
+                f_path = urllib.parse.unquote(u_str[len("file://"):])
+                if os.path.isfile(f_path):
+                    if is_post_compatible(f_path, is_turning):
+                        dbg_log(f"_ResolveBasePostPath: authoritative exact path via url file:// -> {f_path}")
+                        return os.path.abspath(f_path)
+    except Exception as u_exc:
+        dbg_log(f"_ResolveBasePostPath url inspection exception: {u_exc}")
+
+    # Gather search candidate strings (names / descriptions)
+    candidates = []
+    for attr in ("postPath", "location", "name", "description"):
+        val = getattr(post_cfg, attr, None)
+        if val and isinstance(val, str):
+            candidates.append(val)
+    if hasattr(post_cfg, "url") and post_cfg.url:
+        u_str = post_cfg.url.toString() if hasattr(post_cfg.url, "toString") else str(post_cfg.url)
+        if u_str:
+            candidates.append(os.path.basename(u_str))
+
+    user_dirs, sys_dirs, addon_dirs = (
+        search_dirs_by_tier
+        if search_dirs_by_tier is not None
+        else (
+            search_dirs_by_tier_fn()
+            if search_dirs_by_tier_fn is not None
+            else get_post_search_dirs_by_tier(addon_dir=addon_dir)
+        )
+    )
+    tiers = [
+        ("user/cloud", user_dirs),
+        ("system", sys_dirs),
+        ("add-on", addon_dirs),
+    ]
+
+    for tier_name, sdirs in tiers:
+        if not sdirs:
+            continue
+
+        # A. Basename search within this tier
+        for cand in candidates:
+            bname = os.path.basename(cand).split("?")[0].strip()
+            if not bname:
+                continue
+            names_to_try = [bname]
+            if not bname.lower().endswith(".cps"):
+                names_to_try.append(bname + ".cps")
+
+            matched_files = set()
+            for name_try in names_to_try:
+                for sdir in sdirs:
+                    p_try = os.path.join(sdir, name_try)
+                    if os.path.isfile(p_try) and is_post_compatible(p_try, is_turning):
+                        matched_files.add(os.path.abspath(p_try))
+
+            if len(matched_files) == 1:
+                res = list(matched_files)[0]
+                dbg_log(f"_ResolveBasePostPath: matched {bname} in {tier_name} -> {res}")
+                return res
+            elif len(matched_files) > 1:
+                cand_list = ", ".join(f"'{p}'" for p in sorted(matched_files))
+                raise ValueError(
+                    f"Ambiguous post processor match for '{bname}' in {tier_name} post directories: "
+                    f"multiple compatible candidate files found ({cand_list}). Please specify an exact path."
+                )
+
+        # B. Description substring search within this tier
+        for cand in candidates:
+            cand_clean = cand.strip().lower()
+            if not cand_clean or len(cand_clean) < 3:
+                continue
+
+            matched_files = set()
+            for sdir in sdirs:
+                if not os.path.isdir(sdir):
+                    continue
+                try:
+                    for entry in os.listdir(sdir):
+                        if entry.lower().endswith(".cps"):
+                            entry_path = os.path.join(sdir, entry)
+                            if not is_post_compatible(entry_path, is_turning):
+                                continue
+                            try:
+                                with open(entry_path, "r", encoding="utf-8", errors="ignore") as f:
+                                    for line in f:
+                                        if "description" in line and cand_clean in line.lower():
+                                            matched_files.add(os.path.abspath(entry_path))
+                                            break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            if len(matched_files) == 1:
+                res = list(matched_files)[0]
+                dbg_log(f"_ResolveBasePostPath: matched description '{cand}' in {tier_name} -> {res}")
+                return res
+            elif len(matched_files) > 1:
+                cand_list = ", ".join(f"'{p}'" for p in sorted(matched_files))
+                raise ValueError(
+                    f"Ambiguous post processor match for description '{cand}' in {tier_name} post directories: "
+                    f"multiple compatible candidate files found ({cand_list}). Please specify an exact path."
+                )
+
+    return ""
+
+
 class PipelineOrchestrator:
     def __init__(
         self,
@@ -514,16 +817,9 @@ class PipelineOrchestrator:
                 or ""
             ).lower()
 
-            def _dbg_pipe(msg: str) -> None:
-                try:
-                    from PostClear import _dbg_global
-                    _dbg_global(msg)
-                except Exception:
-                    pass
-
             explicit_workpiece = workpiece is not None
             if explicit_workpiece and (combined_ctx.get("stockPath") or (isinstance(combined_ctx.get("stockExport"), dict) and combined_ctx["stockExport"].get("destPath"))):
-                _dbg_pipe(
+                dbg_log(
                     f"PipelineOrchestrator.run: workpiece provided explicitly; ignoring stockPath '{combined_ctx.get('stockPath')}'"
                 )
 
@@ -559,7 +855,7 @@ class PipelineOrchestrator:
                         "but no solid body geometry was provided or extracted."
                     )
 
-            _dbg_pipe(f"PipelineOrchestrator.run: workpiece stock={getattr(workpiece, 'stock', None)}")
+            dbg_log(f"PipelineOrchestrator.run: workpiece stock={getattr(workpiece, 'stock', None)}")
 
             if workpiece is None or getattr(workpiece, "stock", None) is None:
                 setup_label = f"'{program_name}'" if program_name else "this setup"
@@ -580,7 +876,7 @@ class PipelineOrchestrator:
                 wp_u = wp.get("up") or {}
                 wp_f = wp.get("forward") or {}
                 wo = sec.get("workOrigin") or {}
-                _dbg_pipe(
+                dbg_log(
                     f"Section {sec_idx} ({op_name}): "
                     f"workPlane right=({float(wp_r.get('x', 1.0)):.4f},{float(wp_r.get('y', 0.0)):.4f},{float(wp_r.get('z', 0.0)):.4f}) "
                     f"up=({float(wp_u.get('x', 0.0)):.4f},{float(wp_u.get('y', 1.0)):.4f},{float(wp_u.get('z', 0.0)):.4f}) "
@@ -633,7 +929,7 @@ class PipelineOrchestrator:
                     tools_by_op=tools_by_op,
                     is_turning=is_turning,
                     workpiece_hint_mm=wh_mm,
-                    dbg_fn=_dbg_pipe,
+                    dbg_fn=dbg_log,
                 )
                 pattern_secs_precomputed = True
             elif not is_turning and segments and workpiece is not None:
@@ -650,7 +946,7 @@ class PipelineOrchestrator:
                 all_x = [s.start.x for s in segments] + [s.end.x for s in segments]
                 all_y = [s.start.y for s in segments] + [s.end.y for s in segments]
                 all_z = [s.start.z for s in segments] + [s.end.z for s in segments]
-                _dbg_pipe(
+                dbg_log(
                     f"PipelineOrchestrator.run: toolpath bounds (mm) "
                     f"X=[{min(all_x):.2f}, {max(all_x):.2f}], "
                     f"Y=[{min(all_y):.2f}, {max(all_y):.2f}], "
@@ -726,11 +1022,11 @@ class PipelineOrchestrator:
             report.frame_mismatch_ops = []
 
             if tilted_ops:
-                _dbg_pipe(f"PipelineOrchestrator.run: tilted sections (not verified): {tilted_ops}")
+                dbg_log(f"PipelineOrchestrator.run: tilted sections (not verified): {tilted_ops}")
             if multi_axis_ops:
-                _dbg_pipe(f"PipelineOrchestrator.run: multi-axis simultaneous sections (not verified): {multi_axis_ops}")
+                dbg_log(f"PipelineOrchestrator.run: multi-axis simultaneous sections (not verified): {multi_axis_ops}")
             if report.holder_unchecked_ops:
-                _dbg_pipe(f"PipelineOrchestrator.run: holder not checked for ops: {report.holder_unchecked_ops}")
+                dbg_log(f"PipelineOrchestrator.run: holder not checked for ops: {report.holder_unchecked_ops}")
 
             if tp_box_log and st_box_log:
                 report.stock_bounding_box = st_box_log
@@ -742,7 +1038,7 @@ class PipelineOrchestrator:
                     report.fixture_warning = (
                         "Fixture checks disabled: previous-mode turning has no fixture/chuck definitions."
                     )
-                    _dbg_pipe(f"PipelineOrchestrator.run: {report.fixture_warning}")
+                    dbg_log(f"PipelineOrchestrator.run: {report.fixture_warning}")
 
             # Phase 2 C2: Rapid promotion dog-leg safety check
             # Indicator: post-kernel global highFeedMapping and vendor post property useG0.
@@ -762,9 +1058,9 @@ class PipelineOrchestrator:
                     )
                     report.dog_leg_warning = dog_leg_msg
                     report.promoted_events = set()
-                    _dbg_pipe(f"PipelineOrchestrator.run: {dog_leg_msg}")
+                    dbg_log(f"PipelineOrchestrator.run: {dog_leg_msg}")
 
-            _dbg_pipe(
+            dbg_log(
                 f"PipelineOrchestrator.run: report.volume={report.total_volume_removed_mm3:.3f} mm³, "
                 f"segments={len(segments)}, promoted_events={len(report.promoted_events)}"
             )
@@ -866,7 +1162,7 @@ class PipelineOrchestrator:
                 report.frame_warnings = frame_warnings
                 report.frame_mismatch_ops = frame_mismatch_ops
                 for fw in frame_warnings:
-                    _dbg_pipe(f"PipelineOrchestrator.run: frame warning: {fw}")
+                    dbg_log(f"PipelineOrchestrator.run: frame warning: {fw}")
 
             # -----------------------------------------------------------------
             # Step 6: Generate Summary Report & Verification Plot

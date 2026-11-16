@@ -34,12 +34,9 @@ from geometry.models import (
 
 
 def _dbg(msg: str) -> None:
-    """Internal debug logging helper that forwards to PostClear._dbg_global if available."""
-    try:
-        from PostClear import _dbg_global
-        _dbg_global(msg)
-    except Exception:
-        pass
+    """Internal debug logging helper forwarding to dep_bootstrap.dbg_log."""
+    from dep_bootstrap import dbg_log
+    dbg_log(msg)
 
 
 def transform_design_points_to_setup_wcs(
@@ -827,6 +824,40 @@ def load_stl_mesh(stl_path: str, is_inch: bool = False) -> Tuple[np.ndarray, np.
     return verts, indices
 
 
+def workpiece_from_stl_mesh(
+    vertices_mm: np.ndarray,
+    indices: np.ndarray,
+    is_turning: bool = False,
+    fixtures: Optional[List[AxisymmetricChuckObstacle]] = None,
+    stl_label: str = "",
+) -> WorkpieceDefinition:
+    """
+    Construct a simulation-ready WorkpieceDefinition from metric `(vertices_mm, indices)` arrays.
+
+    When `is_turning=True` and no explicit `fixtures` are provided, attaches a default
+    `AxisymmetricChuckObstacle.from_stock(wp.stock)` behind the stock's `z_min`.
+    """
+    if is_turning:
+        wp = revolve_mesh_to_lathe_stock(
+            vertices_mm,
+            indices,
+            max_radial_offset_mm=None,  # Preceding setup stock is already aligned to active setup WCS
+            fixtures=fixtures,
+        )
+        if not wp.fixtures and isinstance(wp.stock, AxisymmetricStock2D):
+            wp.fixtures = [AxisymmetricChuckObstacle.from_stock(wp.stock)]
+    else:
+        stock = SolidMeshStock3D.from_mesh(vertices_mm, indices)
+        label = f" from '{stl_label}'" if stl_label else ""
+        _dbg(
+            f"workpiece_from_stl_mesh: created SolidMeshStock3D{label} "
+            f"X=[{stock.x_min:.2f}, {stock.x_max:.2f}], Y=[{stock.y_min:.2f}, {stock.y_max:.2f}], Z=[{stock.z_min:.2f}, {stock.z_max:.2f}]"
+        )
+        wp = WorkpieceDefinition(stock=stock, fixtures=fixtures or [])
+    wp.is_stl_derived = True
+    return wp
+
+
 def extract_workpiece_from_stl(
     stl_path: str,
     is_turning: bool = False,
@@ -849,20 +880,10 @@ def extract_workpiece_from_stl(
         WorkpieceDefinition ready for verifier simulation
     """
     vertices_mm, indices = load_stl_mesh(stl_path, is_inch=is_inch)
-
-    if is_turning:
-        wp = revolve_mesh_to_lathe_stock(
-            vertices_mm,
-            indices,
-            max_radial_offset_mm=None,  # Preceding setup stock is already aligned to active setup WCS
-            fixtures=fixtures,
-        )
-    else:
-        stock = SolidMeshStock3D.from_mesh(vertices_mm, indices)
-        _dbg(
-            f"extract_workpiece_from_stl: created SolidMeshStock3D from '{stl_path}' "
-            f"X=[{stock.x_min:.2f}, {stock.x_max:.2f}], Y=[{stock.y_min:.2f}, {stock.y_max:.2f}], Z=[{stock.z_min:.2f}, {stock.z_max:.2f}]"
-        )
-        wp = WorkpieceDefinition(stock=stock, fixtures=fixtures or [])
-    wp.is_stl_derived = True
-    return wp
+    return workpiece_from_stl_mesh(
+        vertices_mm,
+        indices,
+        is_turning=is_turning,
+        fixtures=fixtures,
+        stl_label=stl_path,
+    )
