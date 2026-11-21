@@ -3434,12 +3434,17 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
 
         palette = None
         if os.path.isfile(tmp_html) and hasattr(ui.palettes, "add2"):
+            import urllib.parse
+            posix_path = pathlib.Path(os.path.abspath(tmp_html)).as_posix()
+            if not posix_path.startswith("/"):
+                posix_path = "/" + posix_path
+            tmp_html_url = "file://" + urllib.parse.quote(posix_path, safe="/:")
             try:
-                _dbg_global("_NotifyPostProcessResult: attempting ui.palettes.add2 with tmp_html")
+                _dbg_global(f"_NotifyPostProcessResult: attempting ui.palettes.add2 with {tmp_html_url}")
                 palette = ui.palettes.add2(
                     constNotificationPaletteId,
                     "Post Processing",
-                    tmp_html,
+                    tmp_html_url,
                     True,   # isVisible=True so native Qt window is allocated for setPosition/setSize
                     True,   # showCloseButton
                     is_resizable,
@@ -3447,7 +3452,7 @@ def _NotifyPostProcessResult(ui, cntFiles, cntSkipped, lstSkipped, outputFolder,
                     palette_h,
                 )
             except Exception as e_add2:
-                _dbg_global(f"_NotifyPostProcessResult: add2 with tmp_html failed: {e_add2}")
+                _dbg_global(f"_NotifyPostProcessResult: add2 with tmp_html_url failed: {e_add2}")
 
         if palette:
             _dbg_global(f"_NotifyPostProcessResult: palette active (id={constNotificationPaletteId})")

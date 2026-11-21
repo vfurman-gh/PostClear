@@ -122,6 +122,7 @@ class TestStage2ToastAndLifecycle(unittest.TestCase):
         class MockPalette:
             def __init__(self, pid, pname, html_arg, *_a):
                 self.id = pid
+                self.html_arg = html_arg
                 self.incomingFromHTML = types.SimpleNamespace(add=lambda h: html_added.append(h))
                 self.navigatingURL = types.SimpleNamespace(add=lambda h: nav_added.append(h))
                 self.isVisible = False
@@ -150,6 +151,8 @@ class TestStage2ToastAndLifecycle(unittest.TestCase):
 
         self.assertEqual(len(nav_added), 0, "navigatingURL must not be attached")
         self.assertEqual(len(html_added), 1, "incomingFromHTML must be attached")
+        self.assertTrue(palettes[PostClear.constNotificationPaletteId].html_arg.startswith("file:///"))
+        self.assertNotIn("\\", palettes[PostClear.constNotificationPaletteId].html_arg)
 
     def test_stop_clears_palette_handlers(self):
         fake_handler = object()

@@ -359,8 +359,13 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
 
             @property
             def html(self):
-                if os.path.isfile(self._html):
-                    with open(self._html, "r", encoding="utf-8") as f:
+                path = self._html
+                if path.startswith("file://"):
+                    from urllib.parse import urlparse
+                    from urllib.request import url2pathname
+                    path = url2pathname(urlparse(path).path)
+                if os.path.isfile(path):
+                    with open(path, "r", encoding="utf-8") as f:
                         return f.read()
                 return self._html
 
@@ -390,7 +395,12 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
                 return created_palettes.get(id)
 
             def add2(self, id, name, html_arg, isVisible, showCloseButton, isResizable, width, height):
-                if not (html_arg.startswith("<html>") or html_arg.startswith("<HTML>") or os.path.isfile(html_arg)):
+                path = html_arg
+                if path.startswith("file://"):
+                    from urllib.parse import urlparse
+                    from urllib.request import url2pathname
+                    path = url2pathname(urlparse(path).path)
+                if not (html_arg.startswith("<html>") or html_arg.startswith("<HTML>") or os.path.isfile(path)):
                     raise RuntimeError("3 : Invalid htmlFileURL argument")
                 p = MockPalette(id, name, html_arg)
                 created_palettes[id] = p
@@ -3011,6 +3021,10 @@ class TestPostClearPipelineIntegration(unittest.TestCase):
             created_palettes = []
 
             def _make_palette(pid, title, html_path, is_vis, show_close, is_resiz, w, h):
+                if html_path.startswith("file://"):
+                    from urllib.parse import urlparse
+                    from urllib.request import url2pathname
+                    html_path = url2pathname(urlparse(html_path).path)
                 with open(html_path, "r", encoding="utf-8") as hf:
                     html_str = hf.read()
                 pal = MagicMock()

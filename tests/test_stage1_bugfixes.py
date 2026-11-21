@@ -264,6 +264,10 @@ class TestStage1BugFixes(unittest.TestCase):
         mock_ui.palettes.itemById.return_value = None
 
         def _capture_palette(_pid, _title, html_path, *_args):
+            if html_path.startswith("file://"):
+                from urllib.parse import urlparse
+                from urllib.request import url2pathname
+                html_path = url2pathname(urlparse(html_path).path)
             with open(html_path, "r", encoding="utf-8") as f:
                 captured_html.append(f.read())
             return MagicMock()
