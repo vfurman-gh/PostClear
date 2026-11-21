@@ -6,7 +6,7 @@
 	"description":	{
 		"":	"Batch post-process CAM NC Programs with 3D/2D stock collision verification and safe G0 rapid restoration."
 	},
-	"version":	"3.0.0",
+	"version":	"3.0.1",
 	"runOnStartup":	true,
 	"supportedOS":	"windows|mac",
 	"editEnabled":	true
